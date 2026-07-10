@@ -8,7 +8,7 @@ third, and a polished TUI only after the underlying behavior is observable and s
 - [x] Clean Rust workspace and public repository hygiene.
 - [x] Private, versioned SQLite state.
 - [x] Explicit project registration and diagnostics.
-- [ ] Project metadata, Git state, and incremental refresh.
+- [x] Project metadata, Git state, and incremental refresh.
 - [ ] Import adapters with dry-run previews.
 
 ## Phase 2: session model

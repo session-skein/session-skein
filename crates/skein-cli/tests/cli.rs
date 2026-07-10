@@ -54,5 +54,116 @@ fn initializes_adds_and_lists_a_project() -> Result<(), Box<dyn Error>> {
     assert_eq!(projects[0]["name"], "Synthetic Project");
     let canonical_project = project.canonicalize()?;
     assert_eq!(projects[0]["path"].as_str(), canonical_project.to_str());
+
+    let refreshed = skein(&data, &config)
+        .args(["project", "refresh", "--all", "--json"])
+        .output()?;
+    assert!(refreshed.status.success());
+    let reports: Value = serde_json::from_slice(&refreshed.stdout)?;
+    assert_eq!(reports[0]["status"], "updated");
+    assert!(reports[0]["project"]["git"].is_null());
     Ok(())
+}
+
+#[test]
+fn refreshes_and_shows_bounded_git_metadata() -> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let data = temp.path().join("data");
+    let config = temp.path().join("config");
+    let project = temp.path().join("synthetic-repository");
+    std::fs::create_dir(&project)?;
+    git(&project, ["init", "-b", "main"])?;
+    git(&project, ["config", "user.name", "Synthetic User"])?;
+    git(
+        &project,
+        ["config", "user.email", "synthetic@example.invalid"],
+    )?;
+    let tracked = project.join("tracked.txt");
+    std::fs::write(&tracked, "initial\n")?;
+    git(&project, ["add", "tracked.txt"])?;
+    git(&project, ["commit", "-m", "Synthetic snapshot"])?;
+
+    assert!(
+        skein(&data, &config)
+            .arg("project")
+            .arg("add")
+            .arg(&project)
+            .output()?
+            .status
+            .success()
+    );
+    let refreshed = skein(&data, &config)
+        .arg("project")
+        .arg("refresh")
+        .arg(&project)
+        .arg("--json")
+        .output()?;
+    assert!(refreshed.status.success());
+    let report: Value = serde_json::from_slice(&refreshed.stdout)?;
+    assert_eq!(report["status"], "updated");
+    assert_eq!(report["project"]["git"]["head_ref"], "main");
+    assert_eq!(
+        report["project"]["git"]["last_commit_subject"],
+        "Synthetic snapshot"
+    );
+    assert!(report["project"]["git"]["tracked_dirty"].is_null());
+
+    let unchanged = skein(&data, &config)
+        .arg("project")
+        .arg("refresh")
+        .arg(&project)
+        .arg("--json")
+        .output()?;
+    assert!(unchanged.status.success());
+    let report: Value = serde_json::from_slice(&unchanged.stdout)?;
+    assert_eq!(report["status"], "unchanged");
+
+    std::fs::write(tracked, "changed\n")?;
+    let checked = skein(&data, &config)
+        .arg("project")
+        .arg("refresh")
+        .arg(&project)
+        .args(["--working-tree", "--json"])
+        .output()?;
+    assert!(checked.status.success());
+    let report: Value = serde_json::from_slice(&checked.stdout)?;
+    assert_eq!(report["project"]["git"]["tracked_dirty"], true);
+
+    let shown = skein(&data, &config)
+        .arg("project")
+        .arg("show")
+        .arg(&project)
+        .arg("--json")
+        .output()?;
+    assert!(shown.status.success());
+    let shown: Value = serde_json::from_slice(&shown.stdout)?;
+    assert_eq!(shown["git"]["tracked_dirty"], true);
+    Ok(())
+}
+
+#[test]
+fn refresh_requires_an_explicit_scope() -> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let output = skein(&temp.path().join("data"), &temp.path().join("config"))
+        .args(["project", "refresh"])
+        .output()?;
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("required arguments"));
+    Ok(())
+}
+
+fn git<const N: usize>(project: &Path, args: [&str; N]) -> Result<(), Box<dyn Error>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(project)
+        .args(args)
+        .output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "Git fixture failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    )
+    .into())
 }

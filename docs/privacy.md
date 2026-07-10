@@ -13,6 +13,9 @@ personal or proprietary information.
 - Exports are opt-in, inspectable, and redacted before publication.
 - Diagnostics must describe locations and health without dumping content.
 - Tests use synthetic names and temporary paths.
+- Git snapshots store the registered path, branch, object ID, latest commit timestamp
+  and subject, and an optional tracked-dirty result. Commit bodies and diffs are not
+  stored.
 
 Session Skein currently performs no telemetry and no network requests at runtime.
 That invariant must remain documented if a future optional integration changes it.
