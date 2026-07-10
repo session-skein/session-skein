@@ -152,6 +152,34 @@ fn refresh_requires_an_explicit_scope() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[test]
+fn codex_preview_rejects_an_out_of_range_limit_before_launch() -> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let output = skein(&temp.path().join("data"), &temp.path().join("config"))
+        .env("SKEIN_CODEX_BIN", temp.path().join("must-not-run"))
+        .args(["import", "codex", "preview", "--limit", "0"])
+        .output()?;
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("1..=1000"));
+    assert!(!temp.path().join("data").exists());
+    Ok(())
+}
+
+#[test]
+fn codex_preview_reports_a_missing_configured_executable() -> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let output = skein(&temp.path().join("data"), &temp.path().join("config"))
+        .env("SKEIN_CODEX_BIN", temp.path().join("missing-codex"))
+        .args(["import", "codex", "preview", "--json"])
+        .output()?;
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("app-server I/O failed"));
+    assert!(!temp.path().join("data").exists());
+    Ok(())
+}
+
 fn git<const N: usize>(project: &Path, args: [&str; N]) -> Result<(), Box<dyn Error>> {
     let output = Command::new("git")
         .arg("-C")

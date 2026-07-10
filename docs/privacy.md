@@ -16,6 +16,8 @@ personal or proprietary information.
 - Git snapshots store the registered path, branch, object ID, latest commit timestamp
   and subject, and an optional tracked-dirty result. Commit bodies and diffs are not
   stored.
+- Codex discovery is dry-run and stores nothing. Thread names and first-message text
+  are redacted from output unless `--include-text` is explicitly requested.
 
 Session Skein currently performs no telemetry and no network requests at runtime.
 That invariant must remain documented if a future optional integration changes it.

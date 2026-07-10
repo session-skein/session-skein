@@ -3,7 +3,13 @@
 All notable changes will be documented here. The project follows Semantic Versioning
 after its first published release.
 
-## [0.2.0] - Unreleased
+## [0.3.0] - Unreleased
+
+- Added a separate, version-aware `skein-codex` adapter crate.
+- Added redacted-by-default `import codex preview` through the documented app-server
+  thread API, with bounded pages and explicit source-index repair.
+
+## [0.2.0] - 2026-07-10
 
 - Created the clean Rust workspace and independent Session Skein identity.
 - Added secure platform state paths and a versioned SQLite project registry.

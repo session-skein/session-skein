@@ -36,6 +36,17 @@ The adapter invokes read-only local Git commands. It does not fetch, contact rem
 change the index, or discover repositories. See [git-refresh.md](git-refresh.md) for
 the observable contract.
 
+## Codex adapter
+
+`skein-codex` is isolated from the core state model. It launches the locally installed
+Codex app-server over stdio, performs the documented initialize handshake, and makes
+one bounded `thread/list` request. It does not parse Codex's private rollout JSONL
+format and does not persist preview results.
+
+The app-server schema is specific to the installed Codex version and may evolve. The
+adapter decodes only the fields it exposes publicly and fails closed on protocol or
+JSON-RPC errors. See [codex-preview.md](codex-preview.md).
+
 ## Performance model
 
 The hot path must not scan repositories. Adapters record cursors and fingerprints,

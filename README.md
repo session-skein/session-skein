@@ -7,7 +7,8 @@ workers from one place.
 
 The project is in an early foundation phase. Today, the `skein` binary provides a
 secure versioned project registry, diagnostics, and bounded incremental Git metadata.
-It does not yet control Codex, Agent Deck, tmux, or MCP clients.
+It can also preview local Codex threads through the versioned app-server protocol. It
+does not yet control Codex, Agent Deck, tmux, or MCP clients.
 
 ## Why a skein?
 
@@ -25,6 +26,7 @@ cargo run --release --bin skein -- project refresh /path/to/project --json
 cargo run --release --bin skein -- project refresh /path/to/project --working-tree --json
 cargo run --release --bin skein -- project show /path/to/project --json
 cargo run --release --bin skein -- project list --json
+cargo run --release --bin skein -- import codex preview --limit 50 --json
 ```
 
 `doctor` is always read-only and does not migrate an older database. `init` creates
@@ -37,6 +39,13 @@ fingerprint is unchanged. Working files are not scanned unless `--working-tree` 
 specified; that opt-in check covers tracked files and deliberately excludes untracked
 files and submodules. Use `--all` explicitly to refresh every registered project and
 `--force` to bypass the fingerprint. See [docs/git-refresh.md](docs/git-refresh.md).
+
+Codex preview uses the locally installed `codex app-server` and its existing account
+authentication. It reads one bounded thread-list page and never writes Session Skein
+state. Names and first-message previews are omitted unless `--include-text` is given.
+The default uses Codex's state database only; `--repair-source-index` explicitly opts
+into Codex's slower JSONL scan-and-repair path. See
+[docs/codex-preview.md](docs/codex-preview.md).
 
 Environment overrides:
 

@@ -450,11 +450,12 @@ dependencies = [
 
 [[package]]
 name = "session-skein"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "clap",
  "serde",
  "serde_json",
+ "skein-codex",
  "skein-core",
  "tempfile",
 ]
@@ -466,8 +467,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
+name = "skein-codex"
+version = "0.3.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "skein-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "directories",
  "rusqlite",
