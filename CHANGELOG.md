@@ -9,3 +9,4 @@ after its first published release.
 - Added secure platform state paths and a versioned SQLite project registry.
 - Added `doctor`, `init`, `project add`, and `project list` CLI commands.
 - Added privacy, security, architecture, contribution, CI, and roadmap baselines.
+- Raised the minimum supported Rust version to 1.95.

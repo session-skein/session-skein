@@ -35,7 +35,7 @@ Environment overrides:
 
 ## Development
 
-Rust 1.93 or newer is required. The repository pins 1.93.0 for reproducible checks.
+Rust 1.95 or newer is required. The repository pins 1.95.0 for reproducible checks.
 
 ```console
 cargo fmt --all -- --check
