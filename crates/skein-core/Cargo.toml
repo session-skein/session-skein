@@ -1,0 +1,19 @@
+[package]
+name = "skein-core"
+description = "Local state and project registry for Session Skein"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+directories.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

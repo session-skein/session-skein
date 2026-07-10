@@ -1,0 +1,35 @@
+[workspace]
+members = ["crates/skein-cli", "crates/skein-core"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+license = "MIT"
+
+[workspace.dependencies]
+clap = { version = "4.6.1", features = ["derive"] }
+directories = "6.0.0"
+rusqlite = { version = "0.39.0", features = ["bundled"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+skein-core = { version = "0.1.0", path = "crates/skein-core" }
+tempfile = "3.27.0"
+thiserror = "2.0.18"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
