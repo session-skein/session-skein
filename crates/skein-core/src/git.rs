@@ -66,11 +66,13 @@ pub(crate) fn inspect(
     probe: GitProbe,
     working_tree: bool,
 ) -> Result<GitObservation> {
-    let head_output = run_git(project, ["rev-parse", "--verify", "HEAD"])?;
-    let head_oid = if head_output.status.success() {
-        nonempty_line(&head_output.stdout)
-    } else {
-        None
+    let head_output = run_git(project, ["rev-parse", "--verify", "--quiet", "HEAD"])?;
+    let head_oid = match head_output.status.code() {
+        Some(0) => nonempty_line(&head_output.stdout),
+        Some(1) => None,
+        _ => {
+            return Err(command_error(project, &head_output));
+        }
     };
 
     let (last_commit_at, last_commit_subject) = match head_oid.as_deref() {
@@ -241,22 +243,22 @@ fn ensure_success(project: &Path, output: &std::process::Output) -> Result<()> {
     if output.status.success() {
         return Ok(());
     }
-    Err(Error::GitCommand {
+    Err(command_error(project, output))
+}
+
+fn command_error(project: &Path, output: &std::process::Output) -> Error {
+    Error::GitCommand {
         path: project.to_path_buf(),
         status: output.status.code().unwrap_or(-1),
         stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-    })
+    }
 }
 
 fn dirty_exit_status(project: &Path, output: &std::process::Output) -> Result<bool> {
     match output.status.code() {
         Some(0) => Ok(false),
         Some(1) => Ok(true),
-        _ => Err(Error::GitCommand {
-            path: project.to_path_buf(),
-            status: output.status.code().unwrap_or(-1),
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-        }),
+        _ => Err(command_error(project, output)),
     }
 }
 

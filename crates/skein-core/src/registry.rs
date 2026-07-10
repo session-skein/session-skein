@@ -639,6 +639,27 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn refreshes_an_unborn_git_repository() -> Result<()> {
+        let (temp, registry) = isolated_registry()?;
+        let project_dir = temp.path().join("empty-repository");
+        fs::create_dir(&project_dir).map_err(|source| Error::Io {
+            path: project_dir.clone(),
+            source,
+        })?;
+        run_git(&project_dir, ["init", "-b", "main"])?;
+        registry.add_project(&project_dir, None)?;
+
+        let report = registry.refresh_project(&project_dir, false, false)?;
+        assert_eq!(report.status, RefreshStatus::Updated);
+        let git = report.project.git.expect("Git metadata");
+        assert_eq!(git.head_ref.as_deref(), Some("main"));
+        assert_eq!(git.head_oid, None);
+        assert_eq!(git.last_commit_at, None);
+        assert_eq!(git.last_commit_subject, None);
+        Ok(())
+    }
+
     fn run_git<const N: usize>(project: &Path, args: [&str; N]) -> Result<()> {
         let output = Command::new("git")
             .arg("-C")
