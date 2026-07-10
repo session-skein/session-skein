@@ -9,11 +9,11 @@ third, and a polished TUI only after the underlying behavior is observable and s
 - [x] Private, versioned SQLite state.
 - [x] Explicit project registration and diagnostics.
 - [x] Project metadata, Git state, and incremental refresh.
-- [ ] Import adapters with dry-run previews.
+- [x] Import adapters with dry-run previews.
 
 ## Phase 2: session model
 
-- [ ] Read-only Codex session discovery.
+- [x] Read-only Codex session discovery.
 - [ ] Agent Deck and tmux session adapters.
 - [ ] Durable project-session-task relationships.
 - [ ] Search and ranking with explainable evidence.

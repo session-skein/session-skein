@@ -5,6 +5,7 @@ use clap::Args;
 use clap::Parser;
 use clap::Subcommand;
 use serde::Serialize;
+use skein_codex::DiscoveryOptions;
 use skein_core::Registry;
 use skein_core::SkeinPaths;
 
@@ -26,6 +27,45 @@ enum Command {
         #[command(subcommand)]
         command: ProjectCommand,
     },
+    /// Preview data from external agent adapters without persisting it.
+    Import {
+        #[command(subcommand)]
+        command: ImportCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ImportCommand {
+    /// Read Codex conversation metadata through the local app-server.
+    Codex {
+        #[command(subcommand)]
+        command: CodexImportCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CodexImportCommand {
+    /// Preview one bounded page without writing Session Skein state.
+    Preview(CodexPreviewArgs),
+}
+
+#[derive(Debug, Args)]
+struct CodexPreviewArgs {
+    /// Maximum threads in this page.
+    #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..=1000))]
+    limit: u32,
+    /// Opaque next-page cursor returned by a previous preview.
+    #[arg(long)]
+    cursor: Option<String>,
+    /// Include thread titles and first-message previews in terminal output.
+    #[arg(long)]
+    include_text: bool,
+    /// Allow Codex to scan JSONL rollouts to repair its state index.
+    #[arg(long)]
+    repair_source_index: bool,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -136,6 +176,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        Command::Import { command } => match command {
+            ImportCommand::Codex { command } => match command {
+                CodexImportCommand::Preview(args) => {
+                    let page = skein_codex::discover(&DiscoveryOptions {
+                        limit: args.limit,
+                        cursor: args.cursor,
+                        use_state_db_only: !args.repair_source_index,
+                        include_text: args.include_text,
+                    })?;
+                    print_value(&page, args.json)?;
+                }
+            },
+        },
     }
 
     Ok(())
