@@ -6,8 +6,8 @@ let the conductor resolve the right project and session, then inspect or steer t
 workers from one place.
 
 The project is in an early foundation phase. Today, the `skein` binary provides a
-secure versioned project registry and diagnostics. It does not yet control Codex,
-Agent Deck, tmux, or MCP clients.
+secure versioned project registry, diagnostics, and bounded incremental Git metadata.
+It does not yet control Codex, Agent Deck, tmux, or MCP clients.
 
 ## Why a skein?
 
@@ -21,12 +21,22 @@ inspectable, and recoverable without treating one giant prompt as permanent memo
 cargo run --release --bin skein -- doctor
 cargo run --release --bin skein -- init
 cargo run --release --bin skein -- project add /path/to/project
+cargo run --release --bin skein -- project refresh /path/to/project --json
+cargo run --release --bin skein -- project refresh /path/to/project --working-tree --json
+cargo run --release --bin skein -- project show /path/to/project --json
 cargo run --release --bin skein -- project list --json
 ```
 
-`doctor` is read-only when no database exists. `init` creates a private per-user
-SQLite database. Project discovery is explicit in this first release; Session Skein
-does not recursively crawl disks or network mounts.
+`doctor` is always read-only and does not migrate an older database. `init` creates
+or upgrades the private per-user SQLite database. Project discovery is explicit;
+Session Skein does not recursively crawl disks or network mounts.
+
+The default `project refresh` reads small Git administrative files and the latest
+commit, then stores a fingerprint. A second refresh skips Git entirely when that
+fingerprint is unchanged. Working files are not scanned unless `--working-tree` is
+specified; that opt-in check covers tracked files and deliberately excludes untracked
+files and submodules. Use `--all` explicitly to refresh every registered project and
+`--force` to bypass the fingerprint. See [docs/git-refresh.md](docs/git-refresh.md).
 
 Environment overrides:
 

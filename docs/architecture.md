@@ -24,6 +24,18 @@ Versioned SQLite state and source-owned transcripts
 - Future control operations will be separate from observation and require an
   explicit policy decision.
 
+## Git metadata adapter
+
+The first source adapter observes only explicitly registered project roots. It stores
+branch, head object, latest commit timestamp and subject, and an optional tracked-file
+dirty result. A fingerprint of small Git administrative files lets the default path
+avoid spawning Git when repository metadata has not changed. Working-tree checks are
+opt-in and exclude untracked files and submodules.
+
+The adapter invokes read-only local Git commands. It does not fetch, contact remotes,
+change the index, or discover repositories. See [git-refresh.md](git-refresh.md) for
+the observable contract.
+
 ## Performance model
 
 The hot path must not scan repositories. Adapters record cursors and fingerprints,

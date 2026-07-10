@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use clap::ArgGroup;
 use clap::Args;
 use clap::Parser;
 use clap::Subcommand;
@@ -47,8 +48,37 @@ enum ProjectCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Show one registered project and its latest metadata snapshot.
+    Show {
+        /// Existing registered project directory.
+        path: PathBuf,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Incrementally refresh bounded metadata for one project or all projects.
+    Refresh(RefreshArgs),
     /// List projects in stable display order.
     List(OutputArgs),
+}
+
+#[derive(Debug, Args)]
+#[command(group(ArgGroup::new("scope").required(true).args(["path", "all"])))]
+struct RefreshArgs {
+    /// Existing registered project directory.
+    path: Option<PathBuf>,
+    /// Refresh every explicitly registered project, sequentially.
+    #[arg(long)]
+    all: bool,
+    /// Check tracked working-tree changes; untracked files remain excluded.
+    #[arg(long)]
+    working_tree: bool,
+    /// Ignore the stored fingerprint and inspect metadata again.
+    #[arg(long)]
+    force: bool,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Serialize)]
@@ -85,6 +115,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 ProjectCommand::Add { path, name, json } => {
                     let project = registry.add_project(&path, name.as_deref())?;
                     print_value(&project, json)?;
+                }
+                ProjectCommand::Show { path, json } => {
+                    let project = registry.get_project(&path)?;
+                    print_value(&project, json)?;
+                }
+                ProjectCommand::Refresh(args) => {
+                    if args.all {
+                        let reports = registry.refresh_all(args.working_tree, args.force)?;
+                        print_value(&reports, args.json)?;
+                    } else if let Some(path) = args.path {
+                        let report =
+                            registry.refresh_project(&path, args.working_tree, args.force)?;
+                        print_value(&report, args.json)?;
+                    }
                 }
                 ProjectCommand::List(output) => {
                     let projects = registry.list_projects()?;
