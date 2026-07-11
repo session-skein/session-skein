@@ -54,9 +54,9 @@ pub struct Session {
     pub text_imported: bool,
 }
 
-/// Text-free session projection used by matching and activity summaries.
+/// Text-free session projection used by matching, summaries, and safe catalog views.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct SessionMetadata {
+pub struct SessionMetadata {
     pub id: i64,
     pub source_kind: String,
     pub source_thread_id: String,
@@ -283,7 +283,7 @@ impl Registry {
     }
 
     /// List sessions without selecting private name or preview columns.
-    pub(crate) fn list_session_metadata(&self) -> Result<Vec<SessionMetadata>> {
+    pub fn list_session_metadata(&self) -> Result<Vec<SessionMetadata>> {
         list_session_metadata_on(&self.connection)
     }
 

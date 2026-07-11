@@ -12,8 +12,8 @@ run one audited foreground Codex turn against an explicitly selected project or
 thread. The alpha worker path can keep an explicitly targeted turn alive while CLI
 clients disconnect and reconnect. It can rank registered projects and linked sessions
 from one private stdin query, dispatch a unique high-confidence route through a
-reconnectable Codex worker, and render factual project/day activity views. It does not
-yet provide the conductor TUI.
+reconnectable Codex worker, and render factual project/day activity views. Its
+standalone TUI puts those views and the global conductor composer in one terminal.
 
 ## Why a skein?
 
@@ -62,6 +62,7 @@ printf '%s\n' 'continue the renderer investigation' | \
 cargo run --release --bin skein -- summary project /path/to/project --json
 cargo run --release --bin skein -- summary projects --json
 cargo run --release --bin skein -- summary day --json
+cargo run --release --bin skein -- tui
 ```
 
 `doctor` is always read-only and does not migrate an older database. `init` creates
@@ -105,7 +106,7 @@ recorded Codex turn; terminal source truth closes the run, while an in-progress 
 missing turn remains recovery-required. No work is replayed or taken over. See
 [docs/workers.md](docs/workers.md).
 
-`match` is the read-only decision layer beneath the future conductor. It reads a
+`match` is the read-only decision layer beneath the conductor. It reads a
 bounded query from stdin, ranks only explicitly registered projects and linked
 sessions, and reports every scoring contribution. Recency can strengthen a lexical or
 exact-identity match but cannot nominate a project by itself. Recommendations are
@@ -119,6 +120,12 @@ route, verifies ChatGPT authentication, then atomically records content-free evi
 full-access policy, control actions, and a starting worker claim before process spawn.
 `--request-id UUID` makes retries status-only: Skein never resends lost private prompt
 content. See [docs/conductor.md](docs/conductor.md).
+
+`tui` is the standalone keyboard-first interface. It reads the same private local
+registry, invokes `skein conduct` as a bounded child process, and follows redacted
+worker events. A dispatch requires pressing F2 immediately before Enter; that
+authority is consumed once. Agent Deck, tmux, MCP, systemd, and API keys are not
+required. See [docs/tui.md](docs/tui.md).
 
 Environment overrides:
 

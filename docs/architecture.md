@@ -54,6 +54,14 @@ route change aborts rather than falling through to another project. Process spaw
 prompt submission happen only after commit; an expired worker with no dispatched
 action becomes a deterministic failed run, never an uncertain recovery claim.
 
+The standalone TUI is a presentation and controller layer over these same commands
+and records. Its render loop performs no database, filesystem, Codex, or worker I/O.
+Background catalog reads use a read-only SQLite connection; selected-run polling and
+exact-run interruption use the fenced worker API. Dispatch invokes the current
+`skein conduct` executable with a private stdin prompt, a stable request UUID, and a
+strictly bounded one-response JSON protocol. Invalid or lost child output is
+reconciled from durable content-free state and never causes prompt replay.
+
 ## Git metadata adapter
 
 The first source adapter observes only explicitly registered project roots. It stores

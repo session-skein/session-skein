@@ -3,7 +3,16 @@
 All notable changes will be documented here. The project follows Semantic Versioning
 after its first published release.
 
-## [0.5.0-alpha.5] - Unreleased fail-closed conductor dispatch
+## [0.5.0-alpha.6] - Unreleased standalone conductor TUI
+
+- Added a keyboard-first terminal interface with a project library, project-scoped
+  session/run navigation, deterministic daily cards, and one global conductor input.
+- Added one-shot full-access arming, bounded child protocol handling, stable request
+  reconciliation, exact-run interrupt confirmation, and redacted live worker events.
+- Kept all catalog I/O and worker operations off the rendering thread and retained a
+  complete Codex CLI-only path with no tmux, Agent Deck, MCP, or service dependency.
+
+## [0.5.0-alpha.5] - 2026-07-11
 
 - Added one private-stdin `conduct` entry point that dispatches only a unique,
   high-confidence deterministic project/session route after ChatGPT authentication.

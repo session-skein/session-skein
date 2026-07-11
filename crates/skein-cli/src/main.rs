@@ -1,3 +1,4 @@
+mod tui;
 mod worker_runtime;
 
 use std::io::Read;
@@ -64,6 +65,8 @@ enum Command {
     },
     /// Route one private prompt and dispatch only a unique high-confidence Codex worker.
     Conduct(ConductArgs),
+    /// Open the standalone keyboard-first project/session conductor interface.
+    Tui,
     /// Rank registered projects and linked sessions without dispatching work.
     Match {
         /// Allow explicitly imported session names/previews to influence local scoring.
@@ -668,6 +671,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             WorkerCommand::CodexGuard => worker_runtime::codex_guard()?,
         },
         Command::Conduct(args) => conduct(&paths, args)?,
+        Command::Tui => tui::run(paths)?,
         Command::Match {
             include_text,
             limit,

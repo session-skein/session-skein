@@ -31,6 +31,20 @@ fn doctor_does_not_create_state() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn tui_rejects_non_interactive_stdio_without_creating_state() -> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let data = temp.path().join("data");
+    let config = temp.path().join("config");
+    let output = skein(&data, &config).arg("tui").output()?;
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("interactive terminal"));
+    assert!(!data.exists());
+    assert!(!config.exists());
+    Ok(())
+}
+
+#[test]
 fn initializes_adds_and_lists_a_project() -> Result<(), Box<dyn Error>> {
     let temp = tempfile::tempdir()?;
     let data = temp.path().join("data");

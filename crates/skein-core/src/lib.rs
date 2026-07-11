@@ -48,6 +48,7 @@ pub use registry::Registry;
 pub use session::ProjectLinkKind;
 pub use session::Session;
 pub use session::SessionImportReport;
+pub use session::SessionMetadata;
 pub use session::SessionObservation;
 pub use worker::ControlWorker;
 pub use worker::WorkerClaim;
