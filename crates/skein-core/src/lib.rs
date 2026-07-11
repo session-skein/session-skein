@@ -5,6 +5,7 @@ mod git;
 mod paths;
 mod registry;
 mod session;
+mod worker;
 
 pub use control::ControlAction;
 pub use control::ControlActionKind;
@@ -13,6 +14,7 @@ pub use control::ControlPlan;
 pub use control::ControlRun;
 pub use control::ControlRunDetail;
 pub use control::ControlRunState;
+pub use control::InterruptPlan;
 pub use control::NewControlRun;
 pub use git::GitMetadata;
 pub use paths::SkeinPaths;
@@ -24,6 +26,10 @@ pub use session::ProjectLinkKind;
 pub use session::Session;
 pub use session::SessionImportReport;
 pub use session::SessionObservation;
+pub use worker::ControlWorker;
+pub use worker::WorkerClaim;
+pub use worker::WorkerConnection;
+pub use worker::WorkerState;
 
 /// Errors returned by Session Skein's core library.
 #[derive(Debug, thiserror::Error)]

@@ -9,7 +9,8 @@ The project is in an early foundation phase. Today, the `skein` binary provides 
 secure versioned project registry, diagnostics, bounded incremental Git metadata, and
 a durable Codex session catalog populated through the app-server protocol. It can
 run one audited foreground Codex turn against an explicitly selected project or
-thread. It does not yet route natural-language work, detach managed workers, or
+thread. The alpha worker path can keep an explicitly targeted turn alive while CLI
+clients disconnect and reconnect. It does not yet route natural-language work or
 provide the conductor TUI.
 
 ## Why a skein?
@@ -40,6 +41,14 @@ printf '%s\n' 'Describe this repository.' | \
 cargo run --release --bin skein -- control list --json
 cargo run --release --bin skein -- control show RUN_ID --json
 cargo run --release --bin skein -- control mark-stale --force --json
+printf '%s\n' 'Run the focused tests.' | \
+  cargo run --release --bin skein -- worker start /path/to/project \
+    --full-access --json
+cargo run --release --bin skein -- worker list --active --json
+cargo run --release --bin skein -- worker status RUN_ID --json
+cargo run --release --bin skein -- worker watch RUN_ID --jsonl
+cargo run --release --bin skein -- worker interrupt RUN_ID
+cargo run --release --bin skein -- worker stop RUN_ID
 ```
 
 `doctor` is always read-only and does not migrate an older database. `init` creates
@@ -73,6 +82,13 @@ content is redacted unless `--include-content` is supplied and is never stored b
 Session Skein. Resume a selected thread with `--resume THREAD_ID`. See
 [docs/codex-control.md](docs/codex-control.md).
 
+`worker start` and `worker resume` create one on-demand Skein worker per run. The
+worker owns the Codex stdio connection, so the starting CLI or a watcher can exit
+without stopping the turn. Fresh CLI processes discover jobs with `worker list`,
+inspect durable redacted state, reattach to a bounded memory-only event window, and
+interrupt the exact active turn without handling thread or turn IDs. See
+[docs/workers.md](docs/workers.md).
+
 Environment overrides:
 
 - `SKEIN_CONFIG_DIR` changes the configuration directory.
@@ -98,9 +114,10 @@ Session Skein is an independent open-source project. It is not affiliated with o
 endorsed by OpenAI. Codex and OpenAI are trademarks of their respective owner.
 
 Codex CLI is the first-class agent runtime. Session Skein does not require Agent Deck,
-tmux, an MCP client, a background service, or a separate API key. Planned optional
-integrations will be capability-detected at runtime and will never own Session Skein
-state.
+tmux, an MCP client, systemd, a separately installed service, or a separate API key.
+Reconnectable jobs use an on-demand background Skein process that exits after the job
+is terminal and idle. Planned optional integrations will be capability-detected at
+runtime and will never own Session Skein state.
 
 ## License
 

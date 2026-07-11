@@ -24,10 +24,11 @@ and a polished TUI only after behavior is observable and safe.
 ## Phase 3: Codex-native control
 
 - [x] Explicit project/thread start, resume, turn start, and foreground monitoring.
-- [ ] Separate read, steer, interrupt, and detached watch operations.
+- [x] Reconnectable detached watch and exact active-turn interruption.
+- [ ] Separate source read and active-turn steer operations.
 - [x] Explicit full-access policy snapshots and audit records for control operations.
 - [ ] Read-only reconciliation of uncertain runs after restart.
-- [ ] Durable detached Codex process ownership without tmux.
+- [x] Fenced, per-run Codex process ownership without tmux.
 
 ## Phase 4: conductor
 

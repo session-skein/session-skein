@@ -576,6 +576,217 @@ read -r _
 
 #[cfg(unix)]
 #[test]
+fn reconnects_to_a_worker_after_the_starting_client_exits() -> Result<(), Box<dyn Error>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir()?;
+    let data = temp.path().join("data");
+    let config = temp.path().join("config");
+    let project = temp.path().join("project");
+    std::fs::create_dir(&project)?;
+    assert!(
+        skein(&data, &config)
+            .arg("project")
+            .arg("add")
+            .arg(&project)
+            .output()?
+            .status
+            .success()
+    );
+    let project = project.canonicalize()?;
+    let script = temp.path().join("fake-codex-worker");
+    let interrupt_log = temp.path().join("interrupt.json");
+    let thread_response = json!({
+        "id": 3,
+        "result": {
+            "thread": {"id": "worker-thread", "sessionId": "worker-session"},
+            "model": "synthetic-model",
+            "modelProvider": "synthetic-provider",
+            "cwd": project,
+            "approvalPolicy": "never",
+            "sandbox": {"type": "dangerFullAccess"}
+        }
+    });
+    std::fs::write(
+        &script,
+        format!(
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+read -r _
+printf '%s\n' '{{"id":1,"result":{{"userAgent":"synthetic"}}}}'
+read -r _
+read -r _
+printf '%s\n' '{{"id":2,"result":{{"requiresOpenaiAuth":true,"account":{{"type":"chatgpt","email":null,"planType":"pro"}}}}}}'
+read -r _ || exit 0
+printf '%s\n' '{}'
+read -r _
+printf '%s\n' '{{"id":4,"result":{{"turn":{{"id":"worker-turn","status":"inProgress","items":[]}}}}}}'
+printf '%s\n' '{{"method":"turn/started","params":{{"threadId":"worker-thread","turn":{{"id":"worker-turn","status":"inProgress","items":[]}}}}}}'
+for _ in $(seq 1 520); do
+  printf '%s\n' '{{"method":"item/agentMessage/delta","params":{{"threadId":"worker-thread","turnId":"worker-turn","itemId":"message","delta":"WORKER_SECRET_OUTPUT"}}}}'
+done
+read -r interrupt
+printf '%s\n' "$interrupt" > '{}'
+printf '%s\n' '{{"id":5,"result":{{}}}}'
+printf '%s\n' '{{"method":"turn/completed","params":{{"threadId":"worker-thread","turn":{{"id":"worker-turn","status":"interrupted","items":[]}}}}}}'
+read -r _ || true
+"#,
+            thread_response,
+            interrupt_log.display()
+        ),
+    )?;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))?;
+
+    let mut start = skein(&data, &config)
+        .env("SKEIN_CODEX_BIN", &script)
+        .arg("worker")
+        .arg("start")
+        .arg(&project)
+        .args(["--full-access", "--json"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    start
+        .stdin
+        .take()
+        .expect("child stdin")
+        .write_all(b"WORKER_SECRET_PROMPT")?;
+    let output = start.wait_with_output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let started: Value = serde_json::from_slice(&output.stdout)?;
+    let run_id = started["run"]["id"].as_i64().expect("run id");
+
+    let mut status = Value::Null;
+    for _ in 0..40 {
+        let output = skein(&data, &config)
+            .args(["worker", "status", &run_id.to_string(), "--json"])
+            .output()?;
+        assert!(output.status.success());
+        status = serde_json::from_slice(&output.stdout)?;
+        if status["run"]["state"] == "active" {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert_eq!(status["run"]["id"], run_id);
+    assert_eq!(status["run"]["state"], "active");
+    assert!(status["liveEventsAvailable"].as_bool().unwrap_or(false));
+    let listed = skein(&data, &config)
+        .args(["worker", "list", "--active", "--json"])
+        .output()?;
+    assert!(listed.status.success());
+    let listed: Value = serde_json::from_slice(&listed.stdout)?;
+    assert_eq!(listed[0]["run"]["id"], run_id);
+
+    let refused_stop = skein(&data, &config)
+        .args(["worker", "stop", &run_id.to_string()])
+        .output()?;
+    assert!(!refused_stop.status.success());
+    assert!(String::from_utf8_lossy(&refused_stop.stderr).contains("active_run"));
+
+    let capability_path = data
+        .join("workers")
+        .join(format!("run-{run_id}.capability"));
+    let capability = std::fs::read_to_string(&capability_path)?;
+    assert_eq!(
+        std::fs::metadata(&capability_path)?.permissions().mode() & 0o777,
+        0o600
+    );
+    std::fs::write(&capability_path, "00000000-0000-4000-8000-000000000000")?;
+    let rejected = skein(&data, &config)
+        .args(["worker", "interrupt", &run_id.to_string()])
+        .output()?;
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("authentication_failed"));
+    std::fs::write(&capability_path, &capability)?;
+    std::fs::set_permissions(&capability_path, std::fs::Permissions::from_mode(0o600))?;
+
+    let interrupted = skein(&data, &config)
+        .args(["worker", "interrupt", &run_id.to_string()])
+        .output()?;
+    assert!(
+        interrupted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&interrupted.stderr)
+    );
+
+    let watched = skein(&data, &config)
+        .args(["worker", "watch", &run_id.to_string(), "--jsonl"])
+        .output()?;
+    assert!(
+        watched.status.success(),
+        "{}",
+        String::from_utf8_lossy(&watched.stderr)
+    );
+    let stdout = String::from_utf8(watched.stdout)?;
+    assert!(stdout.contains("agent_message_delta"));
+    assert!(stdout.contains("\"type\":\"event_gap\""));
+    assert!(stdout.contains("\"delta_bytes\":20"));
+    assert!(!stdout.contains("WORKER_SECRET_OUTPUT"));
+    assert!(stdout.contains("\"state\":\"interrupted\""), "{stdout}");
+    let interrupt: Value = serde_json::from_str(&std::fs::read_to_string(&interrupt_log)?)?;
+    assert_eq!(interrupt["method"], "turn/interrupt");
+    assert_eq!(interrupt["params"]["threadId"], "worker-thread");
+    assert_eq!(interrupt["params"]["turnId"], "worker-turn");
+    let audit = skein(&data, &config)
+        .args(["control", "show", &run_id.to_string(), "--json"])
+        .output()?;
+    assert!(audit.status.success());
+    let audit: Value = serde_json::from_slice(&audit.stdout)?;
+    assert!(audit["actions"].as_array().is_some_and(|actions| {
+        actions.iter().any(|action| {
+            action["action_kind"] == "turn_interrupt" && action["state"] == "succeeded"
+        })
+    }));
+    let repeated = skein(&data, &config)
+        .args(["worker", "interrupt", &run_id.to_string()])
+        .output()?;
+    assert!(repeated.status.success());
+    assert_eq!(std::fs::read_to_string(interrupt_log)?.lines().count(), 1);
+
+    let database = std::fs::read(data.join("skein.sqlite3"))?;
+    assert!(
+        !database
+            .windows(20)
+            .any(|value| value == b"WORKER_SECRET_PROMPT")
+    );
+    assert!(
+        !database
+            .windows(20)
+            .any(|value| value == b"WORKER_SECRET_OUTPUT")
+    );
+    assert!(
+        !database
+            .windows(capability.len())
+            .any(|value| value == capability.as_bytes())
+    );
+
+    let stopped = skein(&data, &config)
+        .args(["worker", "stop", &run_id.to_string()])
+        .output()?;
+    assert!(stopped.status.success());
+    for _ in 0..20 {
+        if !capability_path.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(!capability_path.exists());
+
+    let unknown = skein(&data, &config)
+        .args(["worker", "status", "999999", "--json"])
+        .output()?;
+    assert!(!unknown.status.success());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
 fn closed_control_connection_fails_before_state_mutation() -> Result<(), Box<dyn Error>> {
     use std::os::unix::fs::PermissionsExt;
 
