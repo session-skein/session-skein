@@ -65,3 +65,11 @@ byte/token counts, explicit text-consent state, and structured evidence
 families/kinds/counts/points. They persist no query, tokens, matched values, candidate
 list, prompt hash, or prose. Reusing a request UUID is a status lookup and never
 replays prompt content.
+
+The TUI composer keeps prompt text in process memory only. A one-shot full-access
+acknowledgement is consumed and the visible composer is cleared before its conductor
+child starts. The prompt crosses only the child's stdin; it is absent from argv,
+environment variables, SQLite, and Session Skein logs. The child response is bounded
+to 1 MiB, and live worker views expose only the existing redacted event schema. These
+rules prevent intentional persistence but do not promise secure erasure of operating
+system or allocator memory.

@@ -41,11 +41,13 @@ and a polished TUI only after behavior is observable and safe.
 
 ## Phase 5: TUI
 
-- [ ] Project library and session tree.
-- [ ] One global composer plus project-scoped tabs.
-- [ ] Live worker status, output, blockers, and costs.
-- [ ] Daily narrative and project-card views.
-- [ ] Keyboard-first recovery of previous work.
+- [x] Project library and project-scoped session/run navigation.
+- [x] One global composer with deterministic conductor routing.
+- [ ] Optional project-scoped tabs around the global composer.
+- [x] Live worker state and bounded redacted event views.
+- [ ] Derived blocker and cost views when reliable source data is available.
+- [x] Daily narrative and project-card views.
+- [x] Keyboard-first recovery of previous work from durable state.
 
 ## Optional enrichment track
 
