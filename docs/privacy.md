@@ -36,6 +36,13 @@ personal or proprietary information.
   absent from SQLite, argv, environment variables, logs, and command output.
 - Reconnectable worker events are redacted and retained only in a bounded memory
   window. Historical agent text is not persisted or replayed after a worker exits.
+- Steer text remains only in authenticated IPC and the worker's memory queue. Durable
+  state stores its byte count, opaque request ID, exact turn ID, and fixed outcome.
+- Source reads decode only thread/turn identity, enum-like status, full-history
+  availability, and matches against Skein-generated client IDs. Raw `thread/read`
+  responses, unrecognized source client IDs, item content, names, and previews are not
+  additionally persisted. Skein's own opaque client IDs already exist in the audit
+  ledger so acceptance can be correlated without text.
 
 Session Skein performs no telemetry and has no external network client. Its worker IPC
 is IPv4 loopback-only, its app-server transport is local, and it stores no Codex

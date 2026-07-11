@@ -149,6 +149,9 @@ pub struct ControlAction {
     pub request_method: String,
     pub request_fingerprint: String,
     pub source_result_id: Option<String>,
+    pub client_request_id: Option<String>,
+    pub input_bytes: Option<usize>,
+    pub expected_source_turn_id: Option<String>,
     pub created_at: i64,
     pub dispatch_started_at: Option<i64>,
     pub terminal_at: Option<i64>,
@@ -191,6 +194,34 @@ pub struct InterruptPlan {
     pub should_dispatch: bool,
     pub thread_id: String,
     pub turn_id: String,
+}
+
+/// Idempotent audited same-turn steering request owned by one live worker.
+pub struct SteerPlan {
+    pub action_id: i64,
+    pub should_dispatch: bool,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub client_request_id: String,
+}
+
+/// One audited, read-only recovery probe for a lost worker run.
+pub struct ReconciliationPlan {
+    pub action_id: i64,
+    pub should_dispatch: bool,
+    pub thread_id: String,
+    pub expected_turn_id: Option<String>,
+    pub initial_client_message_id: String,
+}
+
+/// Content-free authoritative evidence extracted from Codex `thread/read`.
+pub struct ReconciliationObservation<'a> {
+    pub thread_id: &'a str,
+    pub thread_status: &'a str,
+    pub turn_id: Option<&'a str>,
+    pub turn_status: Option<&'a str>,
+    pub initial_message_observed: bool,
+    pub observed_steer_client_ids: &'a [&'a str],
 }
 
 impl Registry {
@@ -385,6 +416,429 @@ impl Registry {
             thread_id,
             turn_id,
         })
+    }
+
+    /// Persist an idempotent steer intent for the exact active worker-owned turn.
+    pub fn plan_owned_steer(
+        &mut self,
+        run_id: i64,
+        client_request_id: &str,
+        input_bytes: usize,
+        claim: &WorkerClaim,
+    ) -> Result<SteerPlan> {
+        if claim.run_id() != run_id {
+            return Err(Error::ControlStateConflict(
+                "worker cannot steer another run".to_owned(),
+            ));
+        }
+        if Uuid::parse_str(client_request_id).is_err() {
+            return Err(Error::InvalidControlRequest(
+                "steer request id must be a UUID".to_owned(),
+            ));
+        }
+        if input_bytes == 0 {
+            return Err(Error::InvalidControlRequest(
+                "steer input must be non-empty".to_owned(),
+            ));
+        }
+        let now = unix_timestamp();
+        let transaction = self.connection.transaction()?;
+        assert_worker_fence(&transaction, claim, &["ready", "busy"])?;
+        let existing: Option<(i64, String, String, i64)> = transaction
+            .query_row(
+                "SELECT a.id, a.expected_source_turn_id, r.source_thread_id, a.input_bytes
+                 FROM control_actions a JOIN control_runs r ON r.id = a.run_id
+                 WHERE a.run_id = ?1 AND a.client_request_id = ?2
+                 AND a.action_kind = 'turn_steer'",
+                params![run_id, client_request_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        if let Some((action_id, expected_turn_id, thread_id, stored_input_bytes)) = existing {
+            if stored_input_bytes != i64::try_from(input_bytes).unwrap_or(i64::MAX) {
+                return Err(Error::ControlStateConflict(
+                    "steer request id was already used with a different input length".to_owned(),
+                ));
+            }
+            transaction.commit()?;
+            return Ok(SteerPlan {
+                action_id,
+                should_dispatch: false,
+                thread_id,
+                turn_id: expected_turn_id,
+                client_request_id: client_request_id.to_owned(),
+            });
+        }
+        assert_worker_fence(&transaction, claim, &["busy"])?;
+        let (thread_id, turn_id, control_turn_id, policy_id): (String, String, i64, i64) =
+            transaction.query_row(
+                "SELECT r.source_thread_id, t.source_turn_id, t.id, r.policy_id
+                 FROM control_runs r JOIN control_turns t ON t.run_id = r.id
+                 WHERE r.id = ?1 AND r.state = 'active' AND r.ownership_mode = 'worker'
+                 AND t.state = 'running' AND t.turn_number = 1",
+                [run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+        let interrupt_barrier: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM control_actions WHERE run_id = ?1
+             AND action_kind = 'turn_interrupt'
+             AND state IN ('planned', 'dispatching', 'acknowledged', 'succeeded')",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        if interrupt_barrier != 0 {
+            return Err(Error::ControlStateConflict(
+                "worker cannot queue steer after interrupt".to_owned(),
+            ));
+        }
+        let action_id = insert_action(
+            &transaction,
+            run_id,
+            Some(control_turn_id),
+            policy_id,
+            ControlActionKind::TurnSteer,
+            "turn/steer:text",
+            now,
+        )?;
+        transaction.execute(
+            "UPDATE control_actions SET client_request_id = ?1, input_bytes = ?2,
+                expected_source_turn_id = ?3 WHERE id = ?4",
+            params![
+                client_request_id,
+                i64::try_from(input_bytes).unwrap_or(i64::MAX),
+                turn_id,
+                action_id
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(SteerPlan {
+            action_id,
+            should_dispatch: true,
+            thread_id,
+            turn_id,
+            client_request_id: client_request_id.to_owned(),
+        })
+    }
+
+    /// Record that Codex accepted an exact worker-owned steer request.
+    pub fn acknowledge_owned_steer(
+        &mut self,
+        action_id: i64,
+        turn_id: &str,
+        claim: &WorkerClaim,
+    ) -> Result<()> {
+        let now = unix_timestamp();
+        let transaction = self.connection.transaction()?;
+        assert_worker_fence(&transaction, claim, &["busy"])?;
+        assert_owned_action(&transaction, action_id, claim)?;
+        let expected: String = transaction.query_row(
+            "SELECT expected_source_turn_id FROM control_actions
+             WHERE id = ?1 AND action_kind = 'turn_steer'",
+            [action_id],
+            |row| row.get(0),
+        )?;
+        if expected != turn_id {
+            return Err(Error::ControlStateConflict(
+                "Codex acknowledged a different turn for steer".to_owned(),
+            ));
+        }
+        transition_action(
+            &transaction,
+            action_id,
+            "dispatching",
+            "succeeded",
+            now,
+            Some(turn_id),
+        )?;
+        append_event(&transaction, action_id, "succeeded", now, None)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Record an authoritative Codex rejection of a dispatched steer.
+    pub fn reject_owned_steer(&mut self, action_id: i64, claim: &WorkerClaim) -> Result<()> {
+        let now = unix_timestamp();
+        let transaction = self.connection.transaction()?;
+        assert_worker_fence(&transaction, claim, &["busy"])?;
+        assert_owned_action(&transaction, action_id, claim)?;
+        transition_action(&transaction, action_id, "dispatching", "failed", now, None)?;
+        transaction.execute(
+            "UPDATE control_actions SET error_class = 'steer_rejected',
+                error_message = 'Codex rejected steer for the exact active turn'
+             WHERE id = ?1",
+            [action_id],
+        )?;
+        append_event(&transaction, action_id, "failed", now, None)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Plan an idempotent read-only reconciliation for a lost worker run.
+    pub fn plan_reconciliation(
+        &mut self,
+        run_id: i64,
+        client_request_id: &str,
+    ) -> Result<ReconciliationPlan> {
+        if Uuid::parse_str(client_request_id).is_err() {
+            return Err(Error::InvalidControlRequest(
+                "reconciliation request id must be a UUID".to_owned(),
+            ));
+        }
+        let now = unix_timestamp();
+        let transaction = self.connection.transaction()?;
+        let existing: Option<(i64, String, String, Option<String>, String)> = transaction
+            .query_row(
+                "SELECT a.id, a.state, r.source_thread_id, a.expected_source_turn_id,
+                    t.client_message_id
+                 FROM control_actions a JOIN control_runs r ON r.id = a.run_id
+                 JOIN control_turns t ON t.run_id = r.id AND t.turn_number = 1
+                 WHERE a.run_id = ?1 AND a.client_request_id = ?2
+                 AND a.action_kind = 'status_reconcile'",
+                params![run_id, client_request_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((action_id, state, thread_id, expected_turn_id, initial_client_message_id)) =
+            existing
+        {
+            transaction.commit()?;
+            return Ok(ReconciliationPlan {
+                action_id,
+                should_dispatch: state == "planned",
+                thread_id,
+                expected_turn_id,
+                initial_client_message_id,
+            });
+        }
+        let (thread_id, expected_turn_id, initial_client_message_id, control_turn_id, policy_id): (
+            String,
+            Option<String>,
+            String,
+            i64,
+            i64,
+        ) = transaction.query_row(
+            "SELECT r.source_thread_id, t.source_turn_id, t.client_message_id, t.id, r.policy_id
+             FROM control_runs r JOIN control_turns t ON t.run_id = r.id
+             JOIN control_workers w ON w.run_id = r.id
+             WHERE r.id = ?1 AND r.state = 'recovery_required'
+             AND r.ownership_mode = 'worker' AND w.state IN ('lost', 'exited')",
+            [run_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )?;
+        let action_id = insert_action(
+            &transaction,
+            run_id,
+            Some(control_turn_id),
+            policy_id,
+            ControlActionKind::StatusReconcile,
+            "thread/read:identity-status-only",
+            now,
+        )?;
+        transaction.execute(
+            "UPDATE control_actions SET client_request_id = ?1,
+                expected_source_turn_id = ?2 WHERE id = ?3",
+            params![client_request_id, expected_turn_id, action_id],
+        )?;
+        transaction.commit()?;
+        Ok(ReconciliationPlan {
+            action_id,
+            should_dispatch: true,
+            thread_id,
+            expected_turn_id,
+            initial_client_message_id,
+        })
+    }
+
+    /// Enter the dispatch boundary for a read-only recovery probe.
+    pub fn begin_reconciliation(&mut self, action_id: i64) -> Result<()> {
+        let now = unix_timestamp();
+        let transaction = self.connection.transaction()?;
+        let changed = transaction.execute(
+            "UPDATE control_actions SET state = 'dispatching', dispatch_started_at = ?1
+             WHERE id = ?2 AND action_kind = 'status_reconcile' AND state = 'planned'
+             AND worker_id IS NULL AND EXISTS (
+                SELECT 1 FROM control_runs r JOIN control_workers w ON w.run_id = r.id
+                WHERE r.id = control_actions.run_id AND r.state = 'recovery_required'
+                AND r.ownership_mode = 'worker' AND w.state IN ('lost', 'exited')
+             )",
+            params![now, action_id],
+        )?;
+        if changed != 1 {
+            return Err(Error::ControlStateConflict(
+                "reconciliation action was not dispatchable".to_owned(),
+            ));
+        }
+        append_event(&transaction, action_id, "dispatching", now, None)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Persist content-free source evidence and apply only exact terminal truth.
+    pub fn record_reconciliation(
+        &mut self,
+        action_id: i64,
+        observation: &ReconciliationObservation<'_>,
+    ) -> Result<ControlRun> {
+        let now = unix_timestamp();
+        let transaction = self.connection.transaction()?;
+        let (run_id, expected_thread_id, expected_turn_id): (i64, String, Option<String>) =
+            transaction.query_row(
+                "SELECT a.run_id, r.source_thread_id, a.expected_source_turn_id
+                 FROM control_actions a JOIN control_runs r ON r.id = a.run_id
+                 WHERE a.id = ?1 AND a.action_kind = 'status_reconcile'
+                 AND a.state = 'dispatching' AND r.state = 'recovery_required'",
+                [action_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+        if expected_thread_id != observation.thread_id {
+            return Err(Error::ControlStateConflict(
+                "thread/read returned a different thread identity".to_owned(),
+            ));
+        }
+        if let (Some(observed), Some(expected)) = (observation.turn_id, expected_turn_id.as_deref())
+            && observed != expected
+        {
+            return Err(Error::ControlStateConflict(
+                "reconciliation observation did not target the recorded turn".to_owned(),
+            ));
+        }
+        if expected_turn_id.is_none()
+            && observation.turn_id.is_some()
+            && !observation.initial_message_observed
+        {
+            return Err(Error::ControlStateConflict(
+                "turn identity could not be proven by the initial client message id".to_owned(),
+            ));
+        }
+        let effective_turn_id = expected_turn_id.as_deref().or(observation.turn_id);
+        let stored_thread_status = match observation.thread_status {
+            "notLoaded" | "not_loaded" => "not_loaded",
+            "idle" => "idle",
+            "systemError" | "system_error" => "system_error",
+            "active" => "active",
+            _ => "unknown",
+        };
+        let (outcome, terminal, stored_turn_status) = match observation.turn_status {
+            None => ("turn_missing", None, None),
+            Some("inProgress" | "in_progress") => ("turn_still_running", None, Some("in_progress")),
+            Some("completed") => (
+                "terminal_confirmed",
+                Some(("completed", "completed")),
+                Some("completed"),
+            ),
+            Some("failed") => (
+                "terminal_confirmed",
+                Some(("failed", "failed")),
+                Some("failed"),
+            ),
+            Some("interrupted") => (
+                "terminal_confirmed",
+                Some(("interrupted", "interrupted")),
+                Some("interrupted"),
+            ),
+            Some(_) => ("unsupported_status", None, Some("unknown")),
+        };
+        transaction.execute(
+            "INSERT INTO control_reconciliations (
+                action_id, run_id, observed_at, source_thread_id, expected_source_turn_id,
+                thread_status, turn_found, observed_turn_status, initial_message_observed,
+                steer_messages_observed, outcome
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                action_id,
+                run_id,
+                now,
+                observation.thread_id,
+                effective_turn_id,
+                stored_thread_status,
+                i64::from(observation.turn_id.is_some()),
+                stored_turn_status,
+                i64::from(observation.initial_message_observed),
+                i64::try_from(observation.observed_steer_client_ids.len()).unwrap_or(i64::MAX),
+                outcome
+            ],
+        )?;
+        if expected_turn_id.is_none()
+            && let Some(turn_id) = effective_turn_id
+        {
+            transaction.execute(
+                "UPDATE control_turns SET source_turn_id = ?1
+                 WHERE run_id = ?2 AND source_turn_id IS NULL",
+                params![turn_id, run_id],
+            )?;
+            transaction.execute(
+                "UPDATE control_actions SET expected_source_turn_id = ?1 WHERE id = ?2",
+                params![turn_id, action_id],
+            )?;
+        }
+        transition_action(
+            &transaction,
+            action_id,
+            "dispatching",
+            "succeeded",
+            now,
+            observation.turn_id,
+        )?;
+        append_event(&transaction, action_id, outcome, now, None)?;
+        if let Some((run_state, turn_state)) = terminal {
+            let turn_changed = transaction.execute(
+                "UPDATE control_turns SET state = ?1, terminal_at = ?2
+                 WHERE run_id = ?3 AND state = 'uncertain'",
+                params![turn_state, now, run_id],
+            )?;
+            let run_changed = transaction.execute(
+                "UPDATE control_runs SET state = ?1, terminal_at = ?2, updated_at = ?2,
+                    last_error_class = NULL, last_error_message = NULL
+                 WHERE id = ?3 AND state = 'recovery_required'",
+                params![run_state, now, run_id],
+            )?;
+            if turn_changed != 1 || run_changed != 1 {
+                return Err(Error::ControlStateConflict(
+                    "terminal reconciliation lost the recovery state".to_owned(),
+                ));
+            }
+        }
+        transaction.commit()?;
+        self.control_run(run_id)?.ok_or_else(|| {
+            Error::ControlStateConflict(format!("run {run_id} disappeared after reconciliation"))
+        })
+    }
+
+    /// Fail a read-only reconciliation without persisting source error content.
+    pub fn fail_reconciliation(&mut self, action_id: i64) -> Result<()> {
+        let now = unix_timestamp();
+        let transaction = self.connection.transaction()?;
+        let changed = transaction.execute(
+            "UPDATE control_actions SET state = 'failed', terminal_at = ?1,
+                error_class = 'source_read_failed',
+                error_message = 'Codex source status could not be read safely'
+             WHERE id = ?2 AND action_kind = 'status_reconcile' AND state = 'dispatching'",
+            params![now, action_id],
+        )?;
+        if changed != 1 {
+            return Err(Error::ControlStateConflict(
+                "reconciliation action was not dispatching".to_owned(),
+            ));
+        }
+        append_event(&transaction, action_id, "failed", now, None)?;
+        transaction.commit()?;
+        Ok(())
     }
 
     /// Record that Codex accepted an exact worker-owned interrupt request.
@@ -762,6 +1216,44 @@ impl Registry {
             }
             append_event(&transaction, interrupt_action, status, now, None)?;
         }
+        transaction.execute(
+            "UPDATE control_actions SET state = 'failed', terminal_at = ?1,
+                error_class = 'interrupt_raced',
+                error_message = 'turn reached a terminal outcome before interruption dispatch'
+             WHERE run_id = ?2 AND action_kind = 'turn_interrupt' AND state = 'planned'",
+            params![now, run_id],
+        )?;
+        transaction.execute(
+            "INSERT INTO control_action_events (action_id, sequence, event_kind, recorded_at, detail)
+             SELECT a.id,
+                COALESCE((SELECT MAX(e.sequence) FROM control_action_events e
+                          WHERE e.action_id = a.id), 0) + 1,
+                'failed', ?1, NULL
+             FROM control_actions a WHERE a.run_id = ?2
+             AND a.action_kind = 'turn_interrupt' AND a.error_class = 'interrupt_raced'
+             AND NOT EXISTS (
+                SELECT 1 FROM control_action_events e
+                WHERE e.action_id = a.id AND e.event_kind = 'failed'
+             )",
+            params![now, run_id],
+        )?;
+        transaction.execute(
+            "UPDATE control_actions SET state = 'failed', terminal_at = ?1,
+                error_class = 'turn_already_terminal',
+                error_message = 'turn completed before queued steer dispatch'
+             WHERE run_id = ?2 AND action_kind = 'turn_steer' AND state = 'planned'",
+            params![now, run_id],
+        )?;
+        transaction.execute(
+            "INSERT INTO control_action_events (action_id, sequence, event_kind, recorded_at, detail)
+             SELECT a.id,
+                COALESCE((SELECT MAX(e.sequence) FROM control_action_events e
+                          WHERE e.action_id = a.id), 0) + 1,
+                'failed', ?1, NULL
+             FROM control_actions a WHERE a.run_id = ?2
+             AND a.action_kind = 'turn_steer' AND a.error_class = 'turn_already_terminal'",
+            params![now, run_id],
+        )?;
         let run_changed = transaction.execute(
             "UPDATE control_runs SET state = ?1, updated_at = ?2, terminal_at = ?2
              WHERE id = ?3 AND state = 'active'",
@@ -805,6 +1297,23 @@ impl Registry {
         } else {
             assert_run_ownership(&transaction, run_id, "foreground")?;
         }
+        transaction.execute(
+            "UPDATE control_actions SET state = 'failed', terminal_at = ?1,
+                error_class = 'steer_input_lost',
+                error_message = 'steer text was not persisted and cannot be replayed'
+             WHERE run_id = ?2 AND action_kind = 'turn_steer' AND state = 'planned'",
+            params![now, run_id],
+        )?;
+        transaction.execute(
+            "INSERT INTO control_action_events (action_id, sequence, event_kind, recorded_at, detail)
+             SELECT a.id,
+                COALESCE((SELECT MAX(e.sequence) FROM control_action_events e
+                          WHERE e.action_id = a.id), 0) + 1,
+                'failed', ?1, NULL
+             FROM control_actions a WHERE a.run_id = ?2
+             AND a.action_kind = 'turn_steer' AND a.error_class = 'steer_input_lost'",
+            params![now, run_id],
+        )?;
         let mut statement = transaction.prepare(
             "SELECT id FROM control_actions WHERE run_id = ?1
              AND state IN ('dispatching', 'acknowledged')",
@@ -904,7 +1413,8 @@ impl Registry {
         )?;
         let mut statement = self.connection.prepare(
             "SELECT id, action_key, run_id, action_kind, state, request_method,
-                request_fingerprint, source_result_id, created_at, dispatch_started_at, terminal_at
+                request_fingerprint, source_result_id, created_at, dispatch_started_at, terminal_at,
+                client_request_id, input_bytes, expected_source_turn_id
              FROM control_actions WHERE run_id = ?1 ORDER BY created_at, id",
         )?;
         let actions = statement
@@ -1092,6 +1602,11 @@ fn action_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ControlAction> {
         created_at: row.get(8)?,
         dispatch_started_at: row.get(9)?,
         terminal_at: row.get(10)?,
+        client_request_id: row.get(11)?,
+        input_bytes: row
+            .get::<_, Option<i64>>(12)?
+            .map(|value| usize::try_from(value).unwrap_or(usize::MAX)),
+        expected_source_turn_id: row.get(13)?,
     })
 }
 
@@ -1127,6 +1642,26 @@ mod tests {
             prompt: "Sensitive synthetic prompt",
             full_access_acknowledged: acknowledged,
         }
+    }
+
+    fn active_worker_run(
+        registry: &mut Registry,
+        project: &Path,
+    ) -> Result<(ControlPlan, WorkerClaim)> {
+        let plan = registry.plan_control_run(&input(project, true))?;
+        let claim = registry.create_control_worker(plan.run_id)?;
+        registry.mark_worker_ready(&claim, "127.0.0.1:12345", 42)?;
+        registry.heartbeat_worker(&claim, crate::WorkerState::Busy)?;
+        registry.begin_owned_control_action(plan.thread_action_id, &claim)?;
+        registry.acknowledge_owned_thread_action(
+            plan.thread_action_id,
+            "synthetic-thread",
+            Some("synthetic-session"),
+            &claim,
+        )?;
+        registry.begin_owned_control_action(plan.turn_action_id, &claim)?;
+        registry.acknowledge_owned_turn_action(plan.turn_action_id, "synthetic-turn", &claim)?;
+        Ok((plan, claim))
     }
 
     fn catalog_thread(registry: &mut Registry, project: &Path, thread_id: &str) -> Result<()> {
@@ -1422,6 +1957,194 @@ mod tests {
             registry.begin_control_action(plan.thread_action_id),
             Err(Error::ControlStateConflict(_))
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn owned_steer_is_idempotent_redacted_and_exact_turn_fenced() -> Result<()> {
+        let (_temp, mut registry, project) = registry()?;
+        let (run, claim) = active_worker_run(&mut registry, &project)?;
+        let request_id = "00000000-0000-4000-8000-000000000123";
+        let first = registry.plan_owned_steer(run.run_id, request_id, 27, &claim)?;
+        assert!(first.should_dispatch);
+        assert_eq!(first.turn_id, "synthetic-turn");
+        let retry = registry.plan_owned_steer(run.run_id, request_id, 27, &claim)?;
+        assert_eq!(retry.action_id, first.action_id);
+        assert!(!retry.should_dispatch);
+        assert!(matches!(
+            registry.plan_owned_steer(run.run_id, request_id, 28, &claim),
+            Err(Error::ControlStateConflict(_))
+        ));
+        registry.begin_owned_control_action(first.action_id, &claim)?;
+        registry.acknowledge_owned_steer(first.action_id, "synthetic-turn", &claim)?;
+        let detail = registry.control_run_detail(run.run_id)?;
+        let steer = detail
+            .actions
+            .iter()
+            .find(|action| action.action_kind == ControlActionKind::TurnSteer)
+            .expect("steer action");
+        assert_eq!(steer.state, ControlActionState::Succeeded);
+        assert_eq!(steer.input_bytes, Some(27));
+        assert_eq!(steer.client_request_id.as_deref(), Some(request_id));
+        assert_eq!(
+            steer.expected_source_turn_id.as_deref(),
+            Some("synthetic-turn")
+        );
+        let serialized = serde_json::to_string(&detail)
+            .map_err(|error| Error::InvalidControlRequest(error.to_string()))?;
+        assert!(!serialized.contains("steer text"));
+        Ok(())
+    }
+
+    #[test]
+    fn interrupt_is_a_barrier_and_completion_fails_queued_steer() -> Result<()> {
+        let (_temp, mut registry, project) = registry()?;
+        let (run, claim) = active_worker_run(&mut registry, &project)?;
+        let queued = registry.plan_owned_steer(
+            run.run_id,
+            "00000000-0000-4000-8000-000000000201",
+            5,
+            &claim,
+        )?;
+        let interrupt = registry.plan_owned_interrupt(run.run_id, &claim)?;
+        assert!(interrupt.should_dispatch);
+        assert!(matches!(
+            registry.plan_owned_steer(
+                run.run_id,
+                "00000000-0000-4000-8000-000000000202",
+                5,
+                &claim
+            ),
+            Err(Error::ControlStateConflict(_))
+        ));
+        registry.complete_owned_control_run(run.run_id, "completed", &claim)?;
+        let detail = registry.control_run_detail(run.run_id)?;
+        let queued = detail
+            .actions
+            .iter()
+            .find(|action| action.id == queued.action_id)
+            .expect("queued steer");
+        assert_eq!(queued.state, ControlActionState::Failed);
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_reconciliation_preserves_uncertain_history() -> Result<()> {
+        let (_temp, mut registry, project) = registry()?;
+        let (run, claim) = active_worker_run(&mut registry, &project)?;
+        let steer_id = "00000000-0000-4000-8000-000000000203";
+        let steer = registry.plan_owned_steer(run.run_id, steer_id, 9, &claim)?;
+        registry.begin_owned_control_action(steer.action_id, &claim)?;
+        registry.connection.execute(
+            "UPDATE control_workers SET lease_acquired_at = 0,
+                lease_expires_at = 0, heartbeat_at = 0 WHERE run_id = ?1",
+            [run.run_id],
+        )?;
+        assert_eq!(registry.recover_expired_workers()?, vec![run.run_id]);
+        let reconcile =
+            registry.plan_reconciliation(run.run_id, "00000000-0000-4000-8000-000000000204")?;
+        registry.begin_reconciliation(reconcile.action_id)?;
+        let observed = [steer_id];
+        let resolved = registry.record_reconciliation(
+            reconcile.action_id,
+            &ReconciliationObservation {
+                thread_id: "synthetic-thread",
+                thread_status: "notLoaded",
+                turn_id: Some("synthetic-turn"),
+                turn_status: Some("completed"),
+                initial_message_observed: true,
+                observed_steer_client_ids: &observed,
+            },
+        )?;
+        assert_eq!(resolved.state, ControlRunState::Completed);
+        let detail = registry.control_run_detail(run.run_id)?;
+        assert_eq!(
+            detail
+                .actions
+                .iter()
+                .find(|action| action.id == steer.action_id)
+                .expect("steer")
+                .state,
+            ControlActionState::Uncertain
+        );
+        assert_eq!(
+            detail.actions.last().expect("reconcile").state,
+            ControlActionState::Succeeded
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nonterminal_reconciliation_keeps_recovery_required() -> Result<()> {
+        let (_temp, mut registry, project) = registry()?;
+        let (run, _claim) = active_worker_run(&mut registry, &project)?;
+        registry.connection.execute(
+            "UPDATE control_workers SET lease_acquired_at = 0,
+                lease_expires_at = 0, heartbeat_at = 0 WHERE run_id = ?1",
+            [run.run_id],
+        )?;
+        registry.recover_expired_workers()?;
+        let reconcile =
+            registry.plan_reconciliation(run.run_id, "00000000-0000-4000-8000-000000000205")?;
+        registry.begin_reconciliation(reconcile.action_id)?;
+        let result = registry.record_reconciliation(
+            reconcile.action_id,
+            &ReconciliationObservation {
+                thread_id: "synthetic-thread",
+                thread_status: "notLoaded",
+                turn_id: Some("synthetic-turn"),
+                turn_status: Some("inProgress"),
+                initial_message_observed: true,
+                observed_steer_client_ids: &[],
+            },
+        )?;
+        assert_eq!(result.state, ControlRunState::RecoveryRequired);
+        Ok(())
+    }
+
+    #[test]
+    fn reconciliation_maps_unknown_source_statuses_before_persistence() -> Result<()> {
+        let (_temp, mut registry, project) = registry()?;
+        let (run, claim) = active_worker_run(&mut registry, &project)?;
+        registry.mark_owned_control_uncertain(run.run_id, &claim)?;
+        registry.finish_worker(&claim, "clean")?;
+        let reconcile =
+            registry.plan_reconciliation(run.run_id, "00000000-0000-4000-8000-000000000206")?;
+        registry.begin_reconciliation(reconcile.action_id)?;
+        let sentinel = "PRIVATE_STATUS_SENTINEL";
+        let result = registry.record_reconciliation(
+            reconcile.action_id,
+            &ReconciliationObservation {
+                thread_id: "synthetic-thread",
+                thread_status: sentinel,
+                turn_id: Some("synthetic-turn"),
+                turn_status: Some(sentinel),
+                initial_message_observed: true,
+                observed_steer_client_ids: &[],
+            },
+        )?;
+        assert_eq!(result.state, ControlRunState::RecoveryRequired);
+        let stored: (String, String, String) = registry.connection.query_row(
+            "SELECT thread_status, observed_turn_status, outcome
+             FROM control_reconciliations WHERE action_id = ?1",
+            [reconcile.action_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(
+            stored,
+            (
+                "unknown".to_owned(),
+                "unknown".to_owned(),
+                "unsupported_status".to_owned()
+            )
+        );
+        let count: i64 = registry.connection.query_row(
+            "SELECT COUNT(*) FROM control_reconciliations
+             WHERE thread_status LIKE ?1 OR observed_turn_status LIKE ?1",
+            [format!("%{sentinel}%")],
+            |row| row.get(0),
+        )?;
+        assert_eq!(count, 0);
         Ok(())
     }
 }

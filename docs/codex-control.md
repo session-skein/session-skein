@@ -30,8 +30,9 @@ skein session bind THREAD_ID /path/to/registered/project --json
 
 This foreground compatibility command does not select the project or thread. For a
 reconnectable process and exact interruption, use the separately documented
-`skein worker` commands. Neither path yet provides a global composer, routing,
-confidence evidence, steering, source reconciliation, or the final TUI.
+`skein worker` commands. The worker path adds exact-turn steer and read-only source
+reconciliation; neither path yet provides a global composer, routing, confidence
+evidence, worker takeover, or the final TUI.
 
 ## Policy boundary
 
@@ -58,8 +59,9 @@ If transport is lost after dispatch, Session Skein marks the action uncertain an
 run `recovery_required`. After independently verifying that the foreground controller
 is dead, `skein control mark-stale --force` quarantines its in-flight records without
 replaying them. The force flag applies to legacy foreground runs, which have no worker
-lease and could otherwise quarantine a still-live controller. Source reconciliation and
-durable reattachment are still planned; this command never fabricates completion or
+lease and could otherwise quarantine a still-live controller. Lost worker runs have a
+separate audited `worker reconcile` command that can apply exact terminal Codex source
+truth. Durable reattachment is still planned; neither command fabricates completion or
 silently creates replacement work.
 
 ## Content boundary

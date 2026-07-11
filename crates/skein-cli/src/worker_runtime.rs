@@ -28,8 +28,10 @@ use skein_core::ControlRun;
 use skein_core::ControlRunState;
 use skein_core::ControlWorker;
 use skein_core::InterruptPlan;
+use skein_core::ReconciliationObservation;
 use skein_core::Registry;
 use skein_core::SkeinPaths;
+use skein_core::SteerPlan;
 use skein_core::WorkerClaim;
 use skein_core::WorkerState;
 use uuid::Uuid;
@@ -43,7 +45,7 @@ const SUBMISSION_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const TERMINAL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum WorkerRequest {
     Submit {
@@ -68,16 +70,37 @@ enum WorkerRequest {
         run_key: String,
         capability: String,
     },
+    Steer {
+        protocol_version: u32,
+        run_key: String,
+        capability: String,
+        client_request_id: String,
+        prompt: String,
+    },
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum WorkerResponse {
-    Accepted { run_id: i64 },
-    Stopped { run_id: i64 },
-    InterruptAccepted { run_id: i64 },
+    Accepted {
+        run_id: i64,
+    },
+    Stopped {
+        run_id: i64,
+    },
+    InterruptAccepted {
+        run_id: i64,
+    },
+    SteerAccepted {
+        run_id: i64,
+        action_id: i64,
+        queued: bool,
+    },
     Snapshot(Box<WorkerSnapshot>),
-    Error { code: String, message: String },
+    Error {
+        code: String,
+        message: String,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -111,8 +134,9 @@ struct SharedState {
     next_sequence: Mutex<u64>,
 }
 
-struct RuntimeCommand {
-    interrupt: InterruptPlan,
+enum RuntimeCommand {
+    Interrupt(InterruptPlan),
+    Steer { plan: SteerPlan, prompt: String },
 }
 
 impl SharedState {
@@ -217,7 +241,8 @@ pub fn snapshot(
         WorkerResponse::Error { code, message } => Err(format!("{code}: {message}").into()),
         WorkerResponse::Accepted { .. }
         | WorkerResponse::Stopped { .. }
-        | WorkerResponse::InterruptAccepted { .. } => {
+        | WorkerResponse::InterruptAccepted { .. }
+        | WorkerResponse::SteerAccepted { .. } => {
             Err("worker returned an unexpected response".into())
         }
     }
@@ -262,6 +287,149 @@ pub fn interrupt(paths: &SkeinPaths, run_id: i64) -> Result<(), Box<dyn std::err
         WorkerResponse::Error { code, message } => Err(format!("{code}: {message}").into()),
         _ => Err("worker returned an unexpected interrupt response".into()),
     }
+}
+
+pub fn steer(
+    paths: &SkeinPaths,
+    run_id: i64,
+    client_request_id: &str,
+    prompt: String,
+) -> Result<(i64, bool), Box<dyn std::error::Error>> {
+    let mut registry = Registry::open(paths)?;
+    recover_expired(&mut registry, paths)?;
+    let connection = registry.worker_connection(run_id)?;
+    match request(
+        &connection.endpoint,
+        &WorkerRequest::Steer {
+            protocol_version: PROTOCOL_VERSION,
+            run_key: connection.run_key.clone(),
+            capability: read_capability(paths, run_id)?,
+            client_request_id: client_request_id.to_owned(),
+            prompt,
+        },
+    )? {
+        WorkerResponse::SteerAccepted {
+            run_id: accepted,
+            action_id,
+            queued,
+        } if accepted == run_id => Ok((action_id, queued)),
+        WorkerResponse::Error { code, message } => Err(format!("{code}: {message}").into()),
+        _ => Err("worker returned an unexpected steer response".into()),
+    }
+}
+
+pub fn read_source(paths: &SkeinPaths, run_id: i64) -> Result<Value, Box<dyn std::error::Error>> {
+    let mut registry = Registry::open(paths)?;
+    recover_expired(&mut registry, paths)?;
+    let run = registry
+        .control_run(run_id)?
+        .ok_or_else(|| format!("worker run {run_id} was not found"))?;
+    let thread_id = run
+        .source_thread_id
+        .as_deref()
+        .ok_or("worker run has no authoritative Codex thread identity")?;
+    let mut client = ControlClient::connect()?;
+    let observed = client.read_thread(thread_id, &[])?;
+    Ok(serde_json::json!({
+        "threadId": observed.thread_id,
+        "threadStatus": observed.status,
+        "turns": observed.turns.into_iter().map(|turn| serde_json::json!({
+            "turnId": turn.turn_id,
+            "status": turn.status,
+            "itemsFull": turn.items_full,
+            "contentRedacted": true
+        })).collect::<Vec<_>>(),
+        "contentRedacted": true
+    }))
+}
+
+pub fn reconcile(
+    paths: &SkeinPaths,
+    run_id: i64,
+    client_request_id: &str,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let mut registry = Registry::open(paths)?;
+    recover_expired(&mut registry, paths)?;
+    let plan = registry.plan_reconciliation(run_id, client_request_id)?;
+    if !plan.should_dispatch {
+        let run = registry
+            .control_run(run_id)?
+            .ok_or("worker run disappeared after reconciliation retry")?;
+        return Ok(serde_json::json!({
+            "requestId": client_request_id,
+            "reused": true,
+            "run": run
+        }));
+    }
+    let detail = registry.control_run_detail(run_id)?;
+    let mut known_ids = vec![plan.initial_client_message_id.clone()];
+    known_ids.extend(
+        detail
+            .actions
+            .iter()
+            .filter(|action| action.action_kind == skein_core::ControlActionKind::TurnSteer)
+            .filter_map(|action| action.client_request_id.clone()),
+    );
+    let known_refs = known_ids.iter().map(String::as_str).collect::<Vec<_>>();
+    registry.begin_reconciliation(plan.action_id)?;
+    let observed = match ControlClient::connect()
+        .and_then(|mut client| client.read_thread(&plan.thread_id, &known_refs))
+    {
+        Ok(observed) => observed,
+        Err(error) => {
+            registry.fail_reconciliation(plan.action_id)?;
+            return Err(error.into());
+        }
+    };
+    let selected = match plan.expected_turn_id.as_deref() {
+        Some(expected) => observed.turns.iter().find(|turn| turn.turn_id == expected),
+        None => {
+            let candidates = observed
+                .turns
+                .iter()
+                .filter(|turn| {
+                    turn.matched_client_message_ids
+                        .contains(&plan.initial_client_message_id)
+                })
+                .collect::<Vec<_>>();
+            if candidates.len() > 1 {
+                registry.fail_reconciliation(plan.action_id)?;
+                return Err("multiple Codex turns matched the initial client message id".into());
+            }
+            candidates.into_iter().next()
+        }
+    };
+    let initial_observed = selected.is_some_and(|turn| {
+        turn.matched_client_message_ids
+            .contains(&plan.initial_client_message_id)
+    });
+    let observed_steers = selected
+        .into_iter()
+        .flat_map(|turn| turn.matched_client_message_ids.iter())
+        .filter(|id| **id != plan.initial_client_message_id)
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let observation = ReconciliationObservation {
+        thread_id: &observed.thread_id,
+        thread_status: &observed.status,
+        turn_id: selected.map(|turn| turn.turn_id.as_str()),
+        turn_status: selected.map(|turn| turn.status.as_str()),
+        initial_message_observed: initial_observed,
+        observed_steer_client_ids: &observed_steers,
+    };
+    let run = registry.record_reconciliation(plan.action_id, &observation)?;
+    Ok(serde_json::json!({
+        "requestId": client_request_id,
+        "reused": false,
+        "run": run,
+        "source": {
+            "threadId": observed.thread_id,
+            "threadStatus": observed.status,
+            "turnId": observation.turn_id,
+            "turnStatus": observation.turn_status,
+            "contentRedacted": true
+        }
+    }))
 }
 
 pub fn durable_snapshot(
@@ -510,6 +678,12 @@ fn handle_request(
             protocol_version,
             run_key,
             capability,
+        }
+        | WorkerRequest::Steer {
+            protocol_version,
+            run_key,
+            capability,
+            ..
         } => (*protocol_version, run_key, capability),
     };
     if version != PROTOCOL_VERSION
@@ -577,6 +751,10 @@ fn handle_request(
             })
         }
         WorkerRequest::Interrupt { .. } => {
+            let mut commands = shared
+                .commands
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
             let mut registry = Registry::open(paths)?;
             let interrupt = registry.plan_owned_interrupt(claim.run_id(), claim)?;
             if interrupt.should_dispatch
@@ -585,24 +763,52 @@ fn handle_request(
                     .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                     .is_ok()
             {
-                shared
-                    .commands
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .push_back(RuntimeCommand { interrupt });
+                commands.push_back(RuntimeCommand::Interrupt(interrupt));
             }
             Ok(WorkerResponse::InterruptAccepted {
                 run_id: claim.run_id(),
+            })
+        }
+        WorkerRequest::Steer {
+            client_request_id,
+            prompt,
+            ..
+        } => {
+            let mut commands = shared
+                .commands
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let mut registry = Registry::open(paths)?;
+            let plan = registry.plan_owned_steer(
+                claim.run_id(),
+                &client_request_id,
+                prompt.len(),
+                claim,
+            )?;
+            let action_id = plan.action_id;
+            let queued = plan.should_dispatch;
+            if queued {
+                commands.push_back(RuntimeCommand::Steer { plan, prompt });
+            }
+            Ok(WorkerResponse::SteerAccepted {
+                run_id: claim.run_id(),
+                action_id,
+                queued,
             })
         }
     }
 }
 
 fn run_codex_job(paths: SkeinPaths, claim: WorkerClaim, prompt: String, shared: Arc<SharedState>) {
-    if run_codex_job_inner(&paths, &claim, &prompt, &shared).is_err()
-        && let Ok(mut registry) = Registry::open(&paths)
-    {
-        let _ = registry.mark_owned_control_uncertain(claim.run_id(), &claim);
+    if run_codex_job_inner(&paths, &claim, &prompt, &shared).is_err() {
+        shared
+            .commands
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+        if let Ok(mut registry) = Registry::open(&paths) {
+            let _ = registry.mark_owned_control_uncertain(claim.run_id(), &claim);
+        }
     }
 }
 
@@ -648,13 +854,36 @@ fn run_codex_job_inner(
             .unwrap_or_else(|error| error.into_inner())
             .pop_front()
         {
-            registry.begin_owned_control_action(command.interrupt.action_id, claim)?;
-            client.interrupt_turn(&command.interrupt.thread_id, &command.interrupt.turn_id)?;
-            registry.acknowledge_owned_interrupt(
-                command.interrupt.action_id,
-                &command.interrupt.turn_id,
-                claim,
-            )?;
+            match command {
+                RuntimeCommand::Interrupt(interrupt) => {
+                    registry.begin_owned_control_action(interrupt.action_id, claim)?;
+                    client.interrupt_turn(&interrupt.thread_id, &interrupt.turn_id)?;
+                    registry.acknowledge_owned_interrupt(
+                        interrupt.action_id,
+                        &interrupt.turn_id,
+                        claim,
+                    )?;
+                }
+                RuntimeCommand::Steer { plan, prompt } => {
+                    registry.begin_owned_control_action(plan.action_id, claim)?;
+                    match client.steer_turn(
+                        &plan.thread_id,
+                        &plan.turn_id,
+                        &prompt,
+                        &plan.client_request_id,
+                    ) {
+                        Ok(()) => registry.acknowledge_owned_steer(
+                            plan.action_id,
+                            &plan.turn_id,
+                            claim,
+                        )?,
+                        Err(skein_codex::Error::Server { .. }) => {
+                            registry.reject_owned_steer(plan.action_id, claim)?;
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+            }
         }
         let Some(event) = client.next_event_timeout(Duration::from_millis(200))? else {
             continue;
@@ -671,6 +900,11 @@ fn run_codex_job_inner(
             && turn_id == turn.turn_id
         {
             registry.complete_owned_control_run(claim.run_id(), &status, claim)?;
+            shared
+                .commands
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clear();
             registry.heartbeat_worker(claim, WorkerState::Ready)?;
             return Ok(());
         }
