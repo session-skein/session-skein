@@ -4,16 +4,19 @@ use std::path::PathBuf;
 use rusqlite::OptionalExtension;
 use rusqlite::Transaction;
 use rusqlite::params;
+use serde::Deserialize;
 use serde::Serialize;
 use uuid::Uuid;
 
 use crate::Error;
 use crate::Registry;
 use crate::Result;
+use crate::WorkerClaim;
 use crate::registry::unix_timestamp;
+use crate::worker::assert_worker_fence;
 
 /// Skein-owned lifecycle state for one controlled Codex run.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ControlRunState {
     Planned,
@@ -115,7 +118,7 @@ impl ControlActionState {
 }
 
 /// Public redaction-safe run projection.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ControlRun {
     pub id: i64,
     pub run_key: String,
@@ -123,6 +126,7 @@ pub struct ControlRun {
     pub project_name: String,
     pub working_directory: PathBuf,
     pub state: ControlRunState,
+    pub ownership_mode: String,
     pub source_thread_id: Option<String>,
     pub source_session_id: Option<String>,
     pub created_at: i64,
@@ -179,6 +183,14 @@ pub struct ControlPlan {
     pub turn_action_id: i64,
     pub client_message_id: String,
     pub working_directory: PathBuf,
+}
+
+/// Exact audited interruption request for one active worker-owned turn.
+pub struct InterruptPlan {
+    pub action_id: i64,
+    pub should_dispatch: bool,
+    pub thread_id: String,
+    pub turn_id: String,
 }
 
 impl Registry {
@@ -286,26 +298,177 @@ impl Registry {
         })
     }
 
-    /// Mark an audited action dispatching immediately before its protocol write.
-    pub fn begin_control_action(&mut self, action_id: i64) -> Result<()> {
+    /// Reconstruct the content-free execution plan for a previously planned run.
+    pub fn control_plan(&self, run_id: i64) -> Result<ControlPlan> {
+        let (run_key, client_message_id, working_directory): (String, String, String) =
+            self.connection.query_row(
+                "SELECT r.run_key, t.client_message_id, r.working_directory
+                     FROM control_runs r JOIN control_turns t ON t.run_id = r.id
+                     WHERE r.id = ?1 AND t.turn_number = 1",
+                [run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+        let thread_action_id = self.connection.query_row(
+            "SELECT id FROM control_actions WHERE run_id = ?1
+             AND action_kind IN ('thread_start', 'thread_resume')",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        let turn_action_id = self.connection.query_row(
+            "SELECT id FROM control_actions WHERE run_id = ?1 AND action_kind = 'turn_start'",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        Ok(ControlPlan {
+            run_id,
+            run_key,
+            thread_action_id,
+            turn_action_id,
+            client_message_id,
+            working_directory: PathBuf::from(working_directory),
+        })
+    }
+
+    /// Persist one idempotent interrupt intent for the exact active turn.
+    pub fn plan_owned_interrupt(
+        &mut self,
+        run_id: i64,
+        claim: &WorkerClaim,
+    ) -> Result<InterruptPlan> {
+        if claim.run_id() != run_id {
+            return Err(Error::ControlStateConflict(
+                "worker cannot interrupt another run".to_owned(),
+            ));
+        }
         let now = unix_timestamp();
         let transaction = self.connection.transaction()?;
-        let changed = transaction.execute(
-            "UPDATE control_actions SET state = 'dispatching', dispatch_started_at = ?1
-             WHERE id = ?2 AND state = 'planned'",
-            params![now, action_id],
-        )?;
-        if changed != 1 {
-            return Err(Error::ControlStateConflict(format!(
-                "action {action_id} was not planned"
-            )));
+        assert_worker_fence(&transaction, claim, &["busy"])?;
+        let (thread_id, turn_id, control_turn_id, policy_id): (String, String, i64, i64) =
+            transaction.query_row(
+                "SELECT r.source_thread_id, t.source_turn_id, t.id, r.policy_id
+                 FROM control_runs r JOIN control_turns t ON t.run_id = r.id
+                 WHERE r.id = ?1 AND r.state = 'active' AND r.ownership_mode = 'worker'
+                 AND t.state = 'running' AND t.turn_number = 1",
+                [run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+        let existing: Option<(i64, String)> = transaction
+            .query_row(
+                "SELECT id, state FROM control_actions
+                 WHERE run_id = ?1 AND action_kind = 'turn_interrupt'",
+                [run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((action_id, state)) = existing {
+            transaction.commit()?;
+            return Ok(InterruptPlan {
+                action_id,
+                should_dispatch: state == "planned",
+                thread_id,
+                turn_id,
+            });
         }
+        let action_id = insert_action(
+            &transaction,
+            run_id,
+            Some(control_turn_id),
+            policy_id,
+            ControlActionKind::TurnInterrupt,
+            "turn/interrupt:exact-active-turn",
+            now,
+        )?;
+        transaction.commit()?;
+        Ok(InterruptPlan {
+            action_id,
+            should_dispatch: true,
+            thread_id,
+            turn_id,
+        })
+    }
+
+    /// Record that Codex accepted an exact worker-owned interrupt request.
+    pub fn acknowledge_owned_interrupt(
+        &mut self,
+        action_id: i64,
+        turn_id: &str,
+        claim: &WorkerClaim,
+    ) -> Result<()> {
+        let now = unix_timestamp();
+        let transaction = self.connection.transaction()?;
+        assert_worker_fence(&transaction, claim, &["busy"])?;
+        assert_owned_action(&transaction, action_id, claim)?;
+        transition_action(
+            &transaction,
+            action_id,
+            "dispatching",
+            "acknowledged",
+            now,
+            Some(turn_id),
+        )?;
+        append_event(&transaction, action_id, "acknowledged", now, None)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Mark an audited action dispatching immediately before its protocol write.
+    pub fn begin_control_action(&mut self, action_id: i64) -> Result<()> {
+        self.begin_control_action_inner(action_id, None)
+    }
+
+    /// Begin an action only while the exact worker lease fence remains current.
+    pub fn begin_owned_control_action(
+        &mut self,
+        action_id: i64,
+        claim: &WorkerClaim,
+    ) -> Result<()> {
+        self.begin_control_action_inner(action_id, Some(claim))
+    }
+
+    fn begin_control_action_inner(
+        &mut self,
+        action_id: i64,
+        claim: Option<&WorkerClaim>,
+    ) -> Result<()> {
+        let now = unix_timestamp();
+        let transaction = self.connection.transaction()?;
         let (run_id, turn_id, action_kind): (i64, Option<i64>, String) = transaction.query_row(
             "SELECT run_id, turn_id, action_kind FROM control_actions WHERE id = ?1",
             [action_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
-        if let Some(turn_id) = turn_id {
+        let action_kind_value = ControlActionKind::from_str(&action_kind)?;
+        if let Some(claim) = claim {
+            if claim.run_id() != run_id {
+                return Err(Error::ControlStateConflict(
+                    "worker cannot dispatch an action from another run".to_owned(),
+                ));
+            }
+            assert_worker_fence(&transaction, claim, &["ready", "busy"])?;
+        } else {
+            assert_run_ownership(&transaction, run_id, "foreground")?;
+        }
+        let changed = match claim {
+            Some(claim) => transaction.execute(
+                "UPDATE control_actions SET state = 'dispatching', dispatch_started_at = ?1,
+                    worker_id = ?3, worker_lease_epoch = ?4
+                 WHERE id = ?2 AND state = 'planned' AND worker_id IS NULL",
+                params![now, action_id, claim.id(), claim.lease_epoch()],
+            )?,
+            None => transaction.execute(
+                "UPDATE control_actions SET state = 'dispatching', dispatch_started_at = ?1
+                 WHERE id = ?2 AND state = 'planned' AND worker_id IS NULL",
+                params![now, action_id],
+            )?,
+        };
+        if changed != 1 {
+            return Err(Error::ControlStateConflict(format!(
+                "action {action_id} was not planned"
+            )));
+        }
+        if let Some(turn_id) = turn_id
+            && action_kind_value == ControlActionKind::TurnStart
+        {
             let turn_changed = transaction.execute(
                 "UPDATE control_turns SET state = 'dispatching'
                  WHERE id = ?1 AND state = 'planned'",
@@ -317,7 +480,7 @@ impl Registry {
                 )));
             }
         }
-        let run_changed = match ControlActionKind::from_str(&action_kind)? {
+        let run_changed = match action_kind_value {
             ControlActionKind::ThreadStart | ControlActionKind::ThreadResume => transaction
                 .execute(
                     "UPDATE control_runs SET state = 'starting', updated_at = ?1
@@ -363,8 +526,45 @@ impl Registry {
         source_thread_id: &str,
         source_session_id: Option<&str>,
     ) -> Result<()> {
+        self.acknowledge_thread_action_inner(action_id, source_thread_id, source_session_id, None)
+    }
+
+    /// Record a thread acknowledgement under the exact current worker fence.
+    pub fn acknowledge_owned_thread_action(
+        &mut self,
+        action_id: i64,
+        source_thread_id: &str,
+        source_session_id: Option<&str>,
+        claim: &WorkerClaim,
+    ) -> Result<()> {
+        self.acknowledge_thread_action_inner(
+            action_id,
+            source_thread_id,
+            source_session_id,
+            Some(claim),
+        )
+    }
+
+    fn acknowledge_thread_action_inner(
+        &mut self,
+        action_id: i64,
+        source_thread_id: &str,
+        source_session_id: Option<&str>,
+        claim: Option<&WorkerClaim>,
+    ) -> Result<()> {
         let now = unix_timestamp();
         let transaction = self.connection.transaction()?;
+        let run_id: i64 = transaction.query_row(
+            "SELECT run_id FROM control_actions WHERE id = ?1",
+            [action_id],
+            |row| row.get(0),
+        )?;
+        if let Some(claim) = claim {
+            assert_worker_fence(&transaction, claim, &["busy"])?;
+            assert_owned_action(&transaction, action_id, claim)?;
+        } else {
+            assert_run_ownership(&transaction, run_id, "foreground")?;
+        }
         transition_action(
             &transaction,
             action_id,
@@ -372,11 +572,6 @@ impl Registry {
             "succeeded",
             now,
             Some(source_thread_id),
-        )?;
-        let run_id: i64 = transaction.query_row(
-            "SELECT run_id FROM control_actions WHERE id = ?1",
-            [action_id],
-            |row| row.get(0),
         )?;
         let run_changed = transaction.execute(
             "UPDATE control_runs SET source_thread_id = ?1, source_session_id = ?2,
@@ -397,8 +592,38 @@ impl Registry {
 
     /// Record the accepted turn ID and active Skein-owned run state.
     pub fn acknowledge_turn_action(&mut self, action_id: i64, source_turn_id: &str) -> Result<()> {
+        self.acknowledge_turn_action_inner(action_id, source_turn_id, None)
+    }
+
+    /// Record a turn acknowledgement under the exact current worker fence.
+    pub fn acknowledge_owned_turn_action(
+        &mut self,
+        action_id: i64,
+        source_turn_id: &str,
+        claim: &WorkerClaim,
+    ) -> Result<()> {
+        self.acknowledge_turn_action_inner(action_id, source_turn_id, Some(claim))
+    }
+
+    fn acknowledge_turn_action_inner(
+        &mut self,
+        action_id: i64,
+        source_turn_id: &str,
+        claim: Option<&WorkerClaim>,
+    ) -> Result<()> {
         let now = unix_timestamp();
         let transaction = self.connection.transaction()?;
+        let (run_id, turn_id): (i64, i64) = transaction.query_row(
+            "SELECT run_id, turn_id FROM control_actions WHERE id = ?1",
+            [action_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if let Some(claim) = claim {
+            assert_worker_fence(&transaction, claim, &["busy"])?;
+            assert_owned_action(&transaction, action_id, claim)?;
+        } else {
+            assert_run_ownership(&transaction, run_id, "foreground")?;
+        }
         transition_action(
             &transaction,
             action_id,
@@ -406,11 +631,6 @@ impl Registry {
             "acknowledged",
             now,
             Some(source_turn_id),
-        )?;
-        let (run_id, turn_id): (i64, i64) = transaction.query_row(
-            "SELECT run_id, turn_id FROM control_actions WHERE id = ?1",
-            [action_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         let turn_changed = transaction.execute(
             "UPDATE control_turns SET state = 'running', source_turn_id = ?1
@@ -439,6 +659,25 @@ impl Registry {
 
     /// Finalize an authoritative `turn/completed` outcome.
     pub fn complete_control_run(&mut self, run_id: i64, status: &str) -> Result<ControlRun> {
+        self.complete_control_run_inner(run_id, status, None)
+    }
+
+    /// Finalize a run only under the exact current worker fence.
+    pub fn complete_owned_control_run(
+        &mut self,
+        run_id: i64,
+        status: &str,
+        claim: &WorkerClaim,
+    ) -> Result<ControlRun> {
+        self.complete_control_run_inner(run_id, status, Some(claim))
+    }
+
+    fn complete_control_run_inner(
+        &mut self,
+        run_id: i64,
+        status: &str,
+        claim: Option<&WorkerClaim>,
+    ) -> Result<ControlRun> {
         let (run_state, turn_state) = match status {
             "completed" => ("completed", "completed"),
             "interrupted" => ("interrupted", "interrupted"),
@@ -451,6 +690,16 @@ impl Registry {
         };
         let now = unix_timestamp();
         let transaction = self.connection.transaction()?;
+        if let Some(claim) = claim {
+            if claim.run_id() != run_id {
+                return Err(Error::ControlStateConflict(
+                    "worker cannot complete another run".to_owned(),
+                ));
+            }
+            assert_worker_fence(&transaction, claim, &["busy"])?;
+        } else {
+            assert_run_ownership(&transaction, run_id, "foreground")?;
+        }
         let turn_changed = transaction.execute(
             "UPDATE control_turns SET state = ?1, terminal_at = ?2
              WHERE run_id = ?3 AND state = 'running'",
@@ -466,6 +715,9 @@ impl Registry {
             [run_id],
             |row| row.get(0),
         )?;
+        if let Some(claim) = claim {
+            assert_owned_action(&transaction, action_id, claim)?;
+        }
         transition_action(
             &transaction,
             action_id,
@@ -475,6 +727,41 @@ impl Registry {
             None,
         )?;
         append_event(&transaction, action_id, status, now, None)?;
+        let interrupt_action: Option<i64> = transaction
+            .query_row(
+                "SELECT id FROM control_actions WHERE run_id = ?1
+                 AND action_kind = 'turn_interrupt' AND state = 'acknowledged'",
+                [run_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(interrupt_action) = interrupt_action {
+            if let Some(claim) = claim {
+                assert_owned_action(&transaction, interrupt_action, claim)?;
+            }
+            let interrupt_state = if status == "interrupted" {
+                "succeeded"
+            } else {
+                "failed"
+            };
+            transition_action(
+                &transaction,
+                interrupt_action,
+                "acknowledged",
+                interrupt_state,
+                now,
+                None,
+            )?;
+            if interrupt_state == "failed" {
+                transaction.execute(
+                    "UPDATE control_actions SET error_class = 'interrupt_raced',
+                        error_message = 'turn reached another terminal outcome before interruption'
+                     WHERE id = ?1",
+                    [interrupt_action],
+                )?;
+            }
+            append_event(&transaction, interrupt_action, status, now, None)?;
+        }
         let run_changed = transaction.execute(
             "UPDATE control_runs SET state = ?1, updated_at = ?2, terminal_at = ?2
              WHERE id = ?3 AND state = 'active'",
@@ -493,8 +780,31 @@ impl Registry {
 
     /// Mark a post-dispatch failure uncertain so it is never replayed automatically.
     pub fn mark_control_uncertain(&mut self, run_id: i64) -> Result<()> {
+        self.mark_control_uncertain_inner(run_id, None)
+    }
+
+    /// Quarantine ambiguous mutations only under the exact current worker fence.
+    pub fn mark_owned_control_uncertain(&mut self, run_id: i64, claim: &WorkerClaim) -> Result<()> {
+        self.mark_control_uncertain_inner(run_id, Some(claim))
+    }
+
+    fn mark_control_uncertain_inner(
+        &mut self,
+        run_id: i64,
+        claim: Option<&WorkerClaim>,
+    ) -> Result<()> {
         let now = unix_timestamp();
         let transaction = self.connection.transaction()?;
+        if let Some(claim) = claim {
+            if claim.run_id() != run_id {
+                return Err(Error::ControlStateConflict(
+                    "worker cannot quarantine another run".to_owned(),
+                ));
+            }
+            assert_worker_fence(&transaction, claim, &["busy"])?;
+        } else {
+            assert_run_ownership(&transaction, run_id, "foreground")?;
+        }
         let mut statement = transaction.prepare(
             "SELECT id FROM control_actions WHERE run_id = ?1
              AND state IN ('dispatching', 'acknowledged')",
@@ -539,10 +849,14 @@ impl Registry {
         }
         let run_ids = {
             let mut statement = self.connection.prepare(
-                "SELECT id FROM control_runs WHERE state IN ('planned', 'starting', 'active')
+                "SELECT id FROM control_runs
+                 WHERE ownership_mode = 'foreground'
+                 AND state IN ('planned', 'starting', 'active')
                  UNION
-                 SELECT DISTINCT run_id FROM control_actions
-                 WHERE state IN ('dispatching', 'acknowledged')",
+                 SELECT DISTINCT a.run_id FROM control_actions a
+                 JOIN control_runs r ON r.id = a.run_id
+                 WHERE r.ownership_mode = 'foreground'
+                 AND a.state IN ('dispatching', 'acknowledged')",
             )?;
             statement
                 .query_map([], |row| row.get::<_, i64>(0))?
@@ -611,7 +925,7 @@ impl Registry {
 const RUN_SELECT: &str = "SELECT r.id, r.run_key, r.project_id, p.name,
     r.working_directory, r.state, r.source_thread_id, r.source_session_id,
     r.created_at, r.updated_at, r.terminal_at, cp.sandbox_mode, cp.approval_mode,
-    cp.network_access, cp.acknowledged_at
+    cp.network_access, cp.acknowledged_at, r.ownership_mode
     FROM control_runs r JOIN projects p ON p.id = r.project_id
     JOIN control_policies cp ON cp.id = r.policy_id";
 
@@ -685,6 +999,39 @@ fn transition_action(
     Ok(())
 }
 
+fn assert_owned_action(
+    transaction: &Transaction<'_>,
+    action_id: i64,
+    claim: &WorkerClaim,
+) -> Result<()> {
+    let count: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM control_actions
+         WHERE id = ?1 AND run_id = ?2 AND worker_id = ?3 AND worker_lease_epoch = ?4",
+        params![action_id, claim.run_id(), claim.id(), claim.lease_epoch()],
+        |row| row.get(0),
+    )?;
+    if count != 1 {
+        return Err(Error::ControlStateConflict(
+            "action is not owned by the current worker fence".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn assert_run_ownership(transaction: &Transaction<'_>, run_id: i64, expected: &str) -> Result<()> {
+    let count: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM control_runs WHERE id = ?1 AND ownership_mode = ?2",
+        params![run_id, expected],
+        |row| row.get(0),
+    )?;
+    if count != 1 {
+        return Err(Error::ControlStateConflict(format!(
+            "run {run_id} is not owned by {expected} control"
+        )));
+    }
+    Ok(())
+}
+
 fn validated_resume_session_id(
     transaction: &Transaction<'_>,
     thread_id: &str,
@@ -719,6 +1066,7 @@ fn run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ControlRun> {
         project_name: row.get(3)?,
         working_directory: PathBuf::from(row.get::<_, String>(4)?),
         state: ControlRunState::from_str(&row.get::<_, String>(5)?)?,
+        ownership_mode: row.get(15)?,
         source_thread_id: row.get(6)?,
         source_session_id: row.get(7)?,
         created_at: row.get(8)?,
@@ -907,6 +1255,36 @@ mod tests {
         assert_eq!(detail.actions[0].state, ControlActionState::Uncertain);
         assert_eq!(detail.actions[1].state, ControlActionState::Planned);
         assert!(registry.mark_stale_control_runs(true)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn foreground_stale_marking_never_touches_worker_owned_runs() -> Result<()> {
+        let (_temp, mut registry, project) = registry()?;
+        let foreground = registry.plan_control_run(&input(&project, true))?;
+        registry.begin_control_action(foreground.thread_action_id)?;
+
+        let worker_run = registry.plan_control_run(&input(&project, true))?;
+        let worker = registry.create_control_worker(worker_run.run_id)?;
+        registry.mark_worker_ready(&worker, "127.0.0.1:12345", 42)?;
+
+        let recovered = registry.mark_stale_control_runs(true)?;
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].id, foreground.run_id);
+        assert_eq!(
+            registry
+                .control_run(worker_run.run_id)?
+                .expect("worker run")
+                .state,
+            ControlRunState::Planned
+        );
+        assert_eq!(
+            registry
+                .control_worker(worker_run.run_id)?
+                .expect("worker")
+                .state,
+            crate::WorkerState::Ready
+        );
         Ok(())
     }
 

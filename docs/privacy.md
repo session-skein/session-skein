@@ -31,8 +31,14 @@ personal or proprietary information.
   fixed sanitized error classifications, source result IDs, and state transitions.
 - `control codex --include-content` affects only that command's live output. It does
   not enable persistence.
+- Worker prompts cross an authenticated loopback connection only in memory. A random
+  capability lives in a mode-`0600` file beneath the private data directory; it is
+  absent from SQLite, argv, environment variables, logs, and command output.
+- Reconnectable worker events are redacted and retained only in a bounded memory
+  window. Historical agent text is not persisted or replayed after a worker exits.
 
-Session Skein performs no telemetry and has no direct network client. Its app-server
-transport is local and it stores no Codex credentials. A controlled Codex process does
+Session Skein performs no telemetry and has no external network client. Its worker IPC
+is IPv4 loopback-only, its app-server transport is local, and it stores no Codex
+credentials. A controlled Codex process does
 contact OpenAI and may contact configured web or MCP services under Codex's own
 configuration and the explicitly acknowledged full-access policy.

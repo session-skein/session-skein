@@ -17,7 +17,54 @@ use crate::Result;
 use crate::SkeinPaths;
 use crate::git;
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
+
+const CREATE_WORKER_SCHEMA: &str = "CREATE TABLE control_workers (
+    id INTEGER PRIMARY KEY,
+    worker_key TEXT NOT NULL UNIQUE,
+    run_id INTEGER NOT NULL UNIQUE REFERENCES control_runs(id) ON DELETE RESTRICT,
+    runtime_kind TEXT NOT NULL CHECK(runtime_kind = 'codex'),
+    protocol_version INTEGER NOT NULL CHECK(protocol_version = 1),
+    endpoint TEXT,
+    pid INTEGER,
+    process_started_at INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('starting', 'ready', 'busy', 'stopping', 'exited', 'lost')),
+    lease_epoch INTEGER NOT NULL CHECK(lease_epoch > 0),
+    lease_acquired_at INTEGER NOT NULL,
+    lease_expires_at INTEGER NOT NULL,
+    heartbeat_at INTEGER NOT NULL,
+    terminal_at INTEGER,
+    exit_kind TEXT CHECK(exit_kind IN ('clean', 'worker_error', 'codex_exit', 'lease_lost', 'forced', 'unknown')),
+    last_error_class TEXT,
+    last_error_message TEXT,
+    CHECK(lease_expires_at >= lease_acquired_at),
+    CHECK(heartbeat_at >= lease_acquired_at),
+    CHECK(
+        (state IN ('exited', 'lost') AND terminal_at IS NOT NULL)
+        OR (state NOT IN ('exited', 'lost') AND terminal_at IS NULL)
+    )
+);
+CREATE INDEX control_workers_lease ON control_workers(state, lease_expires_at);
+ALTER TABLE control_runs ADD COLUMN ownership_mode TEXT NOT NULL DEFAULT 'foreground'
+    CHECK(ownership_mode IN ('foreground', 'worker'));
+ALTER TABLE control_actions ADD COLUMN worker_id INTEGER REFERENCES control_workers(id) ON DELETE RESTRICT;
+ALTER TABLE control_actions ADD COLUMN worker_lease_epoch INTEGER;
+CREATE INDEX control_actions_worker ON control_actions(worker_id, worker_lease_epoch, state);
+UPDATE control_actions SET state = 'uncertain', terminal_at = unixepoch(),
+    error_class = 'legacy_owner_unknown',
+    error_message = 'pre-worker mutation ownership cannot be recovered'
+WHERE state IN ('dispatching', 'acknowledged');
+INSERT INTO control_action_events (action_id, sequence, event_kind, recorded_at, detail)
+SELECT a.id,
+    COALESCE((SELECT MAX(e.sequence) FROM control_action_events e WHERE e.action_id = a.id), 0) + 1,
+    'uncertain', unixepoch(), NULL
+FROM control_actions a WHERE a.error_class = 'legacy_owner_unknown';
+UPDATE control_turns SET state = 'uncertain', terminal_at = unixepoch()
+WHERE state IN ('dispatching', 'running');
+UPDATE control_runs SET state = 'recovery_required', updated_at = unixepoch(),
+    last_error_class = 'legacy_owner_unknown',
+    last_error_message = 'read-only reconciliation is required before retry'
+WHERE state IN ('planned', 'starting', 'active');";
 
 const CREATE_CONTROL_SCHEMA: &str = "CREATE TABLE control_policies (
     id INTEGER PRIMARY KEY,
@@ -441,6 +488,11 @@ impl Registry {
 
         if current <= 3 {
             transaction.execute_batch(CREATE_CONTROL_SCHEMA)?;
+            transaction.pragma_update(None, "user_version", 4)?;
+        }
+
+        if current <= 4 {
+            transaction.execute_batch(CREATE_WORKER_SCHEMA)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         } else if current != SCHEMA_VERSION {
             return Err(Error::UnsupportedSchema {
@@ -566,7 +618,7 @@ mod tests {
     #[test]
     fn initializes_current_schema() -> Result<()> {
         let (_temp, registry) = isolated_registry()?;
-        assert_eq!(registry.schema_version()?, 4);
+        assert_eq!(registry.schema_version()?, 5);
         Ok(())
     }
 
@@ -599,7 +651,7 @@ mod tests {
         drop(read_only);
 
         let registry = Registry::open(&paths)?;
-        assert_eq!(registry.schema_version()?, 4);
+        assert_eq!(registry.schema_version()?, 5);
         assert!(registry.list_projects()?.is_empty());
         Ok(())
     }
@@ -642,7 +694,7 @@ mod tests {
         drop(connection);
 
         let registry = Registry::open(&paths)?;
-        assert_eq!(registry.schema_version()?, 4);
+        assert_eq!(registry.schema_version()?, 5);
         assert_eq!(registry.list_projects()?.len(), 1);
         assert!(registry.list_sessions()?.is_empty());
         Ok(())
@@ -681,7 +733,8 @@ mod tests {
             text_imported: false,
         }])?;
         registry.connection.execute_batch(
-            "DROP TABLE control_action_events;
+            "DROP TABLE control_workers;
+             DROP TABLE control_action_events;
              DROP TABLE control_actions;
              DROP TABLE control_turns;
              DROP TABLE control_runs;
@@ -691,10 +744,109 @@ mod tests {
         drop(registry);
 
         let registry = Registry::open(&paths)?;
-        assert_eq!(registry.schema_version()?, 4);
+        assert_eq!(registry.schema_version()?, 5);
         assert_eq!(registry.list_projects()?.len(), 1);
         assert_eq!(registry.list_sessions()?.len(), 1);
         assert!(registry.list_control_runs()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn migrates_schema_version_four_without_changing_control_history() -> Result<()> {
+        let temp = tempfile::tempdir().map_err(|source| Error::Io {
+            path: PathBuf::from("temporary test directory"),
+            source,
+        })?;
+        let paths = SkeinPaths::new(temp.path().join("config"), temp.path().join("data"));
+        fs::create_dir_all(&paths.data_dir).map_err(|source| Error::Io {
+            path: paths.data_dir.clone(),
+            source,
+        })?;
+        let connection = Connection::open(paths.database())?;
+        connection.execute_batch(
+            "CREATE TABLE projects (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                path TEXT NOT NULL UNIQUE,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE project_metadata (
+                project_id INTEGER PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                vcs_kind TEXT NOT NULL CHECK(vcs_kind IN ('none', 'git')),
+                fingerprint TEXT NOT NULL,
+                refreshed_at INTEGER NOT NULL,
+                head_ref TEXT,
+                head_oid TEXT,
+                last_commit_at INTEGER,
+                last_commit_subject TEXT,
+                tracked_dirty INTEGER CHECK(tracked_dirty IN (0, 1))
+            );",
+        )?;
+        connection.execute_batch(CREATE_SESSIONS_SCHEMA)?;
+        connection.execute_batch(CREATE_CONTROL_SCHEMA)?;
+        connection.execute_batch(
+            "INSERT INTO projects (id, name, path, created_at, updated_at)
+                VALUES (1, 'Synthetic', '/synthetic/project', 1, 1);
+             INSERT INTO control_policies (
+                id, created_at, sandbox_mode, approval_mode, network_access, project_id,
+                working_directory, acknowledged_at, acknowledgement_source
+             ) VALUES (1, 1, 'danger_full_access', 'never', 1, 1,
+                '/synthetic/project', 1, 'cli_flag');
+             INSERT INTO control_runs (
+                id, run_key, project_id, policy_id, runtime_kind, working_directory,
+                state, created_at, updated_at, terminal_at
+             ) VALUES (1, 'historical-run', 1, 1, 'codex', '/synthetic/project',
+                'completed', 1, 2, 2);
+             INSERT INTO control_runs (
+                id, run_key, project_id, policy_id, runtime_kind, working_directory,
+                state, source_thread_id, created_at, updated_at
+             ) VALUES (2, 'inflight-run', 1, 1, 'codex', '/synthetic/project',
+                'active', 'synthetic-thread', 3, 4);
+             INSERT INTO control_turns (
+                id, run_id, turn_number, state, input_bytes, terminal_condition_version,
+                client_message_id, source_turn_id, created_at
+             ) VALUES (1, 2, 1, 'running', 10, 1, 'synthetic-message',
+                'synthetic-turn', 3);
+             INSERT INTO control_actions (
+                id, action_key, run_id, turn_id, policy_id, action_kind, state,
+                request_method, request_fingerprint, source_result_id,
+                created_at, dispatch_started_at
+             ) VALUES (1, 'inflight-action', 2, 1, 1, 'turn_start', 'acknowledged',
+                'turn/start', 'turn/start:text', 'synthetic-turn', 3, 3);
+             PRAGMA user_version = 4;",
+        )?;
+        drop(connection);
+
+        let registry = Registry::open(&paths)?;
+        assert_eq!(registry.schema_version()?, 5);
+        assert_eq!(
+            registry.control_run(1)?.expect("historical run").run_key,
+            "historical-run"
+        );
+        assert!(registry.control_worker(1)?.is_none());
+        let inflight = registry.control_run(2)?.expect("inflight run");
+        assert_eq!(inflight.state, crate::ControlRunState::RecoveryRequired);
+        assert_eq!(inflight.ownership_mode, "foreground");
+        let turn_state: String = registry.connection.query_row(
+            "SELECT state FROM control_turns WHERE run_id = 2",
+            [],
+            |row| row.get(0),
+        )?;
+        let action_state: String = registry.connection.query_row(
+            "SELECT state FROM control_actions WHERE run_id = 2",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(turn_state, "uncertain");
+        assert_eq!(action_state, "uncertain");
+        let columns: String = registry.connection.query_row(
+            "SELECT group_concat(name, ',') FROM pragma_table_info('control_actions')",
+            [],
+            |row| row.get(0),
+        )?;
+        assert!(columns.contains("worker_id"));
+        assert!(columns.contains("worker_lease_epoch"));
         Ok(())
     }
 

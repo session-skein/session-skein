@@ -138,7 +138,7 @@ pub enum ControlEvent {
 /// Long-lived JSONL connection to one locally installed Codex app-server.
 pub struct ControlClient {
     child: Arc<Mutex<std::process::Child>>,
-    stdin: ChildStdin,
+    stdin: Option<ChildStdin>,
     incoming: Receiver<Result<Value>>,
     queued: VecDeque<Value>,
     next_id: i64,
@@ -148,8 +148,23 @@ impl ControlClient {
     /// Spawn Codex, initialize the connection, and verify cached authentication.
     pub fn connect() -> Result<Self> {
         let command = std::env::var_os("SKEIN_CODEX_BIN").unwrap_or_else(|| "codex".into());
-        let mut child = Command::new(command)
-            .args(["app-server", "--listen", "stdio://"])
+        let mut process = Command::new(command);
+        process.args(["app-server", "--listen", "stdio://"]);
+        Self::connect_process(process)
+    }
+
+    /// Connect through a Skein guard process that kills Codex when its owner pipe closes.
+    pub fn connect_guarded(guard_executable: &std::path::Path) -> Result<Self> {
+        let codex = std::env::var_os("SKEIN_CODEX_BIN").unwrap_or_else(|| "codex".into());
+        let mut process = Command::new(guard_executable);
+        process
+            .args(["worker", "codex-guard"])
+            .env("SKEIN_GUARDED_CODEX_BIN", codex);
+        Self::connect_process(process)
+    }
+
+    fn connect_process(mut process: Command) -> Result<Self> {
+        let mut child = process
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -186,7 +201,7 @@ impl ControlClient {
         });
         let mut client = Self {
             child: Arc::new(Mutex::new(child)),
-            stdin,
+            stdin: Some(stdin),
             incoming,
             queued: VecDeque::new(),
             next_id: 1,
@@ -202,7 +217,7 @@ impl ControlClient {
             }),
         )?;
         write_message(
-            &mut client.stdin,
+            client.stdin_mut()?,
             &json!({"method": "initialized", "params": {}}),
         )?;
         let account = client.request("account/read", json!({"refreshToken": true}))?;
@@ -265,22 +280,59 @@ impl ControlClient {
         parse_turn(&result)
     }
 
+    /// Request interruption of the exact active turn.
+    pub fn interrupt_turn(&mut self, thread_id: &str, turn_id: &str) -> Result<()> {
+        self.request(
+            "turn/interrupt",
+            json!({"threadId": thread_id, "turnId": turn_id}),
+        )?;
+        Ok(())
+    }
+
     /// Read the next live notification, tolerating unknown additive methods.
     pub fn next_event(&mut self) -> Result<ControlEvent> {
         loop {
             let value = self.next_value()?;
-            if is_server_request(&value) {
-                return Err(Error::InteractiveRequest(reject_server_request(
-                    &mut self.stdin,
-                    &value,
-                )?));
+            if let Some(event) = self.parse_event_value(value)? {
+                return Ok(event);
             }
-            let Some(method) = value.get("method").and_then(Value::as_str) else {
-                continue;
-            };
-            let params = value.get("params").cloned().unwrap_or(Value::Null);
-            return parse_control_event(method, &params);
         }
+    }
+
+    /// Read one notification with a bounded wait so a worker can service local commands.
+    pub fn next_event_timeout(&mut self, timeout: Duration) -> Result<Option<ControlEvent>> {
+        loop {
+            let value = if let Some(value) = self.queued.pop_front() {
+                value
+            } else {
+                match self.incoming.recv_timeout(timeout) {
+                    Ok(value) => value?,
+                    Err(RecvTimeoutError::Timeout) => return Ok(None),
+                    Err(RecvTimeoutError::Disconnected) => {
+                        return Err(Error::Protocol(
+                            "app-server closed the control connection".to_owned(),
+                        ));
+                    }
+                }
+            };
+            if let Some(event) = self.parse_event_value(value)? {
+                return Ok(Some(event));
+            }
+        }
+    }
+
+    fn parse_event_value(&mut self, value: Value) -> Result<Option<ControlEvent>> {
+        if is_server_request(&value) {
+            return Err(Error::InteractiveRequest(reject_server_request(
+                self.stdin_mut()?,
+                &value,
+            )?));
+        }
+        let Some(method) = value.get("method").and_then(Value::as_str) else {
+            return Ok(None);
+        };
+        let params = value.get("params").cloned().unwrap_or(Value::Null);
+        parse_control_event(method, &params).map(Some)
     }
 
     fn open_thread(
@@ -310,7 +362,7 @@ impl ControlClient {
         let id = self.next_id;
         self.next_id += 1;
         write_message(
-            &mut self.stdin,
+            self.stdin_mut()?,
             &json!({"method": method, "id": id, "params": params}),
         )?;
         let mut deferred = VecDeque::new();
@@ -321,7 +373,7 @@ impl ControlClient {
                 self.receive_value_timeout(timeout)?
             };
             if is_server_request(&value) {
-                let requested_method = reject_server_request(&mut self.stdin, &value)?;
+                let requested_method = reject_server_request(self.stdin_mut()?, &value)?;
                 self.queued.extend(deferred);
                 return Err(Error::InteractiveRequest(requested_method));
             }
@@ -344,6 +396,12 @@ impl ControlClient {
             return Ok(value);
         }
         self.receive_value()
+    }
+
+    fn stdin_mut(&mut self) -> Result<&mut ChildStdin> {
+        self.stdin
+            .as_mut()
+            .ok_or_else(|| Error::Protocol("app-server stdin was already closed".to_owned()))
     }
 
     fn receive_value(&self) -> Result<Value> {
@@ -442,7 +500,15 @@ fn validate_chatgpt_account(result: &Value) -> Result<()> {
 
 impl Drop for ControlClient {
     fn drop(&mut self) {
+        self.stdin.take();
         if let Ok(mut child) = self.child.lock() {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while std::time::Instant::now() < deadline {
+                if child.try_wait().ok().flatten().is_some() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
             let _ = child.kill();
             let _ = child.wait();
         }

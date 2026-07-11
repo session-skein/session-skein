@@ -1,3 +1,5 @@
+mod worker_runtime;
+
 use std::io::Read;
 use std::path::PathBuf;
 
@@ -50,6 +52,92 @@ enum Command {
         #[command(subcommand)]
         command: ControlCommand,
     },
+    /// Run reconnectable, explicitly targeted Codex jobs.
+    Worker {
+        #[command(subcommand)]
+        command: WorkerCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum WorkerCommand {
+    /// List reconnectable worker jobs without exposing IPC credentials.
+    List {
+        /// Show only workers with nonterminal process state.
+        #[arg(long)]
+        active: bool,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Start a new reconnectable Codex job in a registered project.
+    Start(WorkerStartArgs),
+    /// Resume a cataloged, project-bound Codex thread in a reconnectable job.
+    Resume(WorkerResumeArgs),
+    /// Show durable redacted job and worker state.
+    Status {
+        /// Numeric Skein run identifier returned by start or resume.
+        run_id: i64,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Attach to redacted live events without owning the worker lifetime.
+    Watch {
+        /// Numeric Skein run identifier returned by start or resume.
+        run_id: i64,
+        /// Emit newline-delimited JSON events.
+        #[arg(long)]
+        jsonl: bool,
+    },
+    /// Stop an idle or terminal worker; active runs are refused.
+    Stop { run_id: i64 },
+    /// Interrupt the exact active Codex turn owned by a worker.
+    Interrupt { run_id: i64 },
+    /// Internal worker process entry point.
+    #[command(hide = true)]
+    Serve { run_id: i64 },
+    /// Internal Codex child containment proxy.
+    #[command(hide = true)]
+    CodexGuard,
+}
+
+#[derive(Debug, Args)]
+struct WorkerStartArgs {
+    /// Existing registered project directory.
+    project: PathBuf,
+    /// Explicitly authorize danger-full-access with approval policy never.
+    #[arg(long)]
+    full_access: bool,
+    /// Remain attached to redacted live events until terminal completion.
+    #[arg(long)]
+    follow: bool,
+    /// Emit machine-readable JSON.
+    #[arg(long, conflicts_with = "jsonl")]
+    json: bool,
+    /// Emit a machine-readable JSONL stream when following.
+    #[arg(long, conflicts_with = "json")]
+    jsonl: bool,
+}
+
+#[derive(Debug, Args)]
+struct WorkerResumeArgs {
+    /// Cataloged Codex thread bound to its selected project.
+    thread_id: String,
+    /// Existing registered project directory.
+    project: PathBuf,
+    /// Explicitly authorize danger-full-access with approval policy never.
+    #[arg(long)]
+    full_access: bool,
+    /// Remain attached to redacted live events until terminal completion.
+    #[arg(long)]
+    follow: bool,
+    /// Emit machine-readable JSON.
+    #[arg(long, conflicts_with = "jsonl")]
+    json: bool,
+    /// Emit a machine-readable JSONL stream when following.
+    #[arg(long, conflicts_with = "json")]
+    jsonl: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -424,22 +512,136 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 print_value(&registry.mark_stale_control_runs(force)?, json)?;
             }
         },
+        Command::Worker { command } => match command {
+            WorkerCommand::List { active, json } => {
+                print_value(&worker_runtime::durable_list(&paths, active)?, json)?;
+            }
+            WorkerCommand::Start(args) => worker_start(&paths, args)?,
+            WorkerCommand::Resume(args) => worker_resume(&paths, args)?,
+            WorkerCommand::Status { run_id, json } => {
+                print_value(&worker_runtime::durable_snapshot(&paths, run_id)?, json)?;
+            }
+            WorkerCommand::Watch { run_id, jsonl } => {
+                let run = worker_runtime::watch(&paths, run_id, jsonl)?;
+                if jsonl {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&serde_json::json!({
+                            "type": "worker_run",
+                            "run": run
+                        }))?
+                    );
+                } else {
+                    println!("\nrun {}: {:?}", run.id, run.state);
+                }
+            }
+            WorkerCommand::Stop { run_id } => {
+                worker_runtime::stop(&paths, run_id)?;
+                println!("stopped worker for run {run_id}");
+            }
+            WorkerCommand::Interrupt { run_id } => {
+                worker_runtime::interrupt(&paths, run_id)?;
+                println!("interrupt accepted for run {run_id}");
+            }
+            WorkerCommand::Serve { run_id } => worker_runtime::serve(paths, run_id)?,
+            WorkerCommand::CodexGuard => worker_runtime::codex_guard()?,
+        },
     }
 
     Ok(())
 }
 
-fn control_codex(
+fn worker_start(
     paths: &SkeinPaths,
-    args: ControlCodexArgs,
+    args: WorkerStartArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if !args.full_access {
+    worker_launch(
+        paths,
+        &args.project,
+        None,
+        args.full_access,
+        args.follow,
+        args.json,
+        args.jsonl,
+    )
+}
+
+fn worker_resume(
+    paths: &SkeinPaths,
+    args: WorkerResumeArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    worker_launch(
+        paths,
+        &args.project,
+        Some(&args.thread_id),
+        args.full_access,
+        args.follow,
+        args.json,
+        args.jsonl,
+    )
+}
+
+fn worker_launch(
+    paths: &SkeinPaths,
+    project: &std::path::Path,
+    resume_thread_id: Option<&str>,
+    full_access: bool,
+    follow: bool,
+    json: bool,
+    jsonl: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !full_access {
         return Err(skein_core::Error::InvalidControlRequest(
             "pass --full-access to acknowledge danger-full-access with approvals disabled"
                 .to_owned(),
         )
         .into());
     }
+    if json && follow {
+        return Err(skein_core::Error::InvalidControlRequest(
+            "use --jsonl, not --json, when --follow is enabled".to_owned(),
+        )
+        .into());
+    }
+    let prompt = read_control_prompt()?;
+    // Validate ChatGPT authentication before creating durable run or worker state.
+    drop(ControlClient::connect()?);
+    let mut registry = Registry::open(paths)?;
+    let plan = registry.plan_control_run(&NewControlRun {
+        project_path: project,
+        resume_thread_id,
+        prompt: &prompt,
+        full_access_acknowledged: true,
+    })?;
+    let snapshot = worker_runtime::launch_worker(paths, &mut registry, plan.run_id, prompt)?;
+    if jsonl {
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "type": "worker_snapshot",
+                "snapshot": snapshot
+            }))?
+        );
+    } else if json {
+        print_value(&snapshot, true)?;
+    } else {
+        println!("started reconnectable run {}", plan.run_id);
+    }
+    if follow {
+        let run = worker_runtime::watch(paths, plan.run_id, jsonl)?;
+        if jsonl {
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({"type":"worker_run","run":run}))?
+            );
+        } else {
+            println!("\nrun {}: {:?}", run.id, run.state);
+        }
+    }
+    Ok(())
+}
+
+fn read_control_prompt() -> Result<String, Box<dyn std::error::Error>> {
     let mut prompt = String::new();
     std::io::stdin()
         .take((MAX_CONTROL_PROMPT_BYTES + 1) as u64)
@@ -456,6 +658,21 @@ fn control_codex(
         )
         .into());
     }
+    Ok(prompt)
+}
+
+fn control_codex(
+    paths: &SkeinPaths,
+    args: ControlCodexArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !args.full_access {
+        return Err(skein_core::Error::InvalidControlRequest(
+            "pass --full-access to acknowledge danger-full-access with approvals disabled"
+                .to_owned(),
+        )
+        .into());
+    }
+    let prompt = read_control_prompt()?;
 
     let mut client = ControlClient::connect()?;
     let mut registry = Registry::open(paths)?;

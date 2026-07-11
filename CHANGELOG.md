@@ -3,7 +3,15 @@
 All notable changes will be documented here. The project follows Semantic Versioning
 after its first published release.
 
-## [0.5.0-alpha.1] - Unreleased control foundation
+## [0.5.0-alpha.2] - Unreleased reconnectable worker foundation
+
+- Added per-run worker ownership, fenced leases, and private authenticated loopback
+  IPC so a client can disconnect without owning the Codex process lifetime.
+- Added worker discovery, durable status, bounded redacted watch windows with gap
+  markers, exact audited interruption, guarded Codex child cleanup, and expired-owner
+  quarantine without replay.
+
+## [0.5.0-alpha.1] - 2026-07-11
 
 - Added explicitly targeted foreground Codex thread start/resume and managed turn
   execution through app-server with existing Codex ChatGPT authentication.

@@ -28,9 +28,10 @@ skein session show THREAD_ID --json
 skein session bind THREAD_ID /path/to/registered/project --json
 ```
 
-This release does not select the project or thread. It does not yet provide detached
-workers, a global composer, routing, confidence evidence, separate steer/interrupt
-commands, or the final TUI.
+This foreground compatibility command does not select the project or thread. For a
+reconnectable process and exact interruption, use the separately documented
+`skein worker` commands. Neither path yet provides a global composer, routing,
+confidence evidence, steering, source reconciliation, or the final TUI.
 
 ## Policy boundary
 
@@ -56,8 +57,8 @@ only from the exact matching `turn/completed` notification.
 If transport is lost after dispatch, Session Skein marks the action uncertain and the
 run `recovery_required`. After independently verifying that the foreground controller
 is dead, `skein control mark-stale --force` quarantines its in-flight records without
-replaying them. The force flag is required because v0.5 alpha has no ownership lease
-and could otherwise quarantine a still-live controller. Source reconciliation and
+replaying them. The force flag applies to legacy foreground runs, which have no worker
+lease and could otherwise quarantine a still-live controller. Source reconciliation and
 durable reattachment are still planned; this command never fabricates completion or
 silently creates replacement work.
 
@@ -81,4 +82,5 @@ closed instead of being silently approved.
 
 The foreground controller does not manage or reconcile background terminals or
 detached subprocesses created by Codex. Such processes may outlive the controlled turn
-until durable process ownership is implemented.
+because the stable app-server does not expose background-terminal enumeration or
+cleanup.
