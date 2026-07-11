@@ -373,6 +373,24 @@ impl Registry {
             if worker_changed != 1 {
                 continue;
             }
+            transaction.execute(
+                "UPDATE control_actions SET state = 'failed', terminal_at = ?1,
+                    error_class = 'steer_input_lost',
+                    error_message = 'steer text was not persisted and cannot be replayed'
+                 WHERE run_id = ?2 AND action_kind = 'turn_steer' AND state = 'planned'",
+                params![now, run_id],
+            )?;
+            transaction.execute(
+                "INSERT INTO control_action_events (
+                    action_id, sequence, event_kind, recorded_at, detail
+                 ) SELECT a.id,
+                    COALESCE((SELECT MAX(e.sequence) FROM control_action_events e
+                              WHERE e.action_id = a.id), 0) + 1,
+                    'failed', ?1, NULL
+                 FROM control_actions a WHERE a.run_id = ?2
+                 AND a.action_kind = 'turn_steer' AND a.error_class = 'steer_input_lost'",
+                params![now, run_id],
+            )?;
             let action_ids = {
                 let mut statement = transaction.prepare(
                     "SELECT id FROM control_actions WHERE run_id = ?1 AND worker_id = ?2

@@ -3,7 +3,14 @@
 All notable changes will be documented here. The project follows Semantic Versioning
 after its first published release.
 
-## [0.5.0-alpha.2] - Unreleased reconnectable worker foundation
+## [0.5.0-alpha.3] - Unreleased steer and source reconciliation
+
+- Added idempotent, exact-active-turn steering through reconnectable worker IPC with
+  an interrupt barrier and content-free durable audit evidence.
+- Added redacted `thread/read` inspection and audited reconciliation of a lost
+  worker's exact terminal Codex turn without replay, takeover, or transcript storage.
+
+## [0.5.0-alpha.2] - 2026-07-11
 
 - Added per-run worker ownership, fenced leases, and private authenticated loopback
   IPC so a client can disconnect without owning the Codex process lifetime.

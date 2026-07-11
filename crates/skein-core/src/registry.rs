@@ -17,7 +17,36 @@ use crate::Result;
 use crate::SkeinPaths;
 use crate::git;
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
+
+const CREATE_RECONCILIATION_SCHEMA: &str =
+    "ALTER TABLE control_actions ADD COLUMN client_request_id TEXT;
+ALTER TABLE control_actions ADD COLUMN input_bytes INTEGER;
+ALTER TABLE control_actions ADD COLUMN expected_source_turn_id TEXT;
+CREATE UNIQUE INDEX control_actions_client_request
+    ON control_actions(run_id, client_request_id) WHERE client_request_id IS NOT NULL;
+CREATE TABLE control_reconciliations (
+    id INTEGER PRIMARY KEY,
+    action_id INTEGER NOT NULL UNIQUE REFERENCES control_actions(id) ON DELETE RESTRICT,
+    run_id INTEGER NOT NULL REFERENCES control_runs(id) ON DELETE RESTRICT,
+    observed_at INTEGER NOT NULL,
+    source_thread_id TEXT NOT NULL,
+    expected_source_turn_id TEXT,
+    thread_status TEXT NOT NULL CHECK(thread_status IN
+        ('not_loaded', 'idle', 'system_error', 'active', 'unknown')),
+    turn_found INTEGER NOT NULL CHECK(turn_found IN (0, 1)),
+    observed_turn_status TEXT CHECK(observed_turn_status IS NULL OR observed_turn_status IN
+        ('in_progress', 'completed', 'failed', 'interrupted', 'unknown')),
+    initial_message_observed INTEGER NOT NULL CHECK(initial_message_observed IN (0, 1)),
+    steer_messages_observed INTEGER NOT NULL CHECK(steer_messages_observed >= 0),
+    outcome TEXT NOT NULL CHECK(outcome IN
+        ('terminal_confirmed', 'turn_still_running', 'turn_missing',
+         'identity_unavailable', 'unsupported_status')),
+    CHECK((turn_found = 1 AND observed_turn_status IS NOT NULL)
+       OR (turn_found = 0 AND observed_turn_status IS NULL))
+);
+CREATE INDEX control_reconciliations_run
+    ON control_reconciliations(run_id, observed_at DESC);";
 
 const CREATE_WORKER_SCHEMA: &str = "CREATE TABLE control_workers (
     id INTEGER PRIMARY KEY,
@@ -493,6 +522,11 @@ impl Registry {
 
         if current <= 4 {
             transaction.execute_batch(CREATE_WORKER_SCHEMA)?;
+            transaction.pragma_update(None, "user_version", 5)?;
+        }
+
+        if current <= 5 {
+            transaction.execute_batch(CREATE_RECONCILIATION_SCHEMA)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         } else if current != SCHEMA_VERSION {
             return Err(Error::UnsupportedSchema {
@@ -618,7 +652,7 @@ mod tests {
     #[test]
     fn initializes_current_schema() -> Result<()> {
         let (_temp, registry) = isolated_registry()?;
-        assert_eq!(registry.schema_version()?, 5);
+        assert_eq!(registry.schema_version()?, 6);
         Ok(())
     }
 
@@ -651,7 +685,7 @@ mod tests {
         drop(read_only);
 
         let registry = Registry::open(&paths)?;
-        assert_eq!(registry.schema_version()?, 5);
+        assert_eq!(registry.schema_version()?, 6);
         assert!(registry.list_projects()?.is_empty());
         Ok(())
     }
@@ -694,7 +728,7 @@ mod tests {
         drop(connection);
 
         let registry = Registry::open(&paths)?;
-        assert_eq!(registry.schema_version()?, 5);
+        assert_eq!(registry.schema_version()?, 6);
         assert_eq!(registry.list_projects()?.len(), 1);
         assert!(registry.list_sessions()?.is_empty());
         Ok(())
@@ -733,7 +767,8 @@ mod tests {
             text_imported: false,
         }])?;
         registry.connection.execute_batch(
-            "DROP TABLE control_workers;
+            "DROP TABLE control_reconciliations;
+             DROP TABLE control_workers;
              DROP TABLE control_action_events;
              DROP TABLE control_actions;
              DROP TABLE control_turns;
@@ -744,7 +779,7 @@ mod tests {
         drop(registry);
 
         let registry = Registry::open(&paths)?;
-        assert_eq!(registry.schema_version()?, 5);
+        assert_eq!(registry.schema_version()?, 6);
         assert_eq!(registry.list_projects()?.len(), 1);
         assert_eq!(registry.list_sessions()?.len(), 1);
         assert!(registry.list_control_runs()?.is_empty());
@@ -819,7 +854,7 @@ mod tests {
         drop(connection);
 
         let registry = Registry::open(&paths)?;
-        assert_eq!(registry.schema_version()?, 5);
+        assert_eq!(registry.schema_version()?, 6);
         assert_eq!(
             registry.control_run(1)?.expect("historical run").run_key,
             "historical-run"
@@ -847,6 +882,49 @@ mod tests {
         )?;
         assert!(columns.contains("worker_id"));
         assert!(columns.contains("worker_lease_epoch"));
+        Ok(())
+    }
+
+    #[test]
+    fn migrates_schema_version_five_without_changing_worker_history() -> Result<()> {
+        let temp = tempfile::tempdir().map_err(|source| Error::Io {
+            path: PathBuf::from("temporary test directory"),
+            source,
+        })?;
+        let paths = SkeinPaths::new(temp.path().join("config"), temp.path().join("data"));
+        let project = temp.path().join("project");
+        fs::create_dir(&project).map_err(|source| Error::Io {
+            path: project.clone(),
+            source,
+        })?;
+        let registry = Registry::open(&paths)?;
+        registry.add_project(&project, Some("Synthetic"))?;
+        registry.connection.execute_batch(
+            "DROP TABLE control_reconciliations;
+             DROP INDEX control_actions_client_request;
+             ALTER TABLE control_actions DROP COLUMN expected_source_turn_id;
+             ALTER TABLE control_actions DROP COLUMN input_bytes;
+             ALTER TABLE control_actions DROP COLUMN client_request_id;
+             PRAGMA user_version = 5;",
+        )?;
+        drop(registry);
+
+        let registry = Registry::open(&paths)?;
+        assert_eq!(registry.schema_version()?, 6);
+        assert_eq!(registry.list_projects()?.len(), 1);
+        let columns: String = registry.connection.query_row(
+            "SELECT group_concat(name, ',') FROM pragma_table_info('control_actions')",
+            [],
+            |row| row.get(0),
+        )?;
+        assert!(columns.contains("client_request_id"));
+        let reconciliation_table: i64 = registry.connection.query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name = 'control_reconciliations'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(reconciliation_table, 1);
         Ok(())
     }
 

@@ -12,7 +12,10 @@ printf '%s\n' 'Run the focused tests.' | \
 skein worker list --active --json
 skein worker status RUN_ID --json
 skein worker watch RUN_ID --jsonl
+printf '%s\n' 'Only inspect the failing test.' | skein worker steer RUN_ID
 skein worker interrupt RUN_ID
+skein worker read RUN_ID --json
+skein worker reconcile RUN_ID --json
 skein worker stop RUN_ID
 ```
 
@@ -43,7 +46,26 @@ Client restart is supported: use `worker list`, `status`, or `watch` from a fres
 Worker/app-server crash is different. Once its lease expires, a client atomically
 marks the worker lost, fences the old epoch, marks ambiguous actions and turns
 uncertain, and moves the run to `recovery_required`. It never resends the prompt or an
-uncertain mutation. Authoritative `thread/read` reconciliation is the next milestone.
+uncertain mutation. `worker reconcile` opens a fresh bounded app-server connection,
+reads only the recorded thread and exact turn, and records content-free evidence. An
+authoritative terminal status closes the Skein run. `inProgress`, missing, mismatched,
+or unsupported source state leaves it recovery-required. Reconciliation does not
+take over, resume, or reattach a lost worker.
+
+## Steering and source reads
+
+`worker steer` reads one bounded non-empty text input from stdin and queues it through
+the worker's existing app-server connection. Codex receives `turn/steer` with the
+recorded active turn as an exact precondition. The client-generated request ID is
+durable, so `--request-id UUID` can safely retry a lost IPC response without a second
+wire request. Multiple steers are FIFO; once interrupt is planned, later steers are
+rejected. A queued steer whose text is lost before dispatch is failed, never replayed.
+
+`worker read` uses `thread/read` on a fresh connection and emits thread/turn identities,
+status labels, and whether complete item metadata was available. It does not resume
+the thread, display content, or persist the response. `worker reconcile` is narrower:
+it is accepted only for a worker-owned `recovery_required` run whose worker is fenced
+and terminal.
 
 ## Private IPC and content
 
@@ -68,8 +90,10 @@ durable redacted state remains.
 
 - One text turn per worker run.
 - Full-access/no-approval policy only, with explicit acknowledgement.
-- No source-content read, steer, routing, project inference, summaries, or TUI yet.
+- Source reads are metadata-only; there is no source-content display.
+- No routing, project inference, summaries, global composer, or TUI yet.
 - `worker stop` refuses an active run; use `worker interrupt`, wait for authoritative
   terminal status, then stop the idle worker.
-- Exact source reconciliation and lease takeover are not implemented yet.
+- Reconciliation can close exact terminal turns; lease takeover/reattachment is not
+  implemented.
 - Codex background terminal processes are not enumerated by the stable app-server API.

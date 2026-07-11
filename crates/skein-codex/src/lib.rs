@@ -16,6 +16,7 @@ use std::sync::mpsc::Receiver;
 use std::sync::mpsc::RecvTimeoutError;
 use std::thread;
 use std::time::Duration;
+use std::time::Instant;
 
 use serde::Deserialize;
 use serde::Serialize;
@@ -25,6 +26,7 @@ use serde_json::json;
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTROL_RESUME_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const MAX_DEFERRED_MESSAGES: usize = 1_024;
 
 /// Errors produced by the Codex discovery adapter.
@@ -91,6 +93,23 @@ pub struct ControlledThread {
 pub struct ControlledTurn {
     pub turn_id: String,
     pub status: String,
+}
+
+/// Content-free authoritative observation returned by `thread/read`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ThreadObservation {
+    pub thread_id: String,
+    pub status: String,
+    pub turns: Vec<TurnObservation>,
+}
+
+/// Identity and status evidence for one Codex turn, with user text discarded.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TurnObservation {
+    pub turn_id: String,
+    pub status: String,
+    pub items_full: bool,
+    pub matched_client_message_ids: Vec<String>,
 }
 
 /// Redaction-aware live event emitted by the control connection.
@@ -289,6 +308,52 @@ impl ControlClient {
         Ok(())
     }
 
+    /// Append text to the exact active turn and verify the returned turn identity.
+    pub fn steer_turn(
+        &mut self,
+        thread_id: &str,
+        expected_turn_id: &str,
+        prompt: &str,
+        client_message_id: &str,
+    ) -> Result<()> {
+        let result = self.request(
+            "turn/steer",
+            json!({
+                "threadId": thread_id,
+                "expectedTurnId": expected_turn_id,
+                "input": [{"type": "text", "text": prompt}],
+                "clientUserMessageId": client_message_id
+            }),
+        )?;
+        let returned = required_string(&result, "turnId")?;
+        if returned != expected_turn_id {
+            return Err(Error::Protocol(format!(
+                "turn/steer returned turn {returned}, expected {expected_turn_id}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Read authoritative thread/turn identity and status while discarding all content.
+    pub fn read_thread(
+        &mut self,
+        thread_id: &str,
+        expected_client_message_ids: &[&str],
+    ) -> Result<ThreadObservation> {
+        let result = self.request_with_timeout(
+            "thread/read",
+            json!({"threadId": thread_id, "includeTurns": true}),
+            CONTROL_READ_TIMEOUT,
+        )?;
+        let observation = parse_thread_observation(&result, expected_client_message_ids)?;
+        if observation.thread_id != thread_id {
+            return Err(Error::Protocol(
+                "thread/read returned a different thread identity".to_owned(),
+            ));
+        }
+        Ok(observation)
+    }
+
     /// Read the next live notification, tolerating unknown additive methods.
     pub fn next_event(&mut self) -> Result<ControlEvent> {
         loop {
@@ -366,11 +431,33 @@ impl ControlClient {
             &json!({"method": method, "id": id, "params": params}),
         )?;
         let mut deferred = VecDeque::new();
+        let deadline = Instant::now() + timeout;
         loop {
             let value = if let Some(value) = self.queued.pop_front() {
                 value
             } else {
-                self.receive_value_timeout(timeout)?
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    self.queued.extend(deferred);
+                    return Err(Error::Timeout {
+                        seconds: timeout.as_secs(),
+                    });
+                }
+                match self.incoming.recv_timeout(remaining) {
+                    Ok(value) => value?,
+                    Err(RecvTimeoutError::Timeout) => {
+                        self.queued.extend(deferred);
+                        return Err(Error::Timeout {
+                            seconds: timeout.as_secs(),
+                        });
+                    }
+                    Err(RecvTimeoutError::Disconnected) => {
+                        self.queued.extend(deferred);
+                        return Err(Error::Protocol(
+                            "app-server closed the control connection".to_owned(),
+                        ));
+                    }
+                }
             };
             if is_server_request(&value) {
                 let requested_method = reject_server_request(self.stdin_mut()?, &value)?;
@@ -383,6 +470,7 @@ impl ControlClient {
                 return response_result(response);
             }
             if deferred.len() >= MAX_DEFERRED_MESSAGES {
+                self.queued.extend(deferred);
                 return Err(Error::Protocol(format!(
                     "more than {MAX_DEFERRED_MESSAGES} unrelated messages arrived while awaiting {method}"
                 )));
@@ -408,18 +496,6 @@ impl ControlClient {
         self.incoming
             .recv()
             .map_err(|_| Error::Protocol("app-server closed the control connection".to_owned()))?
-    }
-
-    fn receive_value_timeout(&self, timeout: Duration) -> Result<Value> {
-        match self.incoming.recv_timeout(timeout) {
-            Ok(value) => value,
-            Err(RecvTimeoutError::Timeout) => Err(Error::Timeout {
-                seconds: timeout.as_secs(),
-            }),
-            Err(RecvTimeoutError::Disconnected) => Err(Error::Protocol(
-                "app-server closed the control connection".to_owned(),
-            )),
-        }
     }
 }
 
@@ -823,6 +899,76 @@ fn parse_turn(result: &Value) -> Result<ControlledTurn> {
     })
 }
 
+fn parse_thread_observation(
+    result: &Value,
+    expected_client_message_ids: &[&str],
+) -> Result<ThreadObservation> {
+    let thread = result
+        .get("thread")
+        .ok_or_else(|| Error::Protocol("thread/read response had no thread".to_owned()))?;
+    let raw_status = thread
+        .get("status")
+        .and_then(|value| value.get("type"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::Protocol("thread/read status was missing or invalid".to_owned()))?;
+    let status = normalize_thread_status(raw_status);
+    let turns = thread
+        .get("turns")
+        .and_then(Value::as_array)
+        .ok_or_else(|| Error::Protocol("thread/read turns were missing or invalid".to_owned()))?
+        .iter()
+        .map(|turn| {
+            let matched_client_message_ids = turn
+                .get("items")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|item| item.get("type").and_then(Value::as_str) == Some("userMessage"))
+                .filter_map(|item| item.get("clientId").and_then(Value::as_str))
+                .filter(|client_id| expected_client_message_ids.contains(client_id))
+                .map(ToOwned::to_owned)
+                .collect();
+            Ok(TurnObservation {
+                turn_id: required_string(turn, "id")?,
+                status: normalize_turn_status(&required_string(turn, "status")?),
+                items_full: turn
+                    .get("itemsView")
+                    .and_then(Value::as_str)
+                    .unwrap_or("full")
+                    == "full",
+                matched_client_message_ids,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(ThreadObservation {
+        thread_id: required_string(thread, "id")?,
+        status,
+        turns,
+    })
+}
+
+fn normalize_thread_status(value: &str) -> String {
+    match value {
+        "notLoaded" => "not_loaded",
+        "idle" => "idle",
+        "systemError" => "system_error",
+        "active" => "active",
+        _ => "unknown",
+    }
+    .to_owned()
+}
+
+fn normalize_turn_status(value: &str) -> String {
+    match value {
+        "inProgress" => "in_progress",
+        "completed" => "completed",
+        "failed" => "failed",
+        "interrupted" => "interrupted",
+        _ => "unknown",
+    }
+    .to_owned()
+}
+
 fn required_string(value: &Value, field: &str) -> Result<String> {
     value
         .get(field)
@@ -1047,5 +1193,34 @@ mod tests {
             parse_controlled_thread(&valid, std::path::Path::new("/different/project")),
             Err(Error::PolicyMismatch(_))
         ));
+    }
+
+    #[test]
+    fn thread_observation_discards_content_but_keeps_client_identity() -> Result<()> {
+        let result = json!({
+            "thread": {
+                "id": "thread-1",
+                "status": {"type": "PRIVATE_THREAD_STATUS"},
+                "turns": [{
+                    "id": "turn-1",
+                    "status": "PRIVATE_TURN_STATUS",
+                    "items": [
+                        {"type": "userMessage", "id": "item-1", "clientId": "client-1",
+                         "content": [{"type": "text", "text": "PRIVATE SENTINEL"}]},
+                        {"type": "agentMessage", "id": "item-2", "text": "SECRET"}
+                    ]
+                }]
+            }
+        });
+        let observed = parse_thread_observation(&result, &["client-1"])?;
+        assert_eq!(observed.thread_id, "thread-1");
+        assert_eq!(observed.status, "unknown");
+        assert_eq!(observed.turns[0].status, "unknown");
+        assert_eq!(observed.turns[0].matched_client_message_ids, ["client-1"]);
+        assert!(observed.turns[0].items_full);
+        assert!(!format!("{observed:?}").contains("PRIVATE SENTINEL"));
+        assert!(!format!("{observed:?}").contains("SECRET"));
+        assert!(!format!("{observed:?}").contains("PRIVATE_THREAD_STATUS"));
+        Ok(())
     }
 }

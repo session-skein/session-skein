@@ -25,9 +25,10 @@ and a polished TUI only after behavior is observable and safe.
 
 - [x] Explicit project/thread start, resume, turn start, and foreground monitoring.
 - [x] Reconnectable detached watch and exact active-turn interruption.
-- [ ] Separate source read and active-turn steer operations.
+- [x] Separate source read and active-turn steer operations.
 - [x] Explicit full-access policy snapshots and audit records for control operations.
-- [ ] Read-only reconciliation of uncertain runs after restart.
+- [x] Read-only reconciliation of exact terminal turns after worker loss.
+- [ ] Worker takeover or reattachment after worker loss.
 - [x] Fenced, per-run Codex process ownership without tmux.
 
 ## Phase 4: conductor

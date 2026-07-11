@@ -3,7 +3,7 @@ members = ["crates/skein-cli", "crates/skein-codex", "crates/skein-core"]
 resolver = "2"
 
 [workspace.package]
-version = "0.5.0-alpha.2"
+version = "0.5.0-alpha.3"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -16,8 +16,8 @@ directories = "6.0.0"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
-skein-codex = { version = "0.5.0-alpha.2", path = "crates/skein-codex" }
-skein-core = { version = "0.5.0-alpha.2", path = "crates/skein-core" }
+skein-codex = { version = "0.5.0-alpha.3", path = "crates/skein-codex" }
+skein-core = { version = "0.5.0-alpha.3", path = "crates/skein-core" }
 tempfile = "3.27.0"
 thiserror = "2.0.18"
 uuid = { version = "1.18.1", features = ["v4"] }

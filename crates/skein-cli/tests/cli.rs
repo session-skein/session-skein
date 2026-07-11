@@ -595,6 +595,7 @@ fn reconnects_to_a_worker_after_the_starting_client_exits() -> Result<(), Box<dy
     );
     let project = project.canonicalize()?;
     let script = temp.path().join("fake-codex-worker");
+    let steer_log = temp.path().join("steer.json");
     let interrupt_log = temp.path().join("interrupt.json");
     let thread_response = json!({
         "id": 3,
@@ -625,13 +626,17 @@ printf '%s\n' '{{"method":"turn/started","params":{{"threadId":"worker-thread","
 for _ in $(seq 1 520); do
   printf '%s\n' '{{"method":"item/agentMessage/delta","params":{{"threadId":"worker-thread","turnId":"worker-turn","itemId":"message","delta":"WORKER_SECRET_OUTPUT"}}}}'
 done
+read -r steer
+printf '%s\n' "$steer" > '{}'
+printf '%s\n' '{{"id":5,"result":{{"turnId":"worker-turn"}}}}'
 read -r interrupt
 printf '%s\n' "$interrupt" > '{}'
-printf '%s\n' '{{"id":5,"result":{{}}}}'
+printf '%s\n' '{{"id":6,"result":{{}}}}'
 printf '%s\n' '{{"method":"turn/completed","params":{{"threadId":"worker-thread","turn":{{"id":"worker-turn","status":"interrupted","items":[]}}}}}}'
 read -r _ || true
 "#,
             thread_response,
+            steer_log.display(),
             interrupt_log.display()
         ),
     )?;
@@ -706,6 +711,65 @@ read -r _ || true
     std::fs::write(&capability_path, &capability)?;
     std::fs::set_permissions(&capability_path, std::fs::Permissions::from_mode(0o600))?;
 
+    let request_id = "00000000-0000-4000-8000-000000000456";
+    let mut steering = skein(&data, &config)
+        .args([
+            "worker",
+            "steer",
+            &run_id.to_string(),
+            "--request-id",
+            request_id,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    steering
+        .stdin
+        .take()
+        .expect("steer stdin")
+        .write_all(b"WORKER_SECRET_STEER")?;
+    let steered = steering.wait_with_output()?;
+    assert!(
+        steered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&steered.stderr)
+    );
+    let mut retry = skein(&data, &config)
+        .args([
+            "worker",
+            "steer",
+            &run_id.to_string(),
+            "--request-id",
+            request_id,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    retry
+        .stdin
+        .take()
+        .expect("retry stdin")
+        .write_all(b"WORKER_SECRET_STEER")?;
+    let retry = retry.wait_with_output()?;
+    assert!(retry.status.success());
+    assert!(String::from_utf8_lossy(&retry.stdout).contains("reused action"));
+    for _ in 0..200 {
+        if steer_log.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    let steer_text = std::fs::read_to_string(&steer_log)
+        .map_err(|error| format!("failed to read {}: {error}", steer_log.display()))?;
+    let steer: Value = serde_json::from_str(&steer_text)?;
+    assert_eq!(steer["method"], "turn/steer");
+    assert_eq!(steer["params"]["threadId"], "worker-thread");
+    assert_eq!(steer["params"]["expectedTurnId"], "worker-turn");
+    assert_eq!(steer["params"]["clientUserMessageId"], request_id);
+    assert_eq!(steer_text.lines().count(), 1);
+
     let interrupted = skein(&data, &config)
         .args(["worker", "interrupt", &run_id.to_string()])
         .output()?;
@@ -743,6 +807,13 @@ read -r _ || true
             action["action_kind"] == "turn_interrupt" && action["state"] == "succeeded"
         })
     }));
+    assert!(audit["actions"].as_array().is_some_and(|actions| {
+        actions.iter().any(|action| {
+            action["action_kind"] == "turn_steer"
+                && action["state"] == "succeeded"
+                && action["client_request_id"] == request_id
+        })
+    }));
     let repeated = skein(&data, &config)
         .args(["worker", "interrupt", &run_id.to_string()])
         .output()?;
@@ -759,6 +830,11 @@ read -r _ || true
         !database
             .windows(20)
             .any(|value| value == b"WORKER_SECRET_OUTPUT")
+    );
+    assert!(
+        !database
+            .windows(19)
+            .any(|value| value == b"WORKER_SECRET_STEER")
     );
     assert!(
         !database
@@ -782,6 +858,180 @@ read -r _ || true
         .args(["worker", "status", "999999", "--json"])
         .output()?;
     assert!(!unknown.status.success());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn reads_and_reconciles_exact_lost_worker_turn_without_source_content() -> Result<(), Box<dyn Error>>
+{
+    use std::os::unix::fs::PermissionsExt;
+
+    use skein_core::NewControlRun;
+    use skein_core::Registry;
+    use skein_core::SkeinPaths;
+    use skein_core::WorkerState;
+
+    let temp = tempfile::tempdir()?;
+    let data = temp.path().join("data");
+    let config = temp.path().join("config");
+    let project = temp.path().join("project");
+    std::fs::create_dir(&project)?;
+    let paths = SkeinPaths::new(config.clone(), data.clone());
+    let mut registry = Registry::open(&paths)?;
+    registry.add_project(&project, Some("Synthetic"))?;
+    let plan = registry.plan_control_run(&NewControlRun {
+        project_path: &project,
+        resume_thread_id: None,
+        prompt: "RECOVERY_PRIVATE_INITIAL",
+        full_access_acknowledged: true,
+    })?;
+    let claim = registry.create_control_worker(plan.run_id)?;
+    registry.mark_worker_ready(&claim, "127.0.0.1:1", 42)?;
+    registry.heartbeat_worker(&claim, WorkerState::Busy)?;
+    registry.begin_owned_control_action(plan.thread_action_id, &claim)?;
+    registry.acknowledge_owned_thread_action(
+        plan.thread_action_id,
+        "recovery-thread",
+        Some("recovery-session"),
+        &claim,
+    )?;
+    registry.begin_owned_control_action(plan.turn_action_id, &claim)?;
+    registry.acknowledge_owned_turn_action(plan.turn_action_id, "recovery-turn", &claim)?;
+    registry.mark_owned_control_uncertain(plan.run_id, &claim)?;
+    registry.finish_worker(&claim, "clean")?;
+    drop(registry);
+
+    let log = temp.path().join("read.log");
+    let script = temp.path().join("fake-codex-read");
+    let response = json!({
+        "id": 3,
+        "result": {
+            "thread": {
+                "id": "recovery-thread",
+                "sessionId": "recovery-session",
+                "cwd": project.canonicalize()?,
+                "createdAt": 1,
+                "updatedAt": 2,
+                "source": "appServer",
+                "status": {"type": "notLoaded"},
+                "modelProvider": "openai",
+                "cliVersion": "0.144.1",
+                "ephemeral": false,
+                "preview": "RECOVERY_PRIVATE_PREVIEW",
+                "turns": [{
+                    "id": "recovery-turn",
+                    "status": "completed",
+                    "itemsView": "full",
+                    "items": [{
+                        "type": "userMessage",
+                        "id": "recovery-item",
+                        "clientId": plan.client_message_id,
+                        "content": [{"type": "text", "text": "RECOVERY_PRIVATE_SOURCE"}]
+                    }]
+                }]
+            }
+        }
+    });
+    std::fs::write(
+        &script,
+        format!(
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+read -r _
+printf '%s\n' '{{"id":1,"result":{{"userAgent":"synthetic"}}}}'
+read -r _
+read -r _
+printf '%s\n' '{{"id":2,"result":{{"requiresOpenaiAuth":true,"account":{{"type":"chatgpt","email":null,"planType":"pro"}}}}}}'
+read -r request
+printf '%s\n' "$request" >> '{}'
+printf '%s\n' '{}'
+read -r _ || true
+"#,
+            log.display(),
+            response
+        ),
+    )?;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))?;
+
+    let reconciled = skein(&data, &config)
+        .env("SKEIN_CODEX_BIN", &script)
+        .args([
+            "worker",
+            "reconcile",
+            &plan.run_id.to_string(),
+            "--request-id",
+            "00000000-0000-4000-8000-000000000789",
+            "--json",
+        ])
+        .output()?;
+    assert!(
+        reconciled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reconciled.stderr)
+    );
+    let reconciled_text = String::from_utf8(reconciled.stdout)?;
+    assert!(!reconciled_text.contains("RECOVERY_PRIVATE"));
+    let reconciled: Value = serde_json::from_str(&reconciled_text)?;
+    assert_eq!(reconciled["run"]["state"], "completed");
+    assert_eq!(reconciled["source"]["turnId"], "recovery-turn");
+
+    let retried = skein(&data, &config)
+        .env("SKEIN_CODEX_BIN", temp.path().join("must-not-run"))
+        .args([
+            "worker",
+            "reconcile",
+            &plan.run_id.to_string(),
+            "--request-id",
+            "00000000-0000-4000-8000-000000000789",
+            "--json",
+        ])
+        .output()?;
+    assert!(retried.status.success());
+    let retried: Value = serde_json::from_slice(&retried.stdout)?;
+    assert_eq!(retried["reused"], true);
+    assert_eq!(retried["run"]["state"], "completed");
+
+    let read = skein(&data, &config)
+        .env("SKEIN_CODEX_BIN", &script)
+        .args(["worker", "read", &plan.run_id.to_string(), "--json"])
+        .output()?;
+    assert!(read.status.success());
+    let read_text = String::from_utf8(read.stdout)?;
+    assert!(!read_text.contains("RECOVERY_PRIVATE"));
+    let read: Value = serde_json::from_str(&read_text)?;
+    assert_eq!(read["turns"][0]["status"], "completed");
+    assert_eq!(read["contentRedacted"], true);
+
+    let requests = std::fs::read_to_string(&log)?;
+    assert_eq!(requests.lines().count(), 2);
+    for line in requests.lines() {
+        let request: Value = serde_json::from_str(line)?;
+        assert_eq!(request["method"], "thread/read");
+        assert_eq!(request["params"]["threadId"], "recovery-thread");
+        assert_eq!(request["params"]["includeTurns"], true);
+    }
+    let audit = skein(&data, &config)
+        .args(["control", "show", &plan.run_id.to_string(), "--json"])
+        .output()?;
+    let audit: Value = serde_json::from_slice(&audit.stdout)?;
+    assert!(audit["actions"].as_array().is_some_and(|actions| {
+        actions.iter().any(|action| {
+            action["action_kind"] == "status_reconcile" && action["state"] == "succeeded"
+        })
+    }));
+    let database = std::fs::read(data.join("skein.sqlite3"))?;
+    for sentinel in [
+        b"RECOVERY_PRIVATE_INITIAL".as_slice(),
+        b"RECOVERY_PRIVATE_PREVIEW".as_slice(),
+        b"RECOVERY_PRIVATE_SOURCE".as_slice(),
+    ] {
+        assert!(
+            !database
+                .windows(sentinel.len())
+                .any(|value| value == sentinel)
+        );
+    }
     Ok(())
 }
 

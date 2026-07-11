@@ -94,6 +94,30 @@ enum WorkerCommand {
     Stop { run_id: i64 },
     /// Interrupt the exact active Codex turn owned by a worker.
     Interrupt { run_id: i64 },
+    /// Append stdin text to the exact active turn owned by a worker.
+    Steer {
+        run_id: i64,
+        /// Stable UUID for safely retrying a lost client response.
+        #[arg(long)]
+        request_id: Option<String>,
+    },
+    /// Read redacted authoritative source identity and status without resuming it.
+    Read {
+        run_id: i64,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Reconcile a lost worker run against its exact Codex source turn.
+    Reconcile {
+        run_id: i64,
+        /// Stable UUID for safely retrying this read-only probe.
+        #[arg(long)]
+        request_id: Option<String>,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Internal worker process entry point.
     #[command(hide = true)]
     Serve { run_id: i64 },
@@ -542,6 +566,35 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             WorkerCommand::Interrupt { run_id } => {
                 worker_runtime::interrupt(&paths, run_id)?;
                 println!("interrupt accepted for run {run_id}");
+            }
+            WorkerCommand::Steer { run_id, request_id } => {
+                let prompt = read_control_prompt()?;
+                let request_id = request_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                let (action_id, queued) =
+                    worker_runtime::steer(&paths, run_id, &request_id, prompt)?;
+                if queued {
+                    println!(
+                        "steer queued for run {run_id} as action {action_id} (request {request_id})"
+                    );
+                } else {
+                    println!(
+                        "steer request reused action {action_id} for run {run_id} (request {request_id})"
+                    );
+                }
+            }
+            WorkerCommand::Read { run_id, json } => {
+                print_value(&worker_runtime::read_source(&paths, run_id)?, json)?;
+            }
+            WorkerCommand::Reconcile {
+                run_id,
+                request_id,
+                json,
+            } => {
+                let request_id = request_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                print_value(
+                    &worker_runtime::reconcile(&paths, run_id, &request_id)?,
+                    json,
+                )?;
             }
             WorkerCommand::Serve { run_id } => worker_runtime::serve(paths, run_id)?,
             WorkerCommand::CodexGuard => worker_runtime::codex_guard()?,

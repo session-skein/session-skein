@@ -29,7 +29,7 @@ Versioned SQLite state + Codex-owned transcripts
 
 ## Control state
 
-Schema version 5 keeps control intent separate from imported sessions. Immutable
+Schema version 6 keeps control intent separate from imported sessions. Immutable
 policy snapshots record the exact authority acknowledged for a run. Skein-owned runs,
 turns, actions, and append-only events are committed before app-server mutations.
 Observed session status never drives the control state machine.
@@ -39,8 +39,10 @@ worker path assigns a run to a per-run process with a heartbeat lease and fencin
 epoch. Every worker mutation records and verifies that owner. A detached process owns
 the Codex connection behind a child guard, while clients use authenticated loopback
 IPC and may restart independently. Expired workers are fenced and their runs become
-`recovery_required`; mutating requests are never replayed automatically. Read-only
-source reconciliation remains the next control milestone. See
+`recovery_required`; mutating requests are never replayed automatically. Exact-turn
+steer uses the existing fenced connection. A separate read-only `thread/read` path can
+record content-free source evidence and close an exact terminal recovery run without
+taking over it. See
 [workers.md](workers.md) and [codex-control.md](codex-control.md).
 
 ## Git metadata adapter

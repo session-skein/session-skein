@@ -47,7 +47,11 @@ printf '%s\n' 'Run the focused tests.' | \
 cargo run --release --bin skein -- worker list --active --json
 cargo run --release --bin skein -- worker status RUN_ID --json
 cargo run --release --bin skein -- worker watch RUN_ID --jsonl
+printf '%s\n' 'Change direction without starting a new turn.' | \
+  cargo run --release --bin skein -- worker steer RUN_ID
 cargo run --release --bin skein -- worker interrupt RUN_ID
+cargo run --release --bin skein -- worker read RUN_ID --json
+cargo run --release --bin skein -- worker reconcile RUN_ID --json
 cargo run --release --bin skein -- worker stop RUN_ID
 ```
 
@@ -85,8 +89,11 @@ Session Skein. Resume a selected thread with `--resume THREAD_ID`. See
 `worker start` and `worker resume` create one on-demand Skein worker per run. The
 worker owns the Codex stdio connection, so the starting CLI or a watcher can exit
 without stopping the turn. Fresh CLI processes discover jobs with `worker list`,
-inspect durable redacted state, reattach to a bounded memory-only event window, and
-interrupt the exact active turn without handling thread or turn IDs. See
+inspect durable redacted state, reattach to a bounded memory-only event window,
+steer or interrupt the exact active turn without handling thread or turn IDs, and
+read redacted source status. A fenced lost worker can be reconciled against the exact
+recorded Codex turn; terminal source truth closes the run, while an in-progress or
+missing turn remains recovery-required. No work is replayed or taken over. See
 [docs/workers.md](docs/workers.md).
 
 Environment overrides:
