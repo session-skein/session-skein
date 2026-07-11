@@ -3,7 +3,14 @@
 All notable changes will be documented here. The project follows Semantic Versioning
 after its first published release.
 
-## [0.5.0-alpha.3] - Unreleased steer and source reconciliation
+## [0.5.0-alpha.4] - Unreleased explainable matching and activity views
+
+- Added private-stdin metadata matching across registered projects and linked sessions
+  with deterministic integer evidence, stable confidence labels, and no dispatch.
+- Added generated-on-read project cards and local-day activity digests from already
+  observed Git, session, and control metadata without Codex, an LLM, or cached prose.
+
+## [0.5.0-alpha.3] - 2026-07-11
 
 - Added idempotent, exact-active-turn steering through reconnectable worker IPC with
   an interrupt barrier and content-free durable audit evidence.

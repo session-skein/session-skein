@@ -1035,6 +1035,118 @@ read -r _ || true
     Ok(())
 }
 
+#[test]
+fn matches_and_summarizes_local_metadata_without_codex_or_query_persistence()
+-> Result<(), Box<dyn Error>> {
+    use skein_core::Registry;
+    use skein_core::SessionObservation;
+    use skein_core::SkeinPaths;
+
+    let temp = tempfile::tempdir()?;
+    let data = temp.path().join("data");
+    let config = temp.path().join("config");
+    let project = temp.path().join("checkout-service");
+    std::fs::create_dir(&project)?;
+    let paths = SkeinPaths::new(config.clone(), data.clone());
+    let mut registry = Registry::open(&paths)?;
+    registry.add_project(&project, Some("Checkout Service"))?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs() as i64;
+    registry.import_sessions(&[SessionObservation {
+        source_kind: "codex".to_owned(),
+        source_thread_id: "01900000-0000-7000-8000-000000000321".to_owned(),
+        source_session_id: Some("01900000-0000-7000-8000-000000000320".to_owned()),
+        source_cwd: project.clone(),
+        source_created_at: now - 60,
+        source_updated_at: now,
+        source_label: "cli".to_owned(),
+        observed_status_label: "notLoaded".to_owned(),
+        model_provider: Some("openai".to_owned()),
+        source_version: Some("0.144.1".to_owned()),
+        parent_source_thread_id: None,
+        forked_from_source_thread_id: None,
+        ephemeral: false,
+        name: Some("SESSION_PRIVATE_TITLE".to_owned()),
+        preview: Some("SESSION_PRIVATE_PREVIEW".to_owned()),
+        text_imported: true,
+    }])?;
+    drop(registry);
+
+    let query_sentinel = "QUERY_PRIVATE_NEVER_STORE";
+    let mut child = skein(&data, &config)
+        .env("SKEIN_CODEX_BIN", temp.path().join("must-not-run"))
+        .args(["match", "--json"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child.stdin.take().expect("match stdin").write_all(
+        format!("{query_sentinel} continue 01900000-0000-7000-8000-000000000321").as_bytes(),
+    )?;
+    let output = child.wait_with_output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout)?;
+    assert!(!text.contains(query_sentinel));
+    assert!(!text.contains("SESSION_PRIVATE_TITLE"));
+    assert!(!text.contains("SESSION_PRIVATE_PREVIEW"));
+    let report: Value = serde_json::from_str(&text)?;
+    assert_eq!(report["recommendation"]["confidence"], "high");
+    assert_eq!(report["recommendation"]["action"], "resume");
+    assert_eq!(report["recommendation"]["dispatchable"], false);
+
+    let mut with_text = skein(&data, &config)
+        .env("SKEIN_CODEX_BIN", temp.path().join("must-not-run"))
+        .args(["match", "--include-text", "--json"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    with_text
+        .stdin
+        .take()
+        .expect("match stdin")
+        .write_all(b"SESSION_PRIVATE_TITLE checkout")?;
+    let with_text = with_text.wait_with_output()?;
+    assert!(with_text.status.success());
+    let with_text = String::from_utf8(with_text.stdout)?;
+    assert!(!with_text.contains("SESSION_PRIVATE_TITLE"));
+    assert!(!with_text.contains("SESSION_PRIVATE_PREVIEW"));
+
+    let card = skein(&data, &config)
+        .env("SKEIN_CODEX_BIN", temp.path().join("must-not-run"))
+        .arg("summary")
+        .arg("project")
+        .arg(&project)
+        .arg("--json")
+        .output()?;
+    assert!(card.status.success());
+    let card_text = String::from_utf8(card.stdout)?;
+    assert!(card_text.contains("Checkout Service"));
+    assert!(!card_text.contains("SESSION_PRIVATE"));
+
+    let day = skein(&data, &config)
+        .env("SKEIN_CODEX_BIN", temp.path().join("must-not-run"))
+        .args(["summary", "day", "--json"])
+        .output()?;
+    assert!(day.status.success());
+    let day: Value = serde_json::from_slice(&day.stdout)?;
+    assert_eq!(day["persisted"], false);
+    assert_eq!(day["coverage"]["externalShellWork"], false);
+
+    let database = std::fs::read(data.join("skein.sqlite3"))?;
+    assert!(
+        !database
+            .windows(query_sentinel.len())
+            .any(|window| window == query_sentinel.as_bytes())
+    );
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
 fn closed_control_connection_fails_before_state_mutation() -> Result<(), Box<dyn Error>> {

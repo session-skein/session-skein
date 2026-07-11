@@ -18,8 +18,8 @@ and a polished TUI only after behavior is observable and safe.
 
 - [x] Read-only Codex session discovery.
 - [x] Durable Codex session catalog and project relationships.
-- [ ] Search and ranking with explainable evidence.
-- [ ] Cheap incremental activity summaries.
+- [x] Search and ranking with explainable evidence.
+- [x] Cheap incremental activity summaries.
 
 ## Phase 3: Codex-native control
 

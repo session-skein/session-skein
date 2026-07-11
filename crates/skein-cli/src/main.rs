@@ -3,6 +3,9 @@ mod worker_runtime;
 use std::io::Read;
 use std::path::PathBuf;
 
+use chrono::Local;
+use chrono::NaiveDate;
+use chrono::TimeZone;
 use clap::ArgGroup;
 use clap::Args;
 use clap::Parser;
@@ -18,6 +21,7 @@ use skein_core::SessionObservation;
 use skein_core::SkeinPaths;
 
 const MAX_CONTROL_PROMPT_BYTES: usize = 1024 * 1024;
+const MAX_MATCH_QUERY_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(name = "skein", version, about)]
@@ -56,6 +60,45 @@ enum Command {
     Worker {
         #[command(subcommand)]
         command: WorkerCommand,
+    },
+    /// Rank registered projects and linked sessions without dispatching work.
+    Match {
+        /// Allow explicitly imported session names/previews to influence local scoring.
+        #[arg(long)]
+        include_text: bool,
+        /// Maximum number of ranked projects to return.
+        #[arg(long, default_value_t = 5)]
+        limit: usize,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Render deterministic project cards and bounded activity digests.
+    Summary {
+        #[command(subcommand)]
+        command: SummaryCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SummaryCommand {
+    /// Describe every registered project in stable order.
+    Projects {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Describe one registered project from already observed metadata.
+    Project {
+        path: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Summarize bounded metadata activity for one local calendar day.
+    Day {
+        /// Local date in YYYY-MM-DD form; defaults to today.
+        date: Option<String>,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -599,6 +642,67 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             WorkerCommand::Serve { run_id } => worker_runtime::serve(paths, run_id)?,
             WorkerCommand::CodexGuard => worker_runtime::codex_guard()?,
         },
+        Command::Match {
+            include_text,
+            limit,
+            json,
+        } => {
+            if !(1..=50).contains(&limit) {
+                return Err(skein_core::Error::InvalidControlRequest(
+                    "match limit must be in 1..=50".to_owned(),
+                )
+                .into());
+            }
+            let query = read_match_query()?;
+            let registry = Registry::open(&paths)?;
+            let report = registry.match_metadata(&skein_core::MatchOptions {
+                query: &query,
+                include_text,
+                limit,
+                now: unix_timestamp(),
+            })?;
+            print_match_report(&report, json)?;
+        }
+        Command::Summary { command } => {
+            let registry = Registry::open(&paths)?;
+            match command {
+                SummaryCommand::Projects { json } => {
+                    let cards = registry.project_cards()?;
+                    if json {
+                        print_value(&cards, true)?;
+                    } else {
+                        for card in cards {
+                            println!("{}", card.narrative);
+                        }
+                    }
+                }
+                SummaryCommand::Project { path, json } => {
+                    let card = registry.project_card(&path)?;
+                    if json {
+                        print_value(&card, true)?;
+                    } else {
+                        println!("{}", card.narrative);
+                    }
+                }
+                SummaryCommand::Day { date, json } => {
+                    let (date, timezone, start_at, end_at) = local_day_bounds(date.as_deref())?;
+                    let summary = registry.day_summary(&date, &timezone, start_at, end_at)?;
+                    if json {
+                        print_value(&summary, true)?;
+                    } else {
+                        println!("{}", summary.narrative);
+                        for project in &summary.projects {
+                            println!(
+                                "- {}: {} session metadata observation(s), {} run(s) created",
+                                project.project_name,
+                                project.session_observations,
+                                project.runs_created
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     Ok(())
@@ -712,6 +816,109 @@ fn read_control_prompt() -> Result<String, Box<dyn std::error::Error>> {
         .into());
     }
     Ok(prompt)
+}
+
+fn read_match_query() -> Result<String, Box<dyn std::error::Error>> {
+    let mut query = String::new();
+    std::io::stdin()
+        .take((MAX_MATCH_QUERY_BYTES + 1) as u64)
+        .read_to_string(&mut query)?;
+    if query.len() > MAX_MATCH_QUERY_BYTES {
+        return Err(skein_core::Error::InvalidControlRequest(format!(
+            "match query exceeds the {MAX_MATCH_QUERY_BYTES}-byte limit"
+        ))
+        .into());
+    }
+    if query.trim().is_empty() {
+        return Err(skein_core::Error::InvalidControlRequest(
+            "provide the private match query on standard input".to_owned(),
+        )
+        .into());
+    }
+    Ok(query)
+}
+
+fn print_match_report(
+    report: &skein_core::MatchReport,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if json {
+        return print_value(report, true);
+    }
+    let Some(recommendation) = &report.recommendation else {
+        println!("No metadata match. No project was selected.");
+        return Ok(());
+    };
+    let top = report
+        .candidates
+        .first()
+        .ok_or("match recommendation had no candidate")?;
+    println!("Best match: {}", top.project.name);
+    println!(
+        "Confidence: {} (score {}, runner-up margin {}, dispatch disabled)",
+        format!("{:?}", recommendation.confidence).to_lowercase(),
+        recommendation.score,
+        recommendation.runner_up_margin
+    );
+    for (index, candidate) in report.candidates.iter().enumerate() {
+        println!(
+            "{}. {} [{}]",
+            index + 1,
+            candidate.project.name,
+            candidate.score
+        );
+        for evidence in &candidate.evidence {
+            println!(
+                "   +{} {}:{} ({} match(es))",
+                evidence.points, evidence.family, evidence.kind, evidence.matches
+            );
+        }
+        if let Some(session) = &candidate.suggested_session {
+            println!("   session: {}", session.source_thread_id);
+            for evidence in &session.evidence {
+                println!(
+                    "   +{} {}:{} ({} match(es))",
+                    evidence.points, evidence.family, evidence.kind, evidence.matches
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn local_day_bounds(
+    requested: Option<&str>,
+) -> Result<(String, String, i64, i64), Box<dyn std::error::Error>> {
+    let date = requested.map_or_else(
+        || Ok(Local::now().date_naive()),
+        |value| NaiveDate::parse_from_str(value, "%Y-%m-%d"),
+    )?;
+    let next = date
+        .succ_opt()
+        .ok_or("requested date has no representable following day")?;
+    let start = Local
+        .from_local_datetime(&date.and_hms_opt(0, 0, 0).ok_or("invalid day start")?)
+        .earliest()
+        .ok_or("local midnight was not representable")?;
+    let end = Local
+        .from_local_datetime(&next.and_hms_opt(0, 0, 0).ok_or("invalid day end")?)
+        .earliest()
+        .ok_or("following local midnight was not representable")?;
+    let timezone = iana_time_zone::get_timezone().unwrap_or_else(|_| "local".to_owned());
+    Ok((
+        date.format("%Y-%m-%d").to_string(),
+        timezone,
+        start.timestamp(),
+        end.timestamp(),
+    ))
+}
+
+fn unix_timestamp() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
+        })
 }
 
 fn control_codex(
@@ -973,4 +1180,19 @@ fn print_value<T: Serialize>(value: &T, json: bool) -> Result<(), Box<dyn std::e
         println!("{}", serde_json::to_string(value)?);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod local_time_tests {
+    use super::*;
+
+    #[test]
+    fn local_day_bounds_are_calendar_based_and_bounded() {
+        let (date, timezone, start, end) =
+            local_day_bounds(Some("2026-07-11")).expect("valid local day");
+        assert_eq!(date, "2026-07-11");
+        assert!(!timezone.is_empty());
+        assert!((23 * 60 * 60..=25 * 60 * 60).contains(&(end - start)));
+        assert!(local_day_bounds(Some("not-a-date")).is_err());
+    }
 }

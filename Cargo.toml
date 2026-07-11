@@ -3,7 +3,7 @@ members = ["crates/skein-cli", "crates/skein-codex", "crates/skein-core"]
 resolver = "2"
 
 [workspace.package]
-version = "0.5.0-alpha.3"
+version = "0.5.0-alpha.4"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -13,11 +13,13 @@ homepage = "https://github.com/session-skein/session-skein"
 [workspace.dependencies]
 clap = { version = "4.6.1", features = ["derive"] }
 directories = "6.0.0"
+chrono = { version = "0.4.42", default-features = false, features = ["clock", "std"] }
+iana-time-zone = "0.1.64"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
-skein-codex = { version = "0.5.0-alpha.3", path = "crates/skein-codex" }
-skein-core = { version = "0.5.0-alpha.3", path = "crates/skein-core" }
+skein-codex = { version = "0.5.0-alpha.4", path = "crates/skein-codex" }
+skein-core = { version = "0.5.0-alpha.4", path = "crates/skein-core" }
 tempfile = "3.27.0"
 thiserror = "2.0.18"
 uuid = { version = "1.18.1", features = ["v4"] }

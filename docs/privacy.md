@@ -49,3 +49,11 @@ is IPv4 loopback-only, its app-server transport is local, and it stores no Codex
 credentials. A controlled Codex process does
 contact OpenAI and may contact configured web or MCP services under Codex's own
 configuration and the explicitly acknowledged full-access policy.
+
+Matching queries are accepted only on stdin, bounded to 64 KiB, used in memory, and
+never returned in JSON or persisted. Default matching ignores stored session names and
+previews. `--include-text` permits explicitly imported text to affect local scores but
+still emits only field names, counts, points, and opaque identities—not the matched
+source values. Project cards and day summaries are generated on read and are not
+cached. Project cards may display the already stored Git commit subject; neither view
+reads session transcripts, agent output, commands, diffs, or MCP content.
