@@ -3,6 +3,7 @@ use std::path::Path;
 use std::process::Command;
 
 use serde_json::Value;
+use serde_json::json;
 
 fn skein(data_dir: &Path, config_dir: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_skein"));
@@ -177,6 +178,165 @@ fn codex_preview_reports_a_missing_configured_executable() -> Result<(), Box<dyn
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("app-server I/O failed"));
     assert!(!temp.path().join("data").exists());
+    Ok(())
+}
+
+#[test]
+fn codex_sync_failure_does_not_create_or_migrate_state() -> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let data = temp.path().join("data");
+    let output = skein(&data, &temp.path().join("config"))
+        .env("SKEIN_CODEX_BIN", temp.path().join("missing-codex"))
+        .args(["session", "sync", "codex", "--json"])
+        .output()?;
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("app-server I/O failed"));
+    assert!(!data.exists());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn synchronizes_lists_and_explicitly_rebinds_codex_sessions() -> Result<(), Box<dyn Error>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir()?;
+    let data = temp.path().join("data");
+    let config = temp.path().join("config");
+    let project = temp.path().join("project");
+    let nested = project.join("nested");
+    let alternate = temp.path().join("alternate");
+    std::fs::create_dir_all(&nested)?;
+    std::fs::create_dir(&alternate)?;
+
+    for path in [&project, &alternate] {
+        assert!(
+            skein(&data, &config)
+                .arg("project")
+                .arg("add")
+                .arg(path)
+                .output()?
+                .status
+                .success()
+        );
+    }
+
+    let thread = json!({
+        "id": "synthetic-thread",
+        "sessionId": "synthetic-tree",
+        "cwd": nested,
+        "createdAt": 10,
+        "updatedAt": 20,
+        "source": "cli",
+        "status": {"type": "notLoaded"},
+        "modelProvider": "synthetic-provider",
+        "cliVersion": "1.2.3",
+        "parentThreadId": null,
+        "forkedFromId": null,
+        "ephemeral": false,
+        "name": "Synthetic title",
+        "preview": "Synthetic preview",
+        "turns": []
+    });
+    let response = json!({
+        "id": 2,
+        "result": {"data": [thread], "nextCursor": "opaque-next"}
+    });
+    let script = temp.path().join("fake-codex");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/usr/bin/env bash\nset -euo pipefail\nread -r _\nprintf '%s\\n' '{}'\nread -r _\nread -r _\nprintf '%s\\n' '{}'\n",
+            r#"{"id":1,"result":{"userAgent":"synthetic"}}"#, response
+        ),
+    )?;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))?;
+
+    let synced = skein(&data, &config)
+        .env("SKEIN_CODEX_BIN", &script)
+        .args(["session", "sync", "codex", "--json"])
+        .output()?;
+    assert!(
+        synced.status.success(),
+        "{}",
+        String::from_utf8_lossy(&synced.stderr)
+    );
+    let report: Value = serde_json::from_slice(&synced.stdout)?;
+    assert_eq!(report["inserted"], 1);
+    assert_eq!(report["linkedToProjects"], 1);
+    assert_eq!(report["nextCursor"], "opaque-next");
+    assert_eq!(report["textImported"], false);
+
+    let listed = skein(&data, &config)
+        .args(["session", "list", "--json"])
+        .output()?;
+    assert!(listed.status.success());
+    let sessions: Value = serde_json::from_slice(&listed.stdout)?;
+    assert_eq!(sessions[0]["source_thread_id"], "synthetic-thread");
+    assert_eq!(sessions[0]["project_link_kind"], "automatic");
+    assert!(sessions[0]["name"].is_null());
+    assert!(sessions[0]["preview"].is_null());
+
+    let rebound = skein(&data, &config)
+        .arg("session")
+        .arg("bind")
+        .arg("synthetic-thread")
+        .arg(&alternate)
+        .arg("--json")
+        .output()?;
+    assert!(rebound.status.success());
+    let rebound: Value = serde_json::from_slice(&rebound.stdout)?;
+    assert_eq!(rebound["project_link_kind"], "manual");
+    let alternate = alternate.canonicalize()?;
+    assert_eq!(rebound["project_path"].as_str(), alternate.to_str());
+
+    let with_text = skein(&data, &config)
+        .env("SKEIN_CODEX_BIN", &script)
+        .args(["session", "sync", "codex", "--include-text", "--json"])
+        .output()?;
+    assert!(with_text.status.success());
+    let listed = skein(&data, &config)
+        .args(["session", "list", "--json"])
+        .output()?;
+    let listed: Value = serde_json::from_slice(&listed.stdout)?;
+    assert!(listed[0]["name"].is_null());
+    assert!(listed[0]["preview"].is_null());
+    assert_eq!(listed[0]["text_redacted"], true);
+
+    let shown = skein(&data, &config)
+        .args(["session", "show", "synthetic-thread", "--json"])
+        .output()?;
+    let shown: Value = serde_json::from_slice(&shown.stdout)?;
+    assert_eq!(shown["project_link_kind"], "manual");
+    assert!(shown["name"].is_null());
+    assert!(shown["preview"].is_null());
+    assert_eq!(shown["text_redacted"], true);
+
+    let shown = skein(&data, &config)
+        .args([
+            "session",
+            "show",
+            "synthetic-thread",
+            "--include-text",
+            "--json",
+        ])
+        .output()?;
+    let shown: Value = serde_json::from_slice(&shown.stdout)?;
+    assert_eq!(shown["name"], "Synthetic title");
+    assert_eq!(shown["preview"], "Synthetic preview");
+    assert_eq!(shown["text_redacted"], false);
+
+    let unbound = skein(&data, &config)
+        .args(["session", "unbind", "synthetic-thread", "--json"])
+        .output()?;
+    assert!(unbound.status.success());
+    let unbound: Value = serde_json::from_slice(&unbound.stdout)?;
+    assert_eq!(unbound["project_link_kind"], "manual_unbound");
+    assert!(unbound["project_id"].is_null());
+    assert!(unbound["name"].is_null());
+    assert!(unbound["preview"].is_null());
+    assert_eq!(unbound["text_redacted"], true);
     Ok(())
 }
 

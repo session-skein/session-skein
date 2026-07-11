@@ -3,6 +3,7 @@
 mod git;
 mod paths;
 mod registry;
+mod session;
 
 pub use git::GitMetadata;
 pub use paths::SkeinPaths;
@@ -10,6 +11,10 @@ pub use registry::Project;
 pub use registry::RefreshReport;
 pub use registry::RefreshStatus;
 pub use registry::Registry;
+pub use session::ProjectLinkKind;
+pub use session::Session;
+pub use session::SessionImportReport;
+pub use session::SessionObservation;
 
 /// Errors returned by Session Skein's core library.
 #[derive(Debug, thiserror::Error)]
@@ -51,6 +56,19 @@ pub enum Error {
     /// A path was not present in the explicit project registry.
     #[error("project is not registered: {0}")]
     ProjectNotRegistered(std::path::PathBuf),
+
+    /// An adapter observation violated the durable session contract.
+    #[error("invalid session observation: {0}")]
+    InvalidSessionObservation(String),
+
+    /// No durable session matched the adapter-owned identity.
+    #[error("session is not registered: {source_kind}:{source_thread_id}")]
+    SessionNotFound {
+        /// Adapter identity, such as `codex`.
+        source_kind: String,
+        /// Opaque thread identifier owned by the adapter.
+        source_thread_id: String,
+    },
 
     /// Git could not be started on this machine.
     #[error("could not start Git for {path}: {source}")]

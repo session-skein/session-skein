@@ -18,6 +18,13 @@ personal or proprietary information.
   stored.
 - Codex discovery is dry-run and stores nothing. Thread names and first-message text
   are redacted from output unless `--include-text` is explicitly requested.
+- Codex session sync stores opaque thread and session identifiers, cwd, timestamps,
+  status/source labels, provider and CLI version, parent/fork identifiers, ephemeral
+  state, observation timestamps, and project-link evidence. It stores no turns,
+  command output, diffs, MCP payloads, credentials, or rollout paths.
+- Thread names and first-message previews are absent from durable state by default.
+  `session sync codex --include-text` is the explicit opt-in for storing only those
+  two text fields in the private database.
 
 Session Skein currently performs no telemetry and no network requests at runtime.
 That invariant must remain documented if a future optional integration changes it.

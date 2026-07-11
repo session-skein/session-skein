@@ -1,14 +1,14 @@
 # Session Skein
 
-Session Skein is a fast, local-first conductor for coding-agent projects, sessions,
-and activity. It is being built around one durable entry point: describe the work,
-let the conductor resolve the right project and session, then inspect or steer the
-workers from one place.
+Session Skein is a fast, local-first control plane for Codex CLI projects, threads,
+and activity. It works directly with the locally installed Codex CLI and its existing
+authentication. Planned optional adapters may enrich the view when tools such as tmux
+or Agent Deck are installed, but neither will be required.
 
 The project is in an early foundation phase. Today, the `skein` binary provides a
-secure versioned project registry, diagnostics, and bounded incremental Git metadata.
-It can also preview local Codex threads through the versioned app-server protocol. It
-does not yet control Codex, Agent Deck, tmux, or MCP clients.
+secure versioned project registry, diagnostics, bounded incremental Git metadata, and
+a durable Codex session catalog populated through the app-server protocol. It does
+not yet control Codex workers or provide the conductor TUI.
 
 ## Why a skein?
 
@@ -27,6 +27,11 @@ cargo run --release --bin skein -- project refresh /path/to/project --working-tr
 cargo run --release --bin skein -- project show /path/to/project --json
 cargo run --release --bin skein -- project list --json
 cargo run --release --bin skein -- import codex preview --limit 50 --json
+cargo run --release --bin skein -- session sync codex --limit 50 --json
+cargo run --release --bin skein -- session list --json
+cargo run --release --bin skein -- session show THREAD_ID --json
+cargo run --release --bin skein -- session bind THREAD_ID /path/to/project --json
+cargo run --release --bin skein -- session unbind THREAD_ID --json
 ```
 
 `doctor` is always read-only and does not migrate an older database. `init` creates
@@ -46,6 +51,12 @@ state. Names and first-message previews are omitted unless `--include-text` is g
 The default uses Codex's state database only; `--repair-source-index` explicitly opts
 into Codex's slower JSONL scan-and-repair path. See
 [docs/codex-preview.md](docs/codex-preview.md).
+
+`session sync codex` makes the explicit transition from a write-free preview to a
+bounded, transactional metadata synchronization. It stores no thread text by default,
+never parses rollout JSONL, and never silently creates projects. Existing registered
+projects are associated using the longest canonical ancestor of the observed Codex
+cwd; unmatched sessions remain visible. See [docs/session-sync.md](docs/session-sync.md).
 
 Environment overrides:
 
@@ -70,6 +81,11 @@ See [ROADMAP.md](ROADMAP.md), [docs/architecture.md](docs/architecture.md), and
 
 Session Skein is an independent open-source project. It is not affiliated with or
 endorsed by OpenAI. Codex and OpenAI are trademarks of their respective owner.
+
+Codex CLI is the first-class agent runtime. Session Skein does not require Agent Deck,
+tmux, an MCP client, a background service, or a separate API key. Planned optional
+integrations will be capability-detected at runtime and will never own Session Skein
+state.
 
 ## License
 

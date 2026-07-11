@@ -17,7 +17,40 @@ use crate::Result;
 use crate::SkeinPaths;
 use crate::git;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
+
+const CREATE_SESSIONS_SCHEMA: &str = "CREATE TABLE sessions (
+    id INTEGER PRIMARY KEY,
+    source_kind TEXT NOT NULL,
+    source_thread_id TEXT NOT NULL,
+    source_session_id TEXT,
+    project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+    project_link_kind TEXT NOT NULL CHECK(project_link_kind IN
+        ('automatic', 'manual', 'manual_unbound', 'unmatched')),
+    source_cwd TEXT NOT NULL,
+    source_created_at INTEGER NOT NULL,
+    source_updated_at INTEGER NOT NULL,
+    first_seen_at INTEGER NOT NULL,
+    last_seen_at INTEGER NOT NULL,
+    source_label TEXT NOT NULL,
+    status_label TEXT NOT NULL,
+    model_provider TEXT,
+    source_version TEXT,
+    parent_source_thread_id TEXT,
+    forked_from_source_thread_id TEXT,
+    ephemeral INTEGER NOT NULL CHECK(ephemeral IN (0, 1)),
+    name TEXT,
+    preview TEXT,
+    text_imported INTEGER NOT NULL DEFAULT 0 CHECK(text_imported IN (0, 1)),
+    UNIQUE(source_kind, source_thread_id),
+    CHECK((text_imported = 0 AND name IS NULL AND preview IS NULL) OR text_imported = 1)
+);
+CREATE INDEX sessions_project_updated
+    ON sessions(project_id, source_updated_at DESC);
+CREATE INDEX sessions_source_updated
+    ON sessions(source_kind, source_updated_at DESC);
+CREATE INDEX sessions_source_session
+    ON sessions(source_kind, source_session_id);";
 
 const PROJECT_SELECT: &str = "SELECT p.id, p.name, p.path, p.updated_at,
             m.refreshed_at, m.vcs_kind, m.head_ref, m.head_oid,
@@ -63,7 +96,7 @@ pub struct RefreshReport {
 
 /// Versioned local project registry.
 pub struct Registry {
-    connection: Connection,
+    pub(crate) connection: Connection,
 }
 
 impl Registry {
@@ -311,6 +344,11 @@ impl Registry {
                 );
                 PRAGMA user_version = 2;",
             )?;
+        }
+
+        if current <= 2 {
+            transaction.execute_batch(CREATE_SESSIONS_SCHEMA)?;
+            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         } else if current != SCHEMA_VERSION {
             return Err(Error::UnsupportedSchema {
                 found: current,
@@ -368,7 +406,7 @@ fn canonical_project_path(path: &Path) -> Result<PathBuf> {
     })
 }
 
-fn unix_timestamp() -> i64 {
+pub(crate) fn unix_timestamp() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| {
@@ -435,7 +473,7 @@ mod tests {
     #[test]
     fn initializes_current_schema() -> Result<()> {
         let (_temp, registry) = isolated_registry()?;
-        assert_eq!(registry.schema_version()?, 2);
+        assert_eq!(registry.schema_version()?, 3);
         Ok(())
     }
 
@@ -468,8 +506,52 @@ mod tests {
         drop(read_only);
 
         let registry = Registry::open(&paths)?;
-        assert_eq!(registry.schema_version()?, 2);
+        assert_eq!(registry.schema_version()?, 3);
         assert!(registry.list_projects()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn migrates_schema_version_two_without_changing_projects() -> Result<()> {
+        let temp = tempfile::tempdir().map_err(|source| Error::Io {
+            path: PathBuf::from("temporary test directory"),
+            source,
+        })?;
+        let paths = SkeinPaths::new(temp.path().join("config"), temp.path().join("data"));
+        fs::create_dir_all(&paths.data_dir).map_err(|source| Error::Io {
+            path: paths.data_dir.clone(),
+            source,
+        })?;
+        let connection = Connection::open(paths.database())?;
+        connection.execute_batch(
+            "CREATE TABLE projects (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                path TEXT NOT NULL UNIQUE,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE project_metadata (
+                project_id INTEGER PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                vcs_kind TEXT NOT NULL CHECK(vcs_kind IN ('none', 'git')),
+                fingerprint TEXT NOT NULL,
+                refreshed_at INTEGER NOT NULL,
+                head_ref TEXT,
+                head_oid TEXT,
+                last_commit_at INTEGER,
+                last_commit_subject TEXT,
+                tracked_dirty INTEGER CHECK(tracked_dirty IN (0, 1))
+            );
+            INSERT INTO projects (name, path, created_at, updated_at)
+                VALUES ('Synthetic', '/synthetic/project', 1, 2);
+            PRAGMA user_version = 2;",
+        )?;
+        drop(connection);
+
+        let registry = Registry::open(&paths)?;
+        assert_eq!(registry.schema_version()?, 3);
+        assert_eq!(registry.list_projects()?.len(), 1);
+        assert!(registry.list_sessions()?.is_empty());
         Ok(())
     }
 
