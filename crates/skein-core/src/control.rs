@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::path::PathBuf;
 
+use rusqlite::Connection;
 use rusqlite::OptionalExtension;
 use rusqlite::Transaction;
 use rusqlite::params;
@@ -9,6 +10,7 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use crate::Error;
+use crate::Project;
 use crate::Registry;
 use crate::Result;
 use crate::WorkerClaim;
@@ -227,137 +229,18 @@ pub struct ReconciliationObservation<'a> {
 impl Registry {
     /// Persist policy, run, turn, actions, and initial audit events atomically.
     pub fn plan_control_run(&mut self, input: &NewControlRun<'_>) -> Result<ControlPlan> {
-        if !input.full_access_acknowledged {
-            return Err(Error::InvalidControlRequest(
-                "full-access execution requires explicit acknowledgement".to_owned(),
-            ));
-        }
-        if input.prompt.trim().is_empty() {
-            return Err(Error::InvalidControlRequest(
-                "prompt must be non-empty".to_owned(),
-            ));
-        }
+        validate_control_input(input)?;
         let project = self.get_project(input.project_path)?;
-        if !project.path.is_absolute() {
-            return Err(Error::InvalidControlRequest(
-                "control working directory must be absolute".to_owned(),
-            ));
-        }
-        let cwd = project.path.to_str().ok_or_else(|| {
-            Error::InvalidControlRequest("control path must be valid UTF-8".to_owned())
-        })?;
         let now = unix_timestamp();
-        let run_key = Uuid::new_v4().to_string();
-        let client_message_id = Uuid::new_v4().to_string();
         let transaction = self.connection.transaction()?;
-        transaction.execute(
-            "INSERT INTO control_policies (
-                created_at, sandbox_mode, approval_mode, network_access, project_id,
-                working_directory, acknowledged_at, acknowledgement_source
-             ) VALUES (?1, 'danger_full_access', 'never', 1, ?2, ?3, ?1, 'cli_flag')",
-            params![now, project.id, cwd],
-        )?;
-        let policy_id = transaction.last_insert_rowid();
-        let session_id = match input.resume_thread_id {
-            Some(thread_id) => Some(validated_resume_session_id(
-                &transaction,
-                thread_id,
-                project.id,
-            )?),
-            None => None,
-        };
-        transaction.execute(
-            "INSERT INTO control_runs (
-                run_key, project_id, session_id, policy_id, runtime_kind,
-                working_directory, state, source_thread_id, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, 'codex', ?5, 'planned', ?6, ?7, ?7)",
-            params![
-                run_key,
-                project.id,
-                session_id,
-                policy_id,
-                cwd,
-                input.resume_thread_id,
-                now
-            ],
-        )?;
-        let run_id = transaction.last_insert_rowid();
-        transaction.execute(
-            "INSERT INTO control_turns (
-                run_id, turn_number, state, input_bytes, terminal_condition_version,
-                client_message_id, created_at
-             ) VALUES (?1, 1, 'planned', ?2, 1, ?3, ?4)",
-            params![
-                run_id,
-                i64::try_from(input.prompt.len()).unwrap_or(i64::MAX),
-                client_message_id,
-                now
-            ],
-        )?;
-        let turn_id = transaction.last_insert_rowid();
-        let thread_kind = if input.resume_thread_id.is_some() {
-            ControlActionKind::ThreadResume
-        } else {
-            ControlActionKind::ThreadStart
-        };
-        let thread_action_id = insert_action(
-            &transaction,
-            run_id,
-            None,
-            policy_id,
-            thread_kind,
-            &format!("{}:project:{}", thread_kind.method(), project.id),
-            now,
-        )?;
-        let turn_action_id = insert_action(
-            &transaction,
-            run_id,
-            Some(turn_id),
-            policy_id,
-            ControlActionKind::TurnStart,
-            "turn/start:text",
-            now,
-        )?;
+        let plan = insert_control_plan(&transaction, input, &project, now)?;
         transaction.commit()?;
-        Ok(ControlPlan {
-            run_id,
-            run_key,
-            thread_action_id,
-            turn_action_id,
-            client_message_id,
-            working_directory: project.path,
-        })
+        Ok(plan)
     }
 
     /// Reconstruct the content-free execution plan for a previously planned run.
     pub fn control_plan(&self, run_id: i64) -> Result<ControlPlan> {
-        let (run_key, client_message_id, working_directory): (String, String, String) =
-            self.connection.query_row(
-                "SELECT r.run_key, t.client_message_id, r.working_directory
-                     FROM control_runs r JOIN control_turns t ON t.run_id = r.id
-                     WHERE r.id = ?1 AND t.turn_number = 1",
-                [run_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )?;
-        let thread_action_id = self.connection.query_row(
-            "SELECT id FROM control_actions WHERE run_id = ?1
-             AND action_kind IN ('thread_start', 'thread_resume')",
-            [run_id],
-            |row| row.get(0),
-        )?;
-        let turn_action_id = self.connection.query_row(
-            "SELECT id FROM control_actions WHERE run_id = ?1 AND action_kind = 'turn_start'",
-            [run_id],
-            |row| row.get(0),
-        )?;
-        Ok(ControlPlan {
-            run_id,
-            run_key,
-            thread_action_id,
-            turn_action_id,
-            client_message_id,
-            working_directory: PathBuf::from(working_directory),
-        })
+        control_plan_on(&self.connection, run_id)
     }
 
     /// Persist one idempotent interrupt intent for the exact active turn.
@@ -1385,13 +1268,7 @@ impl Registry {
     }
 
     pub fn list_control_runs(&self) -> Result<Vec<ControlRun>> {
-        let mut statement = self.connection.prepare(&format!(
-            "{RUN_SELECT} ORDER BY r.updated_at DESC, r.id DESC"
-        ))?;
-        statement
-            .query_map([], run_from_row)?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(Error::from)
+        list_control_runs_on(&self.connection)
     }
 
     pub fn control_run(&self, id: i64) -> Result<Option<ControlRun>> {
@@ -1438,6 +1315,151 @@ const RUN_SELECT: &str = "SELECT r.id, r.run_key, r.project_id, p.name,
     cp.network_access, cp.acknowledged_at, r.ownership_mode
     FROM control_runs r JOIN projects p ON p.id = r.project_id
     JOIN control_policies cp ON cp.id = r.policy_id";
+
+pub(crate) fn list_control_runs_on(connection: &Connection) -> Result<Vec<ControlRun>> {
+    let mut statement = connection.prepare(&format!(
+        "{RUN_SELECT} ORDER BY r.updated_at DESC, r.id DESC"
+    ))?;
+    statement
+        .query_map([], run_from_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Error::from)
+}
+
+pub(crate) fn validate_control_input(input: &NewControlRun<'_>) -> Result<()> {
+    if !input.full_access_acknowledged {
+        return Err(Error::InvalidControlRequest(
+            "full-access execution requires explicit acknowledgement".to_owned(),
+        ));
+    }
+    if input.prompt.trim().is_empty() {
+        return Err(Error::InvalidControlRequest(
+            "prompt must be non-empty".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn insert_control_plan(
+    transaction: &Transaction<'_>,
+    input: &NewControlRun<'_>,
+    project: &Project,
+    now: i64,
+) -> Result<ControlPlan> {
+    validate_control_input(input)?;
+    if !project.path.is_absolute() {
+        return Err(Error::InvalidControlRequest(
+            "control working directory must be absolute".to_owned(),
+        ));
+    }
+    let cwd = project.path.to_str().ok_or_else(|| {
+        Error::InvalidControlRequest("control path must be valid UTF-8".to_owned())
+    })?;
+    let run_key = Uuid::new_v4().to_string();
+    let client_message_id = Uuid::new_v4().to_string();
+    transaction.execute(
+        "INSERT INTO control_policies (
+            created_at, sandbox_mode, approval_mode, network_access, project_id,
+            working_directory, acknowledged_at, acknowledgement_source
+         ) VALUES (?1, 'danger_full_access', 'never', 1, ?2, ?3, ?1, 'cli_flag')",
+        params![now, project.id, cwd],
+    )?;
+    let policy_id = transaction.last_insert_rowid();
+    let session_id = match input.resume_thread_id {
+        Some(thread_id) => validated_resume_session_id(transaction, thread_id, project.id)?,
+        None => None,
+    };
+    transaction.execute(
+        "INSERT INTO control_runs (
+            run_key, project_id, session_id, policy_id, runtime_kind,
+            working_directory, state, source_thread_id, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, 'codex', ?5, 'planned', ?6, ?7, ?7)",
+        params![
+            run_key,
+            project.id,
+            session_id,
+            policy_id,
+            cwd,
+            input.resume_thread_id,
+            now
+        ],
+    )?;
+    let run_id = transaction.last_insert_rowid();
+    transaction.execute(
+        "INSERT INTO control_turns (
+            run_id, turn_number, state, input_bytes, terminal_condition_version,
+            client_message_id, created_at
+         ) VALUES (?1, 1, 'planned', ?2, 1, ?3, ?4)",
+        params![
+            run_id,
+            i64::try_from(input.prompt.len()).unwrap_or(i64::MAX),
+            client_message_id,
+            now
+        ],
+    )?;
+    let turn_id = transaction.last_insert_rowid();
+    let thread_kind = if input.resume_thread_id.is_some() {
+        ControlActionKind::ThreadResume
+    } else {
+        ControlActionKind::ThreadStart
+    };
+    let thread_action_id = insert_action(
+        transaction,
+        run_id,
+        None,
+        policy_id,
+        thread_kind,
+        &format!("{}:project:{}", thread_kind.method(), project.id),
+        now,
+    )?;
+    let turn_action_id = insert_action(
+        transaction,
+        run_id,
+        Some(turn_id),
+        policy_id,
+        ControlActionKind::TurnStart,
+        "turn/start:text",
+        now,
+    )?;
+    Ok(ControlPlan {
+        run_id,
+        run_key,
+        thread_action_id,
+        turn_action_id,
+        client_message_id,
+        working_directory: project.path.clone(),
+    })
+}
+
+pub(crate) fn control_plan_on(connection: &Connection, run_id: i64) -> Result<ControlPlan> {
+    let (run_key, client_message_id, working_directory): (String, String, String) = connection
+        .query_row(
+            "SELECT r.run_key, t.client_message_id, r.working_directory
+             FROM control_runs r JOIN control_turns t ON t.run_id = r.id
+             WHERE r.id = ?1 AND t.turn_number = 1",
+            [run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+    let thread_action_id = connection.query_row(
+        "SELECT id FROM control_actions WHERE run_id = ?1
+         AND action_kind IN ('thread_start', 'thread_resume')",
+        [run_id],
+        |row| row.get(0),
+    )?;
+    let turn_action_id = connection.query_row(
+        "SELECT id FROM control_actions WHERE run_id = ?1 AND action_kind = 'turn_start'",
+        [run_id],
+        |row| row.get(0),
+    )?;
+    Ok(ControlPlan {
+        run_id,
+        run_key,
+        thread_action_id,
+        turn_action_id,
+        client_message_id,
+        working_directory: PathBuf::from(working_directory),
+    })
+}
 
 fn insert_action(
     transaction: &Transaction<'_>,
@@ -1546,26 +1568,82 @@ fn validated_resume_session_id(
     transaction: &Transaction<'_>,
     thread_id: &str,
     expected_project_id: i64,
-) -> Result<i64> {
-    let session = transaction
+) -> Result<Option<i64>> {
+    let competing: Option<String> = transaction
         .query_row(
-            "SELECT id, project_id FROM sessions
-             WHERE source_kind = 'codex' AND source_thread_id = ?1",
+            "SELECT state FROM control_runs WHERE source_thread_id = ?1
+             AND state IN ('planned', 'starting', 'active', 'recovery_required')
+             ORDER BY id DESC LIMIT 1",
             [thread_id],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
+            |row| row.get(0),
         )
         .optional()?;
-    let Some((session_id, project_id)) = session else {
-        return Err(Error::InvalidControlRequest(format!(
-            "resume thread {thread_id} is not present in the durable Codex session catalog"
+    if let Some(state) = competing {
+        let class = if state == "recovery_required" {
+            "thread_recovery_required"
+        } else {
+            "thread_already_active"
+        };
+        return Err(Error::ControlStateConflict(format!(
+            "{class}: resume thread {thread_id} already has a nonterminal Skein run"
         )));
+    }
+    let session = transaction
+        .query_row(
+            "SELECT id, project_id, project_link_kind, status_label, source_label, ephemeral
+             FROM sessions
+             WHERE source_kind = 'codex' AND source_thread_id = ?1",
+            [thread_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)? != 0,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((session_id, project_id, link_kind, status, source_label, ephemeral)) = session else {
+        let owned: Option<(Option<i64>, i64)> = transaction
+            .query_row(
+                "SELECT session_id, project_id FROM control_runs
+                 WHERE source_thread_id = ?1
+                 AND state IN ('completed', 'failed', 'interrupted')
+                 ORDER BY updated_at DESC, id DESC LIMIT 1",
+                [thread_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((owned_session_id, owned_project_id)) = owned else {
+            return Err(Error::InvalidControlRequest(format!(
+                "resume thread {thread_id} is absent from the session catalog and completed Skein runs"
+            )));
+        };
+        if owned_project_id != expected_project_id {
+            return Err(Error::InvalidControlRequest(format!(
+                "resume thread {thread_id} is not bound to the selected project"
+            )));
+        }
+        return Ok(owned_session_id);
     };
     if project_id != Some(expected_project_id) {
         return Err(Error::InvalidControlRequest(format!(
             "resume thread {thread_id} is not bound to the selected project"
         )));
     }
-    Ok(session_id)
+    if ephemeral
+        || status == "systemError"
+        || source_label.starts_with("subAgent")
+        || !matches!(link_kind.as_str(), "automatic" | "manual")
+    {
+        return Err(Error::InvalidControlRequest(format!(
+            "resume thread {thread_id} is not eligible for controlled resume"
+        )));
+    }
+    Ok(Some(session_id))
 }
 
 fn run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ControlRun> {

@@ -33,10 +33,11 @@ and a polished TUI only after behavior is observable and safe.
 
 ## Phase 4: conductor
 
-- [ ] One prompt entry point with explicit routing confidence.
-- [ ] Policy boundary for full-access workers.
+- [x] One prompt entry point with explicit routing confidence.
+- [x] Policy boundary for full-access workers.
 - [ ] MCP server and stable machine-readable protocol.
-- [ ] Crash-safe job execution and audit trail.
+- [x] Crash-fenced planning, no-replay audit, and deterministic pre-dispatch failure.
+- [ ] Crash-safe job continuation or takeover after worker loss.
 
 ## Phase 5: TUI
 

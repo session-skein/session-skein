@@ -31,7 +31,7 @@ Versioned SQLite state + Codex-owned transcripts
 
 ## Control state
 
-Schema version 6 keeps control intent separate from imported sessions. Immutable
+Schema version 7 keeps control intent separate from imported sessions. Immutable
 policy snapshots record the exact authority acknowledged for a run. Skein-owned runs,
 turns, actions, and append-only events are committed before app-server mutations.
 Observed session status never drives the control state machine.
@@ -46,6 +46,13 @@ steer uses the existing fenced connection. A separate read-only `thread/read` pa
 record content-free source evidence and close an exact terminal recovery run without
 taking over it. See
 [workers.md](workers.md) and [codex-control.md](codex-control.md).
+
+The conductor performs an initial read-only match, validates ChatGPT authentication,
+then opens one immediate SQLite transaction. It recomputes the route and atomically
+inserts its content-free receipt, policy, run, actions, and starting worker lease. A
+route change aborts rather than falling through to another project. Process spawn and
+prompt submission happen only after commit; an expired worker with no dispatched
+action becomes a deterministic failed run, never an uncertain recovery claim.
 
 ## Git metadata adapter
 

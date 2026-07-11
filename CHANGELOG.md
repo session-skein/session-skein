@@ -3,7 +3,16 @@
 All notable changes will be documented here. The project follows Semantic Versioning
 after its first published release.
 
-## [0.5.0-alpha.4] - Unreleased explainable matching and activity views
+## [0.5.0-alpha.5] - Unreleased fail-closed conductor dispatch
+
+- Added one private-stdin `conduct` entry point that dispatches only a unique,
+  high-confidence deterministic project/session route after ChatGPT authentication.
+- Added schema-7 content-free routing receipts, structured evidence, request UUID
+  idempotency, atomic worker allocation, and deterministic pre-dispatch crash failure.
+- Hardened automatic resume against ephemeral, system-error, subagent, unbound,
+  already-active, and recovery-required Codex threads.
+
+## [0.5.0-alpha.4] - 2026-07-11
 
 - Added private-stdin metadata matching across registered projects and linked sessions
   with deterministic integer evidence, stable confidence labels, and no dispatch.

@@ -17,7 +17,51 @@ use crate::Result;
 use crate::SkeinPaths;
 use crate::git;
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
+
+const CREATE_CONDUCTOR_SCHEMA: &str = "CREATE TABLE conductor_decisions (
+    id INTEGER PRIMARY KEY,
+    request_id TEXT NOT NULL UNIQUE,
+    run_id INTEGER NOT NULL UNIQUE REFERENCES control_runs(id) ON DELETE RESTRICT,
+    created_at INTEGER NOT NULL,
+    matched_at INTEGER NOT NULL,
+    match_schema_version INTEGER NOT NULL CHECK(match_schema_version > 0),
+    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE RESTRICT,
+    source_thread_id TEXT,
+    action TEXT NOT NULL CHECK(action IN ('start', 'resume')),
+    confidence TEXT NOT NULL CHECK(confidence IN ('none', 'low', 'medium', 'high')),
+    ambiguous INTEGER NOT NULL CHECK(ambiguous IN (0, 1)),
+    resolution_kind TEXT NOT NULL CHECK(resolution_kind IN
+        ('automatic', 'explicit_project', 'explicit_thread', 'user_selected')),
+    score INTEGER NOT NULL CHECK(score >= 0),
+    runner_up_margin INTEGER NOT NULL CHECK(runner_up_margin >= 0),
+    candidate_count INTEGER NOT NULL CHECK(candidate_count > 0),
+    query_bytes INTEGER NOT NULL CHECK(query_bytes > 0 AND query_bytes <= 65536),
+    query_tokens INTEGER NOT NULL CHECK(query_tokens > 0),
+    include_text INTEGER NOT NULL CHECK(include_text IN (0, 1)),
+    CHECK((action = 'start' AND source_thread_id IS NULL)
+       OR (action = 'resume' AND source_thread_id IS NOT NULL)),
+    CHECK(ambiguous = 0 OR resolution_kind = 'user_selected'),
+    CHECK(resolution_kind != 'automatic'
+       OR (ambiguous = 0 AND confidence = 'high'))
+);
+CREATE INDEX conductor_decisions_project_created
+    ON conductor_decisions(project_id, created_at DESC);
+CREATE TABLE conductor_decision_evidence (
+    id INTEGER PRIMARY KEY,
+    decision_id INTEGER NOT NULL REFERENCES conductor_decisions(id) ON DELETE RESTRICT,
+    ordinal INTEGER NOT NULL,
+    scope TEXT NOT NULL CHECK(scope IN ('project', 'session')),
+    family TEXT NOT NULL CHECK(family IN
+        ('project_identity', 'project_path', 'git', 'session_identity', 'session_path',
+         'session_text', 'session_link', 'session_recency', 'control')),
+    kind TEXT NOT NULL,
+    points INTEGER NOT NULL CHECK(points > 0),
+    matches INTEGER NOT NULL CHECK(matches > 0),
+    UNIQUE(decision_id, ordinal)
+);
+CREATE INDEX conductor_evidence_decision
+    ON conductor_decision_evidence(decision_id, ordinal);";
 
 const CREATE_RECONCILIATION_SCHEMA: &str =
     "ALTER TABLE control_actions ADD COLUMN client_request_id TEXT;
@@ -331,12 +375,7 @@ impl Registry {
 
     /// List all registered projects in stable name/path order.
     pub fn list_projects(&self) -> Result<Vec<Project>> {
-        let query = format!("{PROJECT_SELECT} ORDER BY p.name COLLATE NOCASE, p.path");
-        let mut statement = self.connection.prepare(&query)?;
-        let projects = statement
-            .query_map([], project_from_row)?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(projects)
+        list_projects_on(&self.connection)
     }
 
     /// Return one project by canonical path.
@@ -527,6 +566,11 @@ impl Registry {
 
         if current <= 5 {
             transaction.execute_batch(CREATE_RECONCILIATION_SCHEMA)?;
+            transaction.pragma_update(None, "user_version", 6)?;
+        }
+
+        if current <= 6 {
+            transaction.execute_batch(CREATE_CONDUCTOR_SCHEMA)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         } else if current != SCHEMA_VERSION {
             return Err(Error::UnsupportedSchema {
@@ -551,7 +595,16 @@ impl Registry {
     }
 }
 
-fn project_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
+pub(crate) fn list_projects_on(connection: &Connection) -> Result<Vec<Project>> {
+    let query = format!("{PROJECT_SELECT} ORDER BY p.name COLLATE NOCASE, p.path");
+    let mut statement = connection.prepare(&query)?;
+    statement
+        .query_map([], project_from_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Error::from)
+}
+
+pub(crate) fn project_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
     let refreshed_at: Option<i64> = row.get(4)?;
     let vcs_kind: Option<String> = row.get(5)?;
     let git = if vcs_kind.as_deref() == Some("git") {
@@ -652,7 +705,7 @@ mod tests {
     #[test]
     fn initializes_current_schema() -> Result<()> {
         let (_temp, registry) = isolated_registry()?;
-        assert_eq!(registry.schema_version()?, 6);
+        assert_eq!(registry.schema_version()?, 7);
         Ok(())
     }
 
@@ -685,7 +738,7 @@ mod tests {
         drop(read_only);
 
         let registry = Registry::open(&paths)?;
-        assert_eq!(registry.schema_version()?, 6);
+        assert_eq!(registry.schema_version()?, 7);
         assert!(registry.list_projects()?.is_empty());
         Ok(())
     }
@@ -728,7 +781,7 @@ mod tests {
         drop(connection);
 
         let registry = Registry::open(&paths)?;
-        assert_eq!(registry.schema_version()?, 6);
+        assert_eq!(registry.schema_version()?, 7);
         assert_eq!(registry.list_projects()?.len(), 1);
         assert!(registry.list_sessions()?.is_empty());
         Ok(())
@@ -767,7 +820,9 @@ mod tests {
             text_imported: false,
         }])?;
         registry.connection.execute_batch(
-            "DROP TABLE control_reconciliations;
+            "DROP TABLE conductor_decision_evidence;
+             DROP TABLE conductor_decisions;
+             DROP TABLE control_reconciliations;
              DROP TABLE control_workers;
              DROP TABLE control_action_events;
              DROP TABLE control_actions;
@@ -779,7 +834,7 @@ mod tests {
         drop(registry);
 
         let registry = Registry::open(&paths)?;
-        assert_eq!(registry.schema_version()?, 6);
+        assert_eq!(registry.schema_version()?, 7);
         assert_eq!(registry.list_projects()?.len(), 1);
         assert_eq!(registry.list_sessions()?.len(), 1);
         assert!(registry.list_control_runs()?.is_empty());
@@ -854,7 +909,7 @@ mod tests {
         drop(connection);
 
         let registry = Registry::open(&paths)?;
-        assert_eq!(registry.schema_version()?, 6);
+        assert_eq!(registry.schema_version()?, 7);
         assert_eq!(
             registry.control_run(1)?.expect("historical run").run_key,
             "historical-run"
@@ -900,7 +955,9 @@ mod tests {
         let registry = Registry::open(&paths)?;
         registry.add_project(&project, Some("Synthetic"))?;
         registry.connection.execute_batch(
-            "DROP TABLE control_reconciliations;
+            "DROP TABLE conductor_decision_evidence;
+             DROP TABLE conductor_decisions;
+             DROP TABLE control_reconciliations;
              DROP INDEX control_actions_client_request;
              ALTER TABLE control_actions DROP COLUMN expected_source_turn_id;
              ALTER TABLE control_actions DROP COLUMN input_bytes;
@@ -910,7 +967,7 @@ mod tests {
         drop(registry);
 
         let registry = Registry::open(&paths)?;
-        assert_eq!(registry.schema_version()?, 6);
+        assert_eq!(registry.schema_version()?, 7);
         assert_eq!(registry.list_projects()?.len(), 1);
         let columns: String = registry.connection.query_row(
             "SELECT group_concat(name, ',') FROM pragma_table_info('control_actions')",
@@ -925,6 +982,53 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(reconciliation_table, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn migrates_schema_version_six_without_rewriting_existing_history() -> Result<()> {
+        let temp = tempfile::tempdir().map_err(|source| Error::Io {
+            path: PathBuf::from("temporary schema-six migration"),
+            source,
+        })?;
+        let paths = SkeinPaths::new(temp.path().join("config"), temp.path().join("data"));
+        let project = temp.path().join("project");
+        fs::create_dir(&project).map_err(|source| Error::Io {
+            path: project.clone(),
+            source,
+        })?;
+        let mut registry = Registry::open(&paths)?;
+        registry.add_project(&project, Some("Synthetic"))?;
+        let plan = registry.plan_control_run(&crate::NewControlRun {
+            project_path: &project,
+            resume_thread_id: None,
+            prompt: "private migration prompt",
+            full_access_acknowledged: true,
+        })?;
+        registry.connection.execute_batch(
+            "DROP TABLE conductor_decision_evidence;
+             DROP TABLE conductor_decisions;
+             PRAGMA user_version = 6;",
+        )?;
+        drop(registry);
+
+        let registry = Registry::open(&paths)?;
+        assert_eq!(registry.schema_version()?, 7);
+        assert_eq!(registry.list_projects()?.len(), 1);
+        assert_eq!(registry.list_control_runs()?.len(), 1);
+        assert_eq!(registry.list_control_runs()?[0].id, plan.run_id);
+        let decisions: i64 = registry.connection.query_row(
+            "SELECT COUNT(*) FROM conductor_decisions",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(decisions, 0);
+        let foreign_key_violations: i64 = registry.connection.query_row(
+            "SELECT COUNT(*) FROM pragma_foreign_key_check",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(foreign_key_violations, 0);
         Ok(())
     }
 

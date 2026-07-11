@@ -91,7 +91,8 @@ durable redacted state remains.
 - One text turn per worker run.
 - Full-access/no-approval policy only, with explicit acknowledgement.
 - Source reads are metadata-only; there is no source-content display.
-- No routing, project inference, summaries, global composer, or TUI yet.
+- The standalone conductor can route a unique high-confidence prompt, but there is no
+  interactive ambiguity picker, semantic router, global composer, or TUI yet.
 - `worker stop` refuses an active run; use `worker interrupt`, wait for authoritative
   terminal status, then stop the idle worker.
 - Reconciliation can close exact terminal turns; lease takeover/reattachment is not

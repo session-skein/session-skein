@@ -118,46 +118,10 @@ impl Registry {
     /// Allocate a single fenced worker identity for a planned run.
     pub fn create_control_worker(&mut self, run_id: i64) -> Result<WorkerClaim> {
         let now = unix_timestamp();
-        let worker_key = Uuid::new_v4().to_string();
         let transaction = self.connection.transaction()?;
-        let run_key: String = transaction
-            .query_row(
-                "SELECT run_key FROM control_runs WHERE id = ?1 AND state = 'planned'",
-                [run_id],
-                |row| row.get(0),
-            )
-            .optional()?
-            .ok_or_else(|| {
-                Error::ControlStateConflict(format!(
-                    "run {run_id} was not planned for worker allocation"
-                ))
-            })?;
-        transaction.execute(
-            "INSERT INTO control_workers (
-                worker_key, run_id, runtime_kind, protocol_version, process_started_at,
-                state, lease_epoch, lease_acquired_at, lease_expires_at, heartbeat_at
-             ) VALUES (?1, ?2, 'codex', 1, ?3, 'starting', 1, ?3, ?4, ?3)",
-            params![worker_key, run_id, now, now + WORKER_LEASE_SECONDS],
-        )?;
-        let id = transaction.last_insert_rowid();
-        let changed = transaction.execute(
-            "UPDATE control_runs SET ownership_mode = 'worker', updated_at = ?1
-             WHERE id = ?2 AND state = 'planned' AND ownership_mode = 'foreground'",
-            params![now, run_id],
-        )?;
-        if changed != 1 {
-            return Err(Error::ControlStateConflict(
-                "run could not be promoted to worker ownership".to_owned(),
-            ));
-        }
+        let claim = allocate_control_worker(&transaction, run_id, now)?;
         transaction.commit()?;
-        Ok(WorkerClaim {
-            id,
-            run_id,
-            run_key,
-            worker_key,
-            lease_epoch: 1,
-        })
+        Ok(claim)
     }
 
     /// Load the private worker identity inside the spawned worker process.
@@ -280,7 +244,7 @@ impl Registry {
     pub fn fail_worker_without_submission(&mut self, claim: &WorkerClaim) -> Result<()> {
         let now = unix_timestamp();
         let transaction = self.connection.transaction()?;
-        assert_worker_fence(&transaction, claim, &["starting", "ready"])?;
+        assert_worker_fence(&transaction, claim, &["starting", "ready", "busy"])?;
         let dispatched: i64 = transaction.query_row(
             "SELECT COUNT(*) FROM control_actions WHERE run_id = ?1 AND state != 'planned'",
             [claim.run_id],
@@ -326,7 +290,7 @@ impl Registry {
                 last_error_class = 'worker_start_failed',
                 last_error_message = 'worker stopped before prompt submission'
              WHERE id = ?2 AND worker_key = ?3 AND lease_epoch = ?4
-             AND state IN ('starting', 'ready') AND lease_expires_at >= ?1",
+             AND state IN ('starting', 'ready', 'busy') AND lease_expires_at >= ?1",
             params![now, claim.id, claim.worker_key, claim.lease_epoch],
         )?;
         if run_changed != 1 || worker_changed != 1 {
@@ -371,6 +335,51 @@ impl Registry {
                 params![now, worker_id, run_id, epoch],
             )?;
             if worker_changed != 1 {
+                continue;
+            }
+            let dispatched: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM control_actions WHERE run_id = ?1 AND state != 'planned'",
+                [run_id],
+                |row| row.get(0),
+            )?;
+            if dispatched == 0 {
+                transaction.execute(
+                    "UPDATE control_actions SET state = 'failed', terminal_at = ?1,
+                        error_class = 'worker_start_lost',
+                        error_message = 'worker lease expired before any Codex mutation'
+                     WHERE run_id = ?2 AND state = 'planned'",
+                    params![now, run_id],
+                )?;
+                transaction.execute(
+                    "INSERT INTO control_action_events (
+                        action_id, sequence, event_kind, recorded_at, detail
+                     ) SELECT a.id,
+                        COALESCE((SELECT MAX(e.sequence) FROM control_action_events e
+                                  WHERE e.action_id = a.id), 0) + 1,
+                        'failed', ?1, NULL
+                     FROM control_actions a WHERE a.run_id = ?2
+                     AND a.error_class = 'worker_start_lost'",
+                    params![now, run_id],
+                )?;
+                transaction.execute(
+                    "UPDATE control_turns SET state = 'failed', terminal_at = ?1
+                     WHERE run_id = ?2 AND state = 'planned'",
+                    params![now, run_id],
+                )?;
+                transaction.execute(
+                    "UPDATE control_runs SET state = 'failed', terminal_at = ?1, updated_at = ?1,
+                        last_error_class = 'worker_start_lost',
+                        last_error_message = 'worker lease expired before any Codex mutation'
+                     WHERE id = ?2 AND state = 'planned' AND ownership_mode = 'worker'",
+                    params![now, run_id],
+                )?;
+                transaction.execute(
+                    "UPDATE control_workers SET last_error_class = 'worker_start_lost',
+                        last_error_message = 'worker lease expired before any Codex mutation'
+                     WHERE id = ?1",
+                    [worker_id],
+                )?;
+                recovered.push(run_id);
                 continue;
             }
             transaction.execute(
@@ -483,6 +492,51 @@ impl Registry {
     }
 }
 
+pub(crate) fn allocate_control_worker(
+    transaction: &Transaction<'_>,
+    run_id: i64,
+    now: i64,
+) -> Result<WorkerClaim> {
+    let worker_key = Uuid::new_v4().to_string();
+    let run_key: String = transaction
+        .query_row(
+            "SELECT run_key FROM control_runs WHERE id = ?1 AND state = 'planned'",
+            [run_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            Error::ControlStateConflict(format!(
+                "run {run_id} was not planned for worker allocation"
+            ))
+        })?;
+    transaction.execute(
+        "INSERT INTO control_workers (
+            worker_key, run_id, runtime_kind, protocol_version, process_started_at,
+            state, lease_epoch, lease_acquired_at, lease_expires_at, heartbeat_at
+         ) VALUES (?1, ?2, 'codex', 1, ?3, 'starting', 1, ?3, ?4, ?3)",
+        params![worker_key, run_id, now, now + WORKER_LEASE_SECONDS],
+    )?;
+    let id = transaction.last_insert_rowid();
+    let changed = transaction.execute(
+        "UPDATE control_runs SET ownership_mode = 'worker', updated_at = ?1
+         WHERE id = ?2 AND state = 'planned' AND ownership_mode = 'foreground'",
+        params![now, run_id],
+    )?;
+    if changed != 1 {
+        return Err(Error::ControlStateConflict(
+            "run could not be promoted to worker ownership".to_owned(),
+        ));
+    }
+    Ok(WorkerClaim {
+        id,
+        run_id,
+        run_key,
+        worker_key,
+        lease_epoch: 1,
+    })
+}
+
 pub(crate) fn assert_worker_fence(
     transaction: &Transaction<'_>,
     claim: &WorkerClaim,
@@ -582,6 +636,47 @@ mod tests {
         assert_eq!(connection.run_key, claim.run_key());
         registry.finish_worker(&claim, "clean")?;
         assert!(registry.worker_connection(plan.run_id).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn busy_worker_can_fail_exactly_before_any_protocol_mutation() -> Result<()> {
+        let temp = tempfile::tempdir().map_err(|source| Error::Io {
+            path: PathBuf::from("temporary pre-dispatch worker test"),
+            source,
+        })?;
+        let project = temp.path().join("project");
+        fs::create_dir(&project).map_err(|source| Error::Io {
+            path: project.clone(),
+            source,
+        })?;
+        let paths = SkeinPaths::new(temp.path().join("config"), temp.path().join("data"));
+        let mut registry = Registry::open(&paths)?;
+        registry.add_project(&project, None)?;
+        let plan = registry.plan_control_run(&NewControlRun {
+            project_path: &project,
+            resume_thread_id: None,
+            prompt: "private",
+            full_access_acknowledged: true,
+        })?;
+        let claim = registry.create_control_worker(plan.run_id)?;
+        registry.mark_worker_ready(&claim, "127.0.0.1:12345", 42)?;
+        registry.heartbeat_worker(&claim, WorkerState::Busy)?;
+        registry.fail_worker_without_submission(&claim)?;
+
+        let run = registry.control_run(plan.run_id)?.expect("failed run");
+        assert_eq!(run.state, crate::ControlRunState::Failed);
+        assert_eq!(
+            registry.control_worker(plan.run_id)?.expect("worker").state,
+            WorkerState::Exited
+        );
+        let detail = registry.control_run_detail(plan.run_id)?;
+        assert!(
+            detail
+                .actions
+                .iter()
+                .all(|action| action.state == crate::ControlActionState::Failed)
+        );
         Ok(())
     }
 
