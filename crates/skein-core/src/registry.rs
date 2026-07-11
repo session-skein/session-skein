@@ -17,7 +17,95 @@ use crate::Result;
 use crate::SkeinPaths;
 use crate::git;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
+
+const CREATE_CONTROL_SCHEMA: &str = "CREATE TABLE control_policies (
+    id INTEGER PRIMARY KEY,
+    created_at INTEGER NOT NULL,
+    sandbox_mode TEXT NOT NULL CHECK(sandbox_mode = 'danger_full_access'),
+    approval_mode TEXT NOT NULL CHECK(approval_mode = 'never'),
+    network_access INTEGER NOT NULL CHECK(network_access IN (0, 1)),
+    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE RESTRICT,
+    working_directory TEXT NOT NULL,
+    acknowledged_at INTEGER NOT NULL,
+    acknowledgement_source TEXT NOT NULL CHECK(acknowledgement_source = 'cli_flag')
+);
+CREATE TABLE control_runs (
+    id INTEGER PRIMARY KEY,
+    run_key TEXT NOT NULL UNIQUE,
+    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE RESTRICT,
+    session_id INTEGER REFERENCES sessions(id) ON DELETE SET NULL,
+    policy_id INTEGER NOT NULL REFERENCES control_policies(id) ON DELETE RESTRICT,
+    runtime_kind TEXT NOT NULL CHECK(runtime_kind = 'codex'),
+    working_directory TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN
+        ('planned', 'starting', 'active', 'completed', 'failed', 'interrupted', 'recovery_required')),
+    source_thread_id TEXT,
+    source_session_id TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    terminal_at INTEGER,
+    last_error_class TEXT,
+    last_error_message TEXT,
+    CHECK(
+        (state IN ('completed', 'failed', 'interrupted') AND terminal_at IS NOT NULL)
+        OR (state NOT IN ('completed', 'failed', 'interrupted') AND terminal_at IS NULL)
+    )
+);
+CREATE INDEX control_runs_state_updated ON control_runs(state, updated_at);
+CREATE INDEX control_runs_project_updated ON control_runs(project_id, updated_at DESC);
+CREATE TABLE control_turns (
+    id INTEGER PRIMARY KEY,
+    run_id INTEGER NOT NULL REFERENCES control_runs(id) ON DELETE RESTRICT,
+    turn_number INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK(state IN
+        ('planned', 'dispatching', 'running', 'completed', 'failed', 'interrupted', 'uncertain')),
+    input_bytes INTEGER NOT NULL CHECK(input_bytes > 0),
+    terminal_condition_version INTEGER NOT NULL CHECK(terminal_condition_version = 1),
+    client_message_id TEXT NOT NULL UNIQUE,
+    source_turn_id TEXT,
+    created_at INTEGER NOT NULL,
+    terminal_at INTEGER,
+    UNIQUE(run_id, turn_number),
+    CHECK(
+        (state IN ('completed', 'failed', 'interrupted', 'uncertain') AND terminal_at IS NOT NULL)
+        OR (state NOT IN ('completed', 'failed', 'interrupted', 'uncertain') AND terminal_at IS NULL)
+    )
+);
+CREATE TABLE control_actions (
+    id INTEGER PRIMARY KEY,
+    action_key TEXT NOT NULL UNIQUE,
+    run_id INTEGER NOT NULL REFERENCES control_runs(id) ON DELETE RESTRICT,
+    turn_id INTEGER REFERENCES control_turns(id) ON DELETE RESTRICT,
+    policy_id INTEGER NOT NULL REFERENCES control_policies(id) ON DELETE RESTRICT,
+    action_kind TEXT NOT NULL CHECK(action_kind IN
+        ('thread_start', 'thread_resume', 'turn_start', 'turn_steer', 'turn_interrupt', 'status_reconcile')),
+    state TEXT NOT NULL CHECK(state IN
+        ('planned', 'dispatching', 'acknowledged', 'succeeded', 'failed', 'uncertain')),
+    request_method TEXT NOT NULL,
+    request_fingerprint TEXT NOT NULL,
+    source_result_id TEXT,
+    created_at INTEGER NOT NULL,
+    dispatch_started_at INTEGER,
+    terminal_at INTEGER,
+    error_class TEXT,
+    error_message TEXT,
+    CHECK(
+        (state IN ('succeeded', 'failed', 'uncertain') AND terminal_at IS NOT NULL)
+        OR (state NOT IN ('succeeded', 'failed', 'uncertain') AND terminal_at IS NULL)
+    )
+);
+CREATE INDEX control_actions_recovery ON control_actions(state, created_at);
+CREATE INDEX control_actions_run ON control_actions(run_id, created_at, id);
+CREATE TABLE control_action_events (
+    id INTEGER PRIMARY KEY,
+    action_id INTEGER NOT NULL REFERENCES control_actions(id) ON DELETE RESTRICT,
+    sequence INTEGER NOT NULL,
+    event_kind TEXT NOT NULL,
+    recorded_at INTEGER NOT NULL,
+    detail TEXT,
+    UNIQUE(action_id, sequence)
+);";
 
 const CREATE_SESSIONS_SCHEMA: &str = "CREATE TABLE sessions (
     id INTEGER PRIMARY KEY,
@@ -349,6 +437,11 @@ impl Registry {
         if current <= 2 {
             transaction.execute_batch(CREATE_SESSIONS_SCHEMA)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        }
+
+        if current <= 3 {
+            transaction.execute_batch(CREATE_CONTROL_SCHEMA)?;
+            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         } else if current != SCHEMA_VERSION {
             return Err(Error::UnsupportedSchema {
                 found: current,
@@ -473,7 +566,7 @@ mod tests {
     #[test]
     fn initializes_current_schema() -> Result<()> {
         let (_temp, registry) = isolated_registry()?;
-        assert_eq!(registry.schema_version()?, 3);
+        assert_eq!(registry.schema_version()?, 4);
         Ok(())
     }
 
@@ -506,7 +599,7 @@ mod tests {
         drop(read_only);
 
         let registry = Registry::open(&paths)?;
-        assert_eq!(registry.schema_version()?, 3);
+        assert_eq!(registry.schema_version()?, 4);
         assert!(registry.list_projects()?.is_empty());
         Ok(())
     }
@@ -549,9 +642,59 @@ mod tests {
         drop(connection);
 
         let registry = Registry::open(&paths)?;
-        assert_eq!(registry.schema_version()?, 3);
+        assert_eq!(registry.schema_version()?, 4);
         assert_eq!(registry.list_projects()?.len(), 1);
         assert!(registry.list_sessions()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn migrates_schema_version_three_without_changing_session_catalog() -> Result<()> {
+        let temp = tempfile::tempdir().map_err(|source| Error::Io {
+            path: PathBuf::from("temporary test directory"),
+            source,
+        })?;
+        let paths = SkeinPaths::new(temp.path().join("config"), temp.path().join("data"));
+        let project_dir = temp.path().join("project");
+        fs::create_dir(&project_dir).map_err(|source| Error::Io {
+            path: project_dir.clone(),
+            source,
+        })?;
+        let mut registry = Registry::open(&paths)?;
+        registry.add_project(&project_dir, None)?;
+        registry.import_sessions(&[crate::SessionObservation {
+            source_kind: "codex".to_owned(),
+            source_thread_id: "synthetic-thread".to_owned(),
+            source_session_id: Some("synthetic-session".to_owned()),
+            source_cwd: project_dir,
+            source_created_at: 1,
+            source_updated_at: 2,
+            source_label: "cli".to_owned(),
+            observed_status_label: "notLoaded".to_owned(),
+            model_provider: Some("synthetic".to_owned()),
+            source_version: Some("1.0.0".to_owned()),
+            parent_source_thread_id: None,
+            forked_from_source_thread_id: None,
+            ephemeral: false,
+            name: None,
+            preview: None,
+            text_imported: false,
+        }])?;
+        registry.connection.execute_batch(
+            "DROP TABLE control_action_events;
+             DROP TABLE control_actions;
+             DROP TABLE control_turns;
+             DROP TABLE control_runs;
+             DROP TABLE control_policies;
+             PRAGMA user_version = 3;",
+        )?;
+        drop(registry);
+
+        let registry = Registry::open(&paths)?;
+        assert_eq!(registry.schema_version()?, 4);
+        assert_eq!(registry.list_projects()?.len(), 1);
+        assert_eq!(registry.list_sessions()?.len(), 1);
+        assert!(registry.list_control_runs()?.is_empty());
         Ok(())
     }
 

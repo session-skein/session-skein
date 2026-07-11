@@ -7,8 +7,10 @@ or Agent Deck are installed, but neither will be required.
 
 The project is in an early foundation phase. Today, the `skein` binary provides a
 secure versioned project registry, diagnostics, bounded incremental Git metadata, and
-a durable Codex session catalog populated through the app-server protocol. It does
-not yet control Codex workers or provide the conductor TUI.
+a durable Codex session catalog populated through the app-server protocol. It can
+run one audited foreground Codex turn against an explicitly selected project or
+thread. It does not yet route natural-language work, detach managed workers, or
+provide the conductor TUI.
 
 ## Why a skein?
 
@@ -32,6 +34,12 @@ cargo run --release --bin skein -- session list --json
 cargo run --release --bin skein -- session show THREAD_ID --json
 cargo run --release --bin skein -- session bind THREAD_ID /path/to/project --json
 cargo run --release --bin skein -- session unbind THREAD_ID --json
+printf '%s\n' 'Describe this repository.' | \
+  cargo run --release --bin skein -- control codex /path/to/project \
+    --full-access --jsonl
+cargo run --release --bin skein -- control list --json
+cargo run --release --bin skein -- control show RUN_ID --json
+cargo run --release --bin skein -- control mark-stale --force --json
 ```
 
 `doctor` is always read-only and does not migrate an older database. `init` creates
@@ -57,6 +65,13 @@ bounded, transactional metadata synchronization. It stores no thread text by def
 never parses rollout JSONL, and never silently creates projects. Existing registered
 projects are associated using the longest canonical ancestor of the observed Codex
 cwd; unmatched sessions remain visible. See [docs/session-sync.md](docs/session-sync.md).
+
+`control codex` reads its prompt from standard input, records an immutable
+danger-full-access / never-approve policy snapshot before mutation, verifies that
+Codex applied that policy, then streams one turn until authoritative completion. Live
+content is redacted unless `--include-content` is supplied and is never stored by
+Session Skein. Resume a selected thread with `--resume THREAD_ID`. See
+[docs/codex-control.md](docs/codex-control.md).
 
 Environment overrides:
 

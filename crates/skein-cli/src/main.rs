@@ -1,3 +1,4 @@
+use std::io::Read;
 use std::path::PathBuf;
 
 use clap::ArgGroup;
@@ -5,11 +6,16 @@ use clap::Args;
 use clap::Parser;
 use clap::Subcommand;
 use serde::Serialize;
+use skein_codex::ControlClient;
+use skein_codex::ControlEvent;
 use skein_codex::DiscoveryOptions;
+use skein_core::NewControlRun;
 use skein_core::Registry;
 use skein_core::SessionImportReport;
 use skein_core::SessionObservation;
 use skein_core::SkeinPaths;
+
+const MAX_CONTROL_PROMPT_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(name = "skein", version, about)]
@@ -39,6 +45,54 @@ enum Command {
         #[command(subcommand)]
         command: SessionCommand,
     },
+    /// Run and inspect explicitly targeted Codex work.
+    Control {
+        #[command(subcommand)]
+        command: ControlCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ControlCommand {
+    /// Start or resume one audited foreground Codex turn.
+    Codex(ControlCodexArgs),
+    /// List redaction-safe Skein-owned runs.
+    List(OutputArgs),
+    /// Show one run and its audit actions without prompt or output content.
+    Show {
+        /// Numeric Skein run identifier.
+        run_id: i64,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Force-quarantine in-flight records after verifying their controller is dead.
+    MarkStale {
+        /// Acknowledge that this can quarantine a still-live foreground controller.
+        #[arg(long)]
+        force: bool,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Args)]
+struct ControlCodexArgs {
+    /// Existing registered project directory.
+    project: PathBuf,
+    /// Resume this opaque Codex thread instead of starting a new one.
+    #[arg(long)]
+    resume: Option<String>,
+    /// Explicitly authorize danger-full-access with approval policy never.
+    #[arg(long)]
+    full_access: bool,
+    /// Display live agent-message deltas; content is never stored by Skein.
+    #[arg(long)]
+    include_content: bool,
+    /// Emit newline-delimited JSON events and a final run record.
+    #[arg(long)]
+    jsonl: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -355,8 +409,210 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 print_value(&session_view(session, args.include_text), args.json)?;
             }
         },
+        Command::Control { command } => match command {
+            ControlCommand::Codex(args) => control_codex(&paths, args)?,
+            ControlCommand::List(output) => {
+                let registry = Registry::open(&paths)?;
+                print_value(&registry.list_control_runs()?, output.json)?;
+            }
+            ControlCommand::Show { run_id, json } => {
+                let registry = Registry::open(&paths)?;
+                print_value(&registry.control_run_detail(run_id)?, json)?;
+            }
+            ControlCommand::MarkStale { force, json } => {
+                let mut registry = Registry::open(&paths)?;
+                print_value(&registry.mark_stale_control_runs(force)?, json)?;
+            }
+        },
     }
 
+    Ok(())
+}
+
+fn control_codex(
+    paths: &SkeinPaths,
+    args: ControlCodexArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !args.full_access {
+        return Err(skein_core::Error::InvalidControlRequest(
+            "pass --full-access to acknowledge danger-full-access with approvals disabled"
+                .to_owned(),
+        )
+        .into());
+    }
+    let mut prompt = String::new();
+    std::io::stdin()
+        .take((MAX_CONTROL_PROMPT_BYTES + 1) as u64)
+        .read_to_string(&mut prompt)?;
+    if prompt.len() > MAX_CONTROL_PROMPT_BYTES {
+        return Err(skein_core::Error::InvalidControlRequest(format!(
+            "prompt exceeds the {MAX_CONTROL_PROMPT_BYTES}-byte control limit"
+        ))
+        .into());
+    }
+    if prompt.trim().is_empty() {
+        return Err(skein_core::Error::InvalidControlRequest(
+            "provide the prompt on standard input".to_owned(),
+        )
+        .into());
+    }
+
+    let mut client = ControlClient::connect()?;
+    let mut registry = Registry::open(paths)?;
+    let plan = registry.plan_control_run(&NewControlRun {
+        project_path: &args.project,
+        resume_thread_id: args.resume.as_deref(),
+        prompt: &prompt,
+        full_access_acknowledged: true,
+    })?;
+
+    registry.begin_control_action(plan.thread_action_id)?;
+    let thread = match args.resume.as_deref() {
+        Some(thread_id) => client.resume_thread(thread_id, &plan.working_directory),
+        None => client.start_thread(&plan.working_directory),
+    };
+    let thread = match thread {
+        Ok(thread) => thread,
+        Err(error) => {
+            registry.mark_control_uncertain(plan.run_id)?;
+            return Err(error.into());
+        }
+    };
+    if let Err(error) = registry.acknowledge_thread_action(
+        plan.thread_action_id,
+        &thread.thread_id,
+        Some(&thread.session_id),
+    ) {
+        registry.mark_control_uncertain(plan.run_id)?;
+        return Err(error.into());
+    }
+
+    registry.begin_control_action(plan.turn_action_id)?;
+    let turn = match client.start_turn(
+        &thread.thread_id,
+        &prompt,
+        &plan.client_message_id,
+        &plan.working_directory,
+    ) {
+        Ok(turn) => turn,
+        Err(error) => {
+            registry.mark_control_uncertain(plan.run_id)?;
+            return Err(error.into());
+        }
+    };
+    if let Err(error) = registry.acknowledge_turn_action(plan.turn_action_id, &turn.turn_id) {
+        registry.mark_control_uncertain(plan.run_id)?;
+        return Err(error.into());
+    }
+
+    loop {
+        let event = match client.next_event() {
+            Ok(event) => event,
+            Err(error) => {
+                registry.mark_control_uncertain(plan.run_id)?;
+                return Err(error.into());
+            }
+        };
+        if control_event_matches(&event, &thread.thread_id, &turn.turn_id) {
+            emit_control_event(&event, args.include_content, args.jsonl)?;
+        }
+        if let ControlEvent::TurnCompleted {
+            thread_id,
+            turn_id,
+            status,
+        } = &event
+            && thread_id == &thread.thread_id
+            && turn_id == &turn.turn_id
+        {
+            let run = registry.complete_control_run(plan.run_id, status)?;
+            if args.jsonl {
+                println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "type": "control_run",
+                        "run": run,
+                        "contentRedacted": !args.include_content
+                    }))?
+                );
+            } else {
+                println!("\nrun {}: {:?}", run.id, run.state);
+            }
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn control_event_matches(event: &ControlEvent, thread_id: &str, turn_id: &str) -> bool {
+    match event {
+        ControlEvent::TurnStarted {
+            thread_id: event_thread,
+            turn_id: event_turn,
+        }
+        | ControlEvent::AgentMessageDelta {
+            thread_id: event_thread,
+            turn_id: event_turn,
+            ..
+        }
+        | ControlEvent::ItemStarted {
+            thread_id: event_thread,
+            turn_id: event_turn,
+            ..
+        }
+        | ControlEvent::ItemCompleted {
+            thread_id: event_thread,
+            turn_id: event_turn,
+            ..
+        }
+        | ControlEvent::RetryingError {
+            thread_id: event_thread,
+            turn_id: event_turn,
+            ..
+        }
+        | ControlEvent::TurnCompleted {
+            thread_id: event_thread,
+            turn_id: event_turn,
+            ..
+        } => event_thread == thread_id && event_turn == turn_id,
+        ControlEvent::ThreadStatusChanged {
+            thread_id: event_thread,
+            ..
+        } => event_thread == thread_id,
+        ControlEvent::Unknown { .. } => true,
+    }
+}
+
+fn emit_control_event(
+    event: &ControlEvent,
+    include_content: bool,
+    jsonl: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if jsonl {
+        let value = match event {
+            ControlEvent::AgentMessageDelta {
+                thread_id,
+                turn_id,
+                delta,
+            } if !include_content => serde_json::json!({
+                "type": "agent_message_delta",
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "deltaBytes": delta.len(),
+                "contentRedacted": true
+            }),
+            _ => serde_json::to_value(event)?,
+        };
+        println!("{}", serde_json::to_string(&value)?);
+    } else {
+        match event {
+            ControlEvent::AgentMessageDelta { delta, .. } if include_content => print!("{delta}"),
+            ControlEvent::TurnStarted { .. } => eprintln!("Codex turn started"),
+            ControlEvent::TurnCompleted { status, .. } => {
+                eprintln!("Codex turn completed: {status}")
+            }
+            _ => {}
+        }
+    }
     Ok(())
 }
 

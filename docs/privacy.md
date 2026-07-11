@@ -25,6 +25,14 @@ personal or proprietary information.
 - Thread names and first-message previews are absent from durable state by default.
   `session sync codex --include-text` is the explicit opt-in for storing only those
   two text fields in the private database.
+- Control prompts, agent messages, command arguments and
+  output, diffs, approval bodies, and MCP payloads remain Codex-owned. Control state
+  stores only byte counts, opaque correlation IDs, policy, timestamps, method names,
+  fixed sanitized error classifications, source result IDs, and state transitions.
+- `control codex --include-content` affects only that command's live output. It does
+  not enable persistence.
 
-Session Skein currently performs no telemetry and no network requests at runtime.
-That invariant must remain documented if a future optional integration changes it.
+Session Skein performs no telemetry and has no direct network client. Its app-server
+transport is local and it stores no Codex credentials. A controlled Codex process does
+contact OpenAI and may contact configured web or MCP services under Codex's own
+configuration and the explicitly acknowledged full-access policy.

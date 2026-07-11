@@ -1,10 +1,19 @@
 //! Fast, local-first state primitives for Session Skein.
 
+mod control;
 mod git;
 mod paths;
 mod registry;
 mod session;
 
+pub use control::ControlAction;
+pub use control::ControlActionKind;
+pub use control::ControlActionState;
+pub use control::ControlPlan;
+pub use control::ControlRun;
+pub use control::ControlRunDetail;
+pub use control::ControlRunState;
+pub use control::NewControlRun;
 pub use git::GitMetadata;
 pub use paths::SkeinPaths;
 pub use registry::Project;
@@ -69,6 +78,14 @@ pub enum Error {
         /// Opaque thread identifier owned by the adapter.
         source_thread_id: String,
     },
+
+    /// A control request violated a policy or state-machine invariant.
+    #[error("invalid control request: {0}")]
+    InvalidControlRequest(String),
+
+    /// A conditional control transition lost a race or used the wrong state.
+    #[error("control state conflict: {0}")]
+    ControlStateConflict(String),
 
     /// Git could not be started on this machine.
     #[error("could not start Git for {path}: {source}")]

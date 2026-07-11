@@ -3,7 +3,16 @@
 All notable changes will be documented here. The project follows Semantic Versioning
 after its first published release.
 
-## [0.4.0] - Unreleased
+## [0.5.0-alpha.1] - Unreleased control foundation
+
+- Added explicitly targeted foreground Codex thread start/resume and managed turn
+  execution through app-server with existing Codex ChatGPT authentication.
+- Added immutable full-access policy snapshots, redaction-safe run state, and a
+  crash-conservative action/event audit ledger in schema version 4.
+- Added redacted JSONL monitoring and authoritative completion from
+  `turn/completed`; prompts and outputs remain Codex-owned.
+
+## [0.4.0] - 2026-07-11
 
 - Added a source-neutral durable session catalog with transactional, idempotent Codex
   metadata synchronization.

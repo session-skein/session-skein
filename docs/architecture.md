@@ -27,6 +27,18 @@ Versioned SQLite state + Codex-owned transcripts
 - Future control operations will be separate from observation and require an
   explicit policy decision.
 
+## Control state
+
+Schema version 4 keeps control intent separate from imported sessions. Immutable
+policy snapshots record the exact authority acknowledged for a run. Skein-owned runs,
+turns, actions, and append-only events are committed before app-server mutations.
+Observed session status never drives the control state machine.
+
+The first control path owns one foreground stdio app-server connection. A transport
+failure after dispatch becomes `recovery_required`; mutating requests are never
+replayed automatically. Durable detached ownership and read-only source reconciliation
+remain the next control milestone. See [codex-control.md](codex-control.md).
+
 ## Git metadata adapter
 
 The first source adapter observes only explicitly registered project roots. It stores

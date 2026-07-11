@@ -1,6 +1,8 @@
 use std::error::Error;
+use std::io::Write;
 use std::path::Path;
 use std::process::Command;
+use std::process::Stdio;
 
 use serde_json::Value;
 use serde_json::json;
@@ -182,6 +184,51 @@ fn codex_preview_reports_a_missing_configured_executable() -> Result<(), Box<dyn
 }
 
 #[test]
+fn oversized_control_prompt_is_rejected_before_codex_or_control_state() -> Result<(), Box<dyn Error>>
+{
+    let temp = tempfile::tempdir()?;
+    let data = temp.path().join("data");
+    let config = temp.path().join("config");
+    let project = temp.path().join("project");
+    std::fs::create_dir(&project)?;
+    assert!(
+        skein(&data, &config)
+            .arg("project")
+            .arg("add")
+            .arg(&project)
+            .output()?
+            .status
+            .success()
+    );
+
+    let mut child = skein(&data, &config)
+        .env("SKEIN_CODEX_BIN", temp.path().join("must-not-run"))
+        .arg("control")
+        .arg("codex")
+        .arg(&project)
+        .arg("--full-access")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .expect("child stdin")
+        .write_all(&vec![b'x'; 1024 * 1024 + 1])?;
+    let output = child.wait_with_output()?;
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("prompt exceeds"));
+
+    let runs = skein(&data, &config)
+        .args(["control", "list", "--json"])
+        .output()?;
+    assert!(runs.status.success());
+    assert_eq!(serde_json::from_slice::<Value>(&runs.stdout)?, json!([]));
+    Ok(())
+}
+
+#[test]
 fn codex_sync_failure_does_not_create_or_migrate_state() -> Result<(), Box<dyn Error>> {
     let temp = tempfile::tempdir()?;
     let data = temp.path().join("data");
@@ -337,6 +384,233 @@ fn synchronizes_lists_and_explicitly_rebinds_codex_sessions() -> Result<(), Box<
     assert!(unbound["name"].is_null());
     assert!(unbound["preview"].is_null());
     assert_eq!(unbound["text_redacted"], true);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn runs_an_audited_full_access_codex_turn_without_persisting_content() -> Result<(), Box<dyn Error>>
+{
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir()?;
+    let data = temp.path().join("data");
+    let config = temp.path().join("config");
+    let project = temp.path().join("project");
+    std::fs::create_dir(&project)?;
+    assert!(
+        skein(&data, &config)
+            .arg("project")
+            .arg("add")
+            .arg(&project)
+            .output()?
+            .status
+            .success()
+    );
+    let project = project.canonicalize()?;
+    let log = temp.path().join("protocol.log");
+    let script = temp.path().join("fake-codex-control");
+    let thread_response = json!({
+        "id": 3,
+        "result": {
+            "thread": {
+                "id": "synthetic-thread",
+                "sessionId": "synthetic-session",
+                "cwd": project,
+                "createdAt": 10,
+                "updatedAt": 10,
+                "source": "appServer",
+                "status": {"type": "idle"},
+                "modelProvider": "synthetic-provider",
+                "cliVersion": "1.2.3",
+                "ephemeral": false,
+                "name": null,
+                "preview": "",
+                "turns": []
+            },
+            "model": "synthetic-model",
+            "modelProvider": "synthetic-provider",
+            "cwd": project,
+            "approvalPolicy": "never",
+            "approvalsReviewer": "user",
+            "sandbox": {"type": "dangerFullAccess"}
+        }
+    });
+    std::fs::write(
+        &script,
+        format!(
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+read -r init; printf '%s\n' "$init" >> '{}'
+printf '%s\n' '{{"id":1,"result":{{"userAgent":"synthetic"}}}}'
+read -r initialized; printf '%s\n' "$initialized" >> '{}'
+read -r account; printf '%s\n' "$account" >> '{}'
+printf '%s\n' '{{"id":2,"result":{{"requiresOpenaiAuth":false,"account":{{"type":"chatgpt","email":null,"planType":"pro"}}}}}}'
+read -r thread; printf '%s\n' "$thread" >> '{}'
+printf '%s\n' '{}'
+read -r turn; printf '%s\n' "$turn" >> '{}'
+printf '%s\n' '{{"id":4,"result":{{"turn":{{"id":"synthetic-turn","status":"inProgress","items":[]}}}}}}'
+printf '%s\n' '{{"method":"item/agentMessage/delta","params":{{"threadId":"synthetic-thread","turnId":"other-turn","itemId":"other-message","delta":"Unrelated answer"}}}}'
+printf '%s\n' '{{"method":"turn/started","params":{{"threadId":"synthetic-thread","turn":{{"id":"synthetic-turn","status":"inProgress","items":[]}}}}}}'
+printf '%s\n' '{{"method":"item/agentMessage/delta","params":{{"threadId":"synthetic-thread","turnId":"synthetic-turn","itemId":"message","delta":"Sensitive synthetic answer"}}}}'
+printf '%s\n' '{{"method":"turn/completed","params":{{"threadId":"synthetic-thread","turn":{{"id":"synthetic-turn","status":"completed","items":[]}}}}}}'
+read -r _ || true
+"#,
+            log.display(),
+            log.display(),
+            log.display(),
+            log.display(),
+            thread_response,
+            log.display()
+        ),
+    )?;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))?;
+
+    let mut child = skein(&data, &config)
+        .env("SKEIN_CODEX_BIN", &script)
+        .arg("control")
+        .arg("codex")
+        .arg(&project)
+        .args(["--full-access", "--jsonl"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .expect("child stdin")
+        .write_all(b"Sensitive synthetic prompt")?;
+    let output = child.wait_with_output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(!stdout.contains("Sensitive synthetic answer"));
+    assert!(!stdout.contains("other-turn"));
+    assert!(stdout.contains("\"contentRedacted\":true"));
+    assert!(stdout.lines().any(|line| {
+        serde_json::from_str::<Value>(line).is_ok_and(|value| value["type"] == "control_run")
+    }));
+
+    let protocol = std::fs::read_to_string(log)?;
+    assert!(protocol.contains("\"method\":\"account/read\""));
+    assert!(protocol.contains("\"sandbox\":\"danger-full-access\""));
+    assert!(protocol.contains("\"approvalPolicy\":\"never\""));
+    assert!(protocol.contains("\"type\":\"dangerFullAccess\""));
+
+    let detail = skein(&data, &config)
+        .args(["control", "show", "1", "--json"])
+        .output()?;
+    assert!(detail.status.success());
+    let detail: Value = serde_json::from_slice(&detail.stdout)?;
+    assert_eq!(detail["state"], "completed");
+    assert_eq!(detail["input_bytes"], "Sensitive synthetic prompt".len());
+    let serialized = serde_json::to_string(&detail)?;
+    assert!(!serialized.contains("Sensitive synthetic prompt"));
+    assert!(!serialized.contains("Sensitive synthetic answer"));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_a_server_request_while_waiting_for_a_response() -> Result<(), Box<dyn Error>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir()?;
+    let data = temp.path().join("data");
+    let config = temp.path().join("config");
+    let project = temp.path().join("project");
+    std::fs::create_dir(&project)?;
+    assert!(
+        skein(&data, &config)
+            .arg("project")
+            .arg("add")
+            .arg(&project)
+            .output()?
+            .status
+            .success()
+    );
+    let script = temp.path().join("fake-codex-server-request");
+    std::fs::write(
+        &script,
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+read -r _
+printf '%s\n' '{"id":1,"result":{"userAgent":"synthetic"}}'
+read -r _
+read -r _
+printf '%s\n' '{"id":99,"method":"item/tool/requestUserInput","params":{}}'
+read -r _
+"#,
+    )?;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))?;
+
+    let mut child = skein(&data, &config)
+        .env("SKEIN_CODEX_BIN", &script)
+        .arg("control")
+        .arg("codex")
+        .arg(&project)
+        .args(["--full-access", "--jsonl"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .expect("child stdin")
+        .write_all(b"Synthetic prompt")?;
+    let output = child.wait_with_output()?;
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unsupported interactive input"));
+    let runs = skein(&data, &config)
+        .args(["control", "list", "--json"])
+        .output()?;
+    assert!(runs.status.success());
+    assert_eq!(serde_json::from_slice::<Value>(&runs.stdout)?, json!([]));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn closed_control_connection_fails_before_state_mutation() -> Result<(), Box<dyn Error>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir()?;
+    let data = temp.path().join("data");
+    let config = temp.path().join("config");
+    let script = temp.path().join("fake-codex-eof");
+    std::fs::write(
+        &script,
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+read -r _
+printf '%s\n' '{"id":1,"result":{"userAgent":"synthetic"}}'
+read -r _
+read -r _
+"#,
+    )?;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))?;
+
+    let mut child = skein(&data, &config)
+        .env("SKEIN_CODEX_BIN", &script)
+        .args(["control", "codex", "/synthetic/project", "--full-access"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .expect("child stdin")
+        .write_all(b"Synthetic prompt")?;
+    let output = child.wait_with_output()?;
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("closed the control connection"));
+    assert!(!data.exists());
     Ok(())
 }
 

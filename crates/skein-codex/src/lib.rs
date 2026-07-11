@@ -1,14 +1,19 @@
-//! Read-only Codex app-server discovery for Session Skein.
+//! Codex app-server discovery and explicit control for Session Skein.
 
+use std::collections::VecDeque;
 use std::io::BufRead;
 use std::io::BufReader;
 use std::io::Write;
+use std::process::ChildStdin;
 use std::process::Command;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
+use std::sync::mpsc;
+use std::sync::mpsc::Receiver;
+use std::sync::mpsc::RecvTimeoutError;
 use std::thread;
 use std::time::Duration;
 
@@ -18,6 +23,9 @@ use serde_json::Value;
 use serde_json::json;
 
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
+const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const CONTROL_RESUME_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const MAX_DEFERRED_MESSAGES: usize = 1_024;
 
 /// Errors produced by the Codex discovery adapter.
 #[derive(Debug, thiserror::Error)]
@@ -43,16 +51,403 @@ pub enum Error {
     #[error("Codex app-server JSON could not be decoded: {0}")]
     Json(#[from] serde_json::Error),
 
-    /// Codex did not complete the bounded preview in time.
-    #[error("Codex app-server preview timed out after {seconds} seconds")]
+    /// Codex did not complete a bounded protocol phase in time.
+    #[error("Codex app-server request timed out after {seconds} seconds")]
     Timeout {
         /// Configured watchdog duration.
         seconds: u64,
     },
+
+    /// The installed Codex CLI has no usable ChatGPT login.
+    #[error("Codex authentication is required; run `codex login`")]
+    AuthenticationRequired,
+
+    /// Codex did not apply the explicitly requested execution policy.
+    #[error("Codex effective policy mismatch: {0}")]
+    PolicyMismatch(String),
+
+    /// App-server requested an interaction this controller cannot safely answer.
+    #[error("Codex requested unsupported interactive input: {0}")]
+    InteractiveRequest(String),
 }
 
 /// Result type used by this adapter.
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// A started or resumed Codex thread with verified effective policy.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControlledThread {
+    pub thread_id: String,
+    pub session_id: String,
+    pub cwd: String,
+    pub model: String,
+    pub model_provider: String,
+}
+
+/// One accepted Codex turn.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControlledTurn {
+    pub turn_id: String,
+    pub status: String,
+}
+
+/// Redaction-aware live event emitted by the control connection.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ControlEvent {
+    TurnStarted {
+        thread_id: String,
+        turn_id: String,
+    },
+    AgentMessageDelta {
+        thread_id: String,
+        turn_id: String,
+        delta: String,
+    },
+    ItemStarted {
+        thread_id: String,
+        turn_id: String,
+        item_type: String,
+    },
+    ItemCompleted {
+        thread_id: String,
+        turn_id: String,
+        item_type: String,
+    },
+    ThreadStatusChanged {
+        thread_id: String,
+        status: String,
+    },
+    RetryingError {
+        thread_id: String,
+        turn_id: String,
+        will_retry: bool,
+    },
+    TurnCompleted {
+        thread_id: String,
+        turn_id: String,
+        status: String,
+    },
+    Unknown {
+        method: String,
+    },
+}
+
+/// Long-lived JSONL connection to one locally installed Codex app-server.
+pub struct ControlClient {
+    child: Arc<Mutex<std::process::Child>>,
+    stdin: ChildStdin,
+    incoming: Receiver<Result<Value>>,
+    queued: VecDeque<Value>,
+    next_id: i64,
+}
+
+impl ControlClient {
+    /// Spawn Codex, initialize the connection, and verify cached authentication.
+    pub fn connect() -> Result<Self> {
+        let command = std::env::var_os("SKEIN_CODEX_BIN").unwrap_or_else(|| "codex".into());
+        let mut child = Command::new(command)
+            .args(["app-server", "--listen", "stdio://"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| Error::Protocol("app-server stdin was unavailable".to_owned()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| Error::Protocol("app-server stdout was unavailable".to_owned()))?;
+        let (sender, incoming) = mpsc::channel();
+        thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if sender
+                            .send(serde_json::from_str(&line).map_err(Error::from))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = sender.send(Err(Error::Io(error)));
+                        break;
+                    }
+                }
+            }
+        });
+        let mut client = Self {
+            child: Arc::new(Mutex::new(child)),
+            stdin,
+            incoming,
+            queued: VecDeque::new(),
+            next_id: 1,
+        };
+        client.request(
+            "initialize",
+            json!({
+                "clientInfo": {
+                    "name": "session_skein",
+                    "title": "Session Skein",
+                    "version": env!("CARGO_PKG_VERSION")
+                }
+            }),
+        )?;
+        write_message(
+            &mut client.stdin,
+            &json!({"method": "initialized", "params": {}}),
+        )?;
+        let account = client.request("account/read", json!({"refreshToken": true}))?;
+        validate_chatgpt_account(&account)?;
+        Ok(client)
+    }
+
+    /// Start a persistent thread under an explicit full-access/no-approval policy.
+    pub fn start_thread(&mut self, cwd: &std::path::Path) -> Result<ControlledThread> {
+        self.open_thread(
+            "thread/start",
+            json!({
+                "cwd": cwd,
+                "sandbox": "danger-full-access",
+                "approvalPolicy": "never",
+                "ephemeral": false,
+                "threadSource": "session_skein"
+            }),
+            cwd,
+        )
+    }
+
+    /// Resume a stored thread under the same explicit policy and working directory.
+    pub fn resume_thread(
+        &mut self,
+        thread_id: &str,
+        cwd: &std::path::Path,
+    ) -> Result<ControlledThread> {
+        self.open_thread(
+            "thread/resume",
+            json!({
+                "threadId": thread_id,
+                "cwd": cwd,
+                "sandbox": "danger-full-access",
+                "approvalPolicy": "never"
+            }),
+            cwd,
+        )
+    }
+
+    /// Start a text turn and reassert the explicit full-access policy.
+    pub fn start_turn(
+        &mut self,
+        thread_id: &str,
+        prompt: &str,
+        client_message_id: &str,
+        cwd: &std::path::Path,
+    ) -> Result<ControlledTurn> {
+        let result = self.request(
+            "turn/start",
+            json!({
+                "threadId": thread_id,
+                "input": [{"type": "text", "text": prompt}],
+                "clientUserMessageId": client_message_id,
+                "cwd": cwd,
+                "sandboxPolicy": {"type": "dangerFullAccess"},
+                "approvalPolicy": "never"
+            }),
+        )?;
+        parse_turn(&result)
+    }
+
+    /// Read the next live notification, tolerating unknown additive methods.
+    pub fn next_event(&mut self) -> Result<ControlEvent> {
+        loop {
+            let value = self.next_value()?;
+            if is_server_request(&value) {
+                return Err(Error::InteractiveRequest(reject_server_request(
+                    &mut self.stdin,
+                    &value,
+                )?));
+            }
+            let Some(method) = value.get("method").and_then(Value::as_str) else {
+                continue;
+            };
+            let params = value.get("params").cloned().unwrap_or(Value::Null);
+            return parse_control_event(method, &params);
+        }
+    }
+
+    fn open_thread(
+        &mut self,
+        method: &str,
+        params: Value,
+        expected_cwd: &std::path::Path,
+    ) -> Result<ControlledThread> {
+        let result = if method == "thread/resume" {
+            self.request_with_timeout(method, params, CONTROL_RESUME_TIMEOUT)?
+        } else {
+            self.request(method, params)?
+        };
+        parse_controlled_thread(&result, expected_cwd)
+    }
+
+    fn request(&mut self, method: &str, params: Value) -> Result<Value> {
+        self.request_with_timeout(method, params, CONTROL_REQUEST_TIMEOUT)
+    }
+
+    fn request_with_timeout(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value> {
+        let id = self.next_id;
+        self.next_id += 1;
+        write_message(
+            &mut self.stdin,
+            &json!({"method": method, "id": id, "params": params}),
+        )?;
+        let mut deferred = VecDeque::new();
+        loop {
+            let value = if let Some(value) = self.queued.pop_front() {
+                value
+            } else {
+                self.receive_value_timeout(timeout)?
+            };
+            if is_server_request(&value) {
+                let requested_method = reject_server_request(&mut self.stdin, &value)?;
+                self.queued.extend(deferred);
+                return Err(Error::InteractiveRequest(requested_method));
+            }
+            if value.get("id").and_then(Value::as_i64) == Some(id) {
+                let response: RpcResponse = serde_json::from_value(value)?;
+                self.queued.extend(deferred);
+                return response_result(response);
+            }
+            if deferred.len() >= MAX_DEFERRED_MESSAGES {
+                return Err(Error::Protocol(format!(
+                    "more than {MAX_DEFERRED_MESSAGES} unrelated messages arrived while awaiting {method}"
+                )));
+            }
+            deferred.push_back(value);
+        }
+    }
+
+    fn next_value(&mut self) -> Result<Value> {
+        if let Some(value) = self.queued.pop_front() {
+            return Ok(value);
+        }
+        self.receive_value()
+    }
+
+    fn receive_value(&self) -> Result<Value> {
+        self.incoming
+            .recv()
+            .map_err(|_| Error::Protocol("app-server closed the control connection".to_owned()))?
+    }
+
+    fn receive_value_timeout(&self, timeout: Duration) -> Result<Value> {
+        match self.incoming.recv_timeout(timeout) {
+            Ok(value) => value,
+            Err(RecvTimeoutError::Timeout) => Err(Error::Timeout {
+                seconds: timeout.as_secs(),
+            }),
+            Err(RecvTimeoutError::Disconnected) => Err(Error::Protocol(
+                "app-server closed the control connection".to_owned(),
+            )),
+        }
+    }
+}
+
+fn parse_controlled_thread(
+    result: &Value,
+    expected_cwd: &std::path::Path,
+) -> Result<ControlledThread> {
+    let sandbox = result
+        .get("sandbox")
+        .and_then(|value| value.get("type"))
+        .and_then(Value::as_str);
+    let approval = result.get("approvalPolicy").and_then(Value::as_str);
+    if sandbox != Some("dangerFullAccess") || approval != Some("never") {
+        return Err(Error::PolicyMismatch(format!(
+            "requested dangerFullAccess/never, received {sandbox:?}/{approval:?}"
+        )));
+    }
+    let cwd = required_string(result, "cwd")?;
+    let expected = expected_cwd.to_string_lossy();
+    if cwd != expected {
+        return Err(Error::PolicyMismatch(format!(
+            "requested cwd {expected}, received {cwd}"
+        )));
+    }
+    let thread = result
+        .get("thread")
+        .ok_or_else(|| Error::Protocol("thread response had no thread".to_owned()))?;
+    Ok(ControlledThread {
+        thread_id: required_string(thread, "id")?,
+        session_id: required_string(thread, "sessionId")?,
+        cwd,
+        model: required_string(result, "model")?,
+        model_provider: required_string(result, "modelProvider")?,
+    })
+}
+
+fn is_server_request(value: &Value) -> bool {
+    value.get("id").is_some() && value.get("method").and_then(Value::as_str).is_some()
+}
+
+fn reject_server_request(stdin: &mut ChildStdin, value: &Value) -> Result<String> {
+    let method = value
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_owned();
+    write_message(
+        stdin,
+        &json!({
+            "id": value.get("id").cloned().unwrap_or(Value::Null),
+            "error": {
+                "code": -32601,
+                "message": "Session Skein cannot safely answer this interactive request"
+            }
+        }),
+    )?;
+    Ok(method)
+}
+
+fn validate_chatgpt_account(result: &Value) -> Result<()> {
+    if result
+        .get("requiresOpenaiAuth")
+        .and_then(Value::as_bool)
+        .is_none()
+    {
+        return Err(Error::AuthenticationRequired);
+    }
+    let account = result.get("account").filter(|value| !value.is_null());
+    if account
+        .and_then(|value| value.get("type"))
+        .and_then(Value::as_str)
+        != Some("chatgpt")
+    {
+        return Err(Error::AuthenticationRequired);
+    }
+    Ok(())
+}
+
+impl Drop for ControlClient {
+    fn drop(&mut self) {
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
 
 /// Options for one bounded `thread/list` request.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -352,6 +747,98 @@ fn source_label(value: &Value) -> String {
     "unknown".to_owned()
 }
 
+fn parse_turn(result: &Value) -> Result<ControlledTurn> {
+    let turn = result
+        .get("turn")
+        .ok_or_else(|| Error::Protocol("turn response had no turn".to_owned()))?;
+    Ok(ControlledTurn {
+        turn_id: required_string(turn, "id")?,
+        status: required_string(turn, "status")?,
+    })
+}
+
+fn required_string(value: &Value, field: &str) -> Result<String> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| Error::Protocol(format!("response field {field} was missing or invalid")))
+}
+
+fn parse_control_event(method: &str, params: &Value) -> Result<ControlEvent> {
+    let thread_id = || required_string(params, "threadId");
+    let turn_id = || required_string(params, "turnId");
+    match method {
+        "turn/started" => {
+            let turn = params
+                .get("turn")
+                .ok_or_else(|| Error::Protocol("turn/started had no turn".to_owned()))?;
+            Ok(ControlEvent::TurnStarted {
+                thread_id: thread_id()?,
+                turn_id: required_string(turn, "id")?,
+            })
+        }
+        "item/agentMessage/delta" => Ok(ControlEvent::AgentMessageDelta {
+            thread_id: thread_id()?,
+            turn_id: turn_id()?,
+            delta: required_string(params, "delta")?,
+        }),
+        "item/started" | "item/completed" => {
+            let item = params
+                .get("item")
+                .ok_or_else(|| Error::Protocol(format!("{method} had no item")))?;
+            let item_type = item
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_owned();
+            if method == "item/started" {
+                Ok(ControlEvent::ItemStarted {
+                    thread_id: thread_id()?,
+                    turn_id: turn_id()?,
+                    item_type,
+                })
+            } else {
+                Ok(ControlEvent::ItemCompleted {
+                    thread_id: thread_id()?,
+                    turn_id: turn_id()?,
+                    item_type,
+                })
+            }
+        }
+        "thread/status/changed" => Ok(ControlEvent::ThreadStatusChanged {
+            thread_id: thread_id()?,
+            status: params
+                .get("status")
+                .and_then(|status| status.get("type"))
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_owned(),
+        }),
+        "error" => Ok(ControlEvent::RetryingError {
+            thread_id: thread_id()?,
+            turn_id: turn_id()?,
+            will_retry: params
+                .get("willRetry")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        }),
+        "turn/completed" => {
+            let turn = params
+                .get("turn")
+                .ok_or_else(|| Error::Protocol("turn/completed had no turn".to_owned()))?;
+            Ok(ControlEvent::TurnCompleted {
+                thread_id: thread_id()?,
+                turn_id: required_string(turn, "id")?,
+                status: required_string(turn, "status")?,
+            })
+        }
+        _ => Ok(ControlEvent::Unknown {
+            method: method.to_owned(),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
@@ -437,5 +924,62 @@ mod tests {
             })),
             "subAgent:thread_spawn"
         );
+    }
+
+    #[test]
+    fn accepts_only_an_authenticated_chatgpt_account() {
+        for requires_openai_auth in [false, true] {
+            assert!(
+                validate_chatgpt_account(&json!({
+                    "requiresOpenaiAuth": requires_openai_auth,
+                    "account": {"type": "chatgpt", "email": null, "planType": "pro"}
+                }))
+                .is_ok()
+            );
+        }
+        for invalid in [
+            json!({"requiresOpenaiAuth": false, "account": null}),
+            json!({"requiresOpenaiAuth": false, "account": {"type": "apiKey"}}),
+            json!({"account": {"type": "chatgpt"}}),
+        ] {
+            assert!(matches!(
+                validate_chatgpt_account(&invalid),
+                Err(Error::AuthenticationRequired)
+            ));
+        }
+    }
+
+    #[test]
+    fn controlled_thread_fails_closed_on_policy_or_cwd_mismatch() {
+        let valid = json!({
+            "thread": {"id": "thread", "sessionId": "session"},
+            "model": "synthetic-model",
+            "modelProvider": "openai",
+            "cwd": "/synthetic/project",
+            "approvalPolicy": "never",
+            "sandbox": {"type": "dangerFullAccess"}
+        });
+        assert!(
+            parse_controlled_thread(&valid, std::path::Path::new("/synthetic/project")).is_ok()
+        );
+
+        let mut wrong_sandbox = valid.clone();
+        wrong_sandbox["sandbox"]["type"] = json!("workspaceWrite");
+        assert!(matches!(
+            parse_controlled_thread(&wrong_sandbox, std::path::Path::new("/synthetic/project")),
+            Err(Error::PolicyMismatch(_))
+        ));
+
+        let mut wrong_approval = valid.clone();
+        wrong_approval["approvalPolicy"] = json!("on-request");
+        assert!(matches!(
+            parse_controlled_thread(&wrong_approval, std::path::Path::new("/synthetic/project")),
+            Err(Error::PolicyMismatch(_))
+        ));
+
+        assert!(matches!(
+            parse_controlled_thread(&valid, std::path::Path::new("/different/project")),
+            Err(Error::PolicyMismatch(_))
+        ));
     }
 }
