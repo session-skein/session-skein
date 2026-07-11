@@ -9,6 +9,8 @@ after its first published release.
   session/run navigation, deterministic daily cards, and one global conductor input.
 - Added one-shot full-access arming, bounded child protocol handling, stable request
   reconciliation, exact-run interrupt confirmation, and redacted live worker events.
+- Added pinned actionable blockers for recovery-required and failed runs plus
+  non-resumable session states.
 - Kept all catalog I/O and worker operations off the rendering thread and retained a
   complete Codex CLI-only path with no tmux, Agent Deck, MCP, or service dependency.
 

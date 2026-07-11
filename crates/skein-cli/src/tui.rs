@@ -611,6 +611,88 @@ impl App {
         self.selected_run
     }
 
+    fn selected_session(&self) -> Option<&SessionMetadata> {
+        let sessions = self.project_sessions();
+        sessions.get(self.selected_work).copied()
+    }
+
+    fn blocker_message(&self) -> Option<String> {
+        if let Some(run_id) = self.selected_run
+            && let Some(run) = self.runs.iter().find(|run| run.id == run_id)
+        {
+            match run.state {
+                ControlRunState::RecoveryRequired => {
+                    return Some(format!(
+                        "BLOCKER run #{run_id}: worker ownership was lost; read/reconcile before resuming"
+                    ));
+                }
+                ControlRunState::Failed => {
+                    return Some(format!(
+                        "BLOCKER run #{run_id}: failed; inspect durable control status before retrying"
+                    ));
+                }
+                _ => {}
+            }
+        }
+        if let Some(session) = self.selected_session() {
+            let matching_run = |run: &&ControlRun| {
+                session.source_kind.eq_ignore_ascii_case("codex")
+                    && Some(run.project_id) == session.project_id
+                    && run.source_thread_id.as_deref() == Some(session.source_thread_id.as_str())
+            };
+            if let Some(run) = self
+                .runs
+                .iter()
+                .filter(matching_run)
+                .find(|run| run.state == ControlRunState::RecoveryRequired)
+            {
+                return Some(format!(
+                    "BLOCKER run #{}: worker ownership was lost; read/reconcile before resuming",
+                    run.id
+                ));
+            }
+            if session.ephemeral {
+                return Some(
+                    "BLOCKER selected thread is ephemeral; start a new durable thread".to_owned(),
+                );
+            }
+            if session
+                .observed_status_label
+                .eq_ignore_ascii_case("systemError")
+            {
+                return Some(
+                    "BLOCKER last source observation reports a system error; refresh/inspect Codex before resuming"
+                        .to_owned(),
+                );
+            }
+            if session.observed_status_label.eq_ignore_ascii_case("active") {
+                let controlled_here = self.runs.iter().filter(matching_run).any(|run| {
+                    matches!(
+                        run.state,
+                        ControlRunState::Planned
+                            | ControlRunState::Starting
+                            | ControlRunState::Active
+                    )
+                });
+                if !controlled_here {
+                    return Some(
+                        "BLOCKER last source observation says active with no matching Skein owner; refresh/inspect Codex"
+                            .to_owned(),
+                    );
+                }
+            }
+        }
+        self.projects
+            .get(self.selected_project)
+            .filter(|card| card.facts.recovery_runs > 0)
+            .map(|card| {
+                format!(
+                    "BLOCKER {} run(s) need recovery; select one and use read/reconcile",
+                    card.facts.recovery_runs
+                )
+            })
+    }
+
     fn select_run(&mut self, run_id: i64) {
         self.pending_run_selection = Some(run_id);
         let Some(run) = self.runs.iter().find(|run| run.id == run_id) else {
@@ -835,6 +917,21 @@ impl App {
     }
 
     fn render_activity(&self, frame: &mut Frame<'_>, area: Rect) {
+        let activity_area = if let Some(blocker) = self.blocker_message() {
+            let sections = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(area.height.min(3)), Constraint::Min(0)])
+                .split(area);
+            frame.render_widget(
+                Paragraph::new(blocker)
+                    .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+                    .wrap(Wrap { trim: true }),
+                sections[0],
+            );
+            sections[1]
+        } else {
+            area
+        };
         let lines = if self.live_events.is_empty() {
             let mut lines = Vec::new();
             if let Some(day) = &self.day_summary {
@@ -883,7 +980,7 @@ impl App {
             " Activity / live redacted events "
         };
         let block = Block::default().title(activity_title).borders(Borders::ALL);
-        let inner = block.inner(area);
+        let inner = block.inner(activity_area);
         let mut paragraph = Paragraph::new(lines).block(block);
         if !self.live_events.is_empty() && inner.height > 0 {
             let scroll = self.live_events.len().saturating_sub(inner.height as usize);
@@ -891,7 +988,7 @@ impl App {
         } else {
             paragraph = paragraph.wrap(Wrap { trim: true });
         }
-        frame.render_widget(paragraph, area);
+        frame.render_widget(paragraph, activity_area);
     }
 
     fn render_composer(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -1461,6 +1558,72 @@ mod tests {
     }
 
     #[test]
+    fn actionable_blockers_are_pinned_from_durable_state() {
+        let mut app = empty_app();
+        let mut card = project_card(1, "first");
+        card.facts.recovery_runs = 2;
+        app.projects = vec![card];
+        assert!(
+            app.blocker_message().is_some_and(|message| {
+                message.contains("need recovery") && message.contains('2')
+            })
+        );
+
+        app.runs = vec![control_run(9, 1)];
+        app.runs[0].state = ControlRunState::RecoveryRequired;
+        app.select_run(9);
+        assert!(
+            app.blocker_message()
+                .is_some_and(|message| message.contains("read/reconcile"))
+        );
+
+        app.selected_run = None;
+        app.selected_work = 0;
+        app.sessions = vec![session_metadata(1, true, "idle")];
+        assert!(
+            app.blocker_message()
+                .is_some_and(|message| message.contains("ephemeral"))
+        );
+
+        app.sessions.clear();
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal.draw(|frame| app.render(frame)).expect("render");
+        let rendered = buffer_text(terminal.backend().buffer());
+        assert!(rendered.contains("BLOCKER"));
+        assert!(rendered.contains("read/reconcile"));
+    }
+
+    #[test]
+    fn active_source_observation_is_cautious_and_correlated_with_owned_runs() {
+        let mut app = empty_app();
+        app.projects = vec![project_card(1, "first")];
+        app.sessions = vec![session_metadata(1, false, "active")];
+        let message = app.blocker_message().expect("unowned active observation");
+        assert!(message.contains("last source observation"));
+        assert!(message.contains("refresh/inspect Codex"));
+
+        let mut run = control_run(9, 1);
+        run.state = ControlRunState::Active;
+        run.source_thread_id = Some("synthetic-thread".to_owned());
+        app.runs = vec![run];
+        assert!(app.blocker_message().is_none());
+
+        app.runs[0].project_id = 2;
+        assert!(
+            app.blocker_message()
+                .is_some_and(|message| message.contains("no matching Skein owner"))
+        );
+
+        app.runs[0].project_id = 1;
+        app.runs[0].state = ControlRunState::RecoveryRequired;
+        assert!(
+            app.blocker_message()
+                .is_some_and(|message| message.contains("read/reconcile"))
+        );
+    }
+
+    #[test]
     fn compact_ui_renders_library_composer_and_help() {
         let mut app = empty_app();
         app.focus = Focus::Composer;
@@ -1532,6 +1695,23 @@ mod tests {
             approval_mode: "never".to_owned(),
             network_access: true,
             full_access_acknowledged_at: 1,
+        }
+    }
+
+    fn session_metadata(project_id: i64, ephemeral: bool, status: &str) -> SessionMetadata {
+        SessionMetadata {
+            id: 1,
+            source_kind: "codex".to_owned(),
+            source_thread_id: "synthetic-thread".to_owned(),
+            project_id: Some(project_id),
+            project_link_kind: skein_core::ProjectLinkKind::Automatic,
+            source_cwd: PathBuf::from("/synthetic/first"),
+            source_updated_at: 1,
+            last_seen_at: 1,
+            source_label: "cli".to_owned(),
+            observed_status_label: status.to_owned(),
+            ephemeral,
+            text_imported: false,
         }
     }
 

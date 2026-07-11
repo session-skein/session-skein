@@ -11,7 +11,8 @@ API key, or a second model subscription.
 - **Work** shows Codex session identities and Skein-owned runs for the selected
   project. Selecting a run follows its bounded, redacted in-memory events.
 - **Activity** shows the selected project narrative and today's metadata digest when
-  no live events are available.
+  no live events are available. It pins an actionable blocker above the stream when
+  durable run or session state requires recovery or prevents a safe resume.
 - **Global conductor composer** sends one private prompt through the same fail-closed
   `conduct` command used by scripts.
 
