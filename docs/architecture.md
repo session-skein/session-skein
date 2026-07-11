@@ -4,15 +4,15 @@ Session Skein is a local control plane. Its core model is intentionally independ
 from any one agent, terminal multiplexer, or subscription provider.
 
 ```text
-TUI / CLI / MCP
+CLI / TUI / MCP
       |
 Conductor and policy
       |
-Project + session + activity model
+Project + session + activity model <--- optional Git/tmux/Agent Deck observers
       |
-Codex | Agent Deck | tmux | Git adapters
+Codex CLI app-server
       |
-Versioned SQLite state and source-owned transcripts
+Versioned SQLite state + Codex-owned transcripts
 ```
 
 ## Workspace boundaries
@@ -20,7 +20,10 @@ Versioned SQLite state and source-owned transcripts
 - `skein-core` owns paths, migrations, and domain state. It does not spawn agents.
 - `session-skein` produces the `skein` CLI and turns core operations into stable
   human-readable or JSON output.
-- Future adapters will read source data incrementally and preserve provenance.
+- Codex CLI is the first-class runtime; the standalone path has no session-manager
+  dependency.
+- Optional adapters read source data incrementally and preserve provenance without
+  owning core state.
 - Future control operations will be separate from observation and require an
   explicit policy decision.
 
@@ -43,15 +46,23 @@ Codex app-server over stdio, performs the documented initialize handshake, and m
 one bounded `thread/list` request. It does not parse Codex's private rollout JSONL
 format and does not persist preview results.
 
+An explicit session sync converts a bounded preview page into source-neutral durable
+metadata. It stores the Codex thread identity and chronology, observed cwd, last
+app-server-instance status, runtime provenance, relationship identifiers, and a
+conservative project link. It does not store turns or the unstable rollout path. See
+[session-sync.md](session-sync.md).
+
 The app-server schema is specific to the installed Codex version and may evolve. The
 adapter decodes only the fields it exposes publicly and fails closed on protocol or
 JSON-RPC errors. See [codex-preview.md](codex-preview.md).
 
 ## Performance model
 
-The hot path must not scan repositories. Adapters record cursors and fingerprints,
-then refresh only changed sources. SQLite queries serve interactive views. Slow or
-remote project roots are polled only when configured, and Git inspection is bounded.
+The hot path must not scan repositories. Git records bounded fingerprints and skips
+unchanged source inspection. Codex exposes opaque cursors only for the current bounded
+scan; durable overlapping checkpoints remain planned work. SQLite queries serve
+interactive views. Slow or remote project roots are polled only when configured, and
+Git inspection is bounded.
 
 Rust reduces process startup, memory overhead, and deployment friction. It cannot
 remove latency caused by a network filesystem or slow physical disk, so the design

@@ -334,11 +334,20 @@ fn source_label(value: &Value) -> String {
     if let Some(value) = value.as_str() {
         return value.to_owned();
     }
-    if value.get("subAgent").is_some() {
-        return "subAgent".to_owned();
-    }
     if value.get("custom").is_some() {
         return "custom".to_owned();
+    }
+    if let Some(sub_agent) = value.get("subAgent") {
+        if let Some(kind) = sub_agent.as_str() {
+            return format!("subAgent:{kind}");
+        }
+        if sub_agent.get("thread_spawn").is_some() {
+            return "subAgent:thread_spawn".to_owned();
+        }
+        if sub_agent.get("other").is_some() {
+            return "subAgent:other".to_owned();
+        }
+        return "subAgent:unknown".to_owned();
     }
     "unknown".to_owned()
 }
@@ -401,5 +410,32 @@ mod tests {
             exchange(Cursor::new(input), &mut output, &DiscoveryOptions::default()),
             Err(Error::Server { code: -1, message }) if message == "synthetic failure"
         ));
+    }
+
+    #[test]
+    fn preserves_nonstandard_source_provenance_without_private_agent_fields() {
+        assert_eq!(source_label(&json!({"custom": "automation"})), "custom");
+        assert_eq!(
+            source_label(&json!({"subAgent": "review"})),
+            "subAgent:review"
+        );
+        assert_eq!(
+            source_label(&json!({"subAgent": {"other": "private label"}})),
+            "subAgent:other"
+        );
+        assert_eq!(
+            source_label(&json!({
+                "subAgent": {
+                    "thread_spawn": {
+                        "agent_nickname": "private nickname",
+                        "agent_path": "private/path",
+                        "agent_role": "worker",
+                        "depth": 1,
+                        "parent_thread_id": "parent"
+                    }
+                }
+            })),
+            "subAgent:thread_spawn"
+        );
     }
 }

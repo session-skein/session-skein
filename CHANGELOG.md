@@ -3,7 +3,16 @@
 All notable changes will be documented here. The project follows Semantic Versioning
 after its first published release.
 
-## [0.3.0] - Unreleased
+## [0.4.0] - Unreleased
+
+- Added a source-neutral durable session catalog with transactional, idempotent Codex
+  metadata synchronization.
+- Added deterministic project association, explicit bind/unbind overrides, and
+  session list/show commands.
+- Made Codex CLI the documented first-class runtime and moved Agent Deck and tmux to
+  an optional enrichment track.
+
+## [0.3.0] - 2026-07-10
 
 - Added a separate, version-aware `skein-codex` adapter crate.
 - Added redacted-by-default `import codex preview` through the documented app-server
