@@ -284,32 +284,7 @@ impl Registry {
 
     /// List sessions without selecting private name or preview columns.
     pub(crate) fn list_session_metadata(&self) -> Result<Vec<SessionMetadata>> {
-        let query = format!(
-            "{SESSION_METADATA_SELECT} ORDER BY s.source_updated_at DESC,
-             s.source_kind, s.source_thread_id"
-        );
-        let mut statement = self.connection.prepare(&query)?;
-        statement
-            .query_map([], session_metadata_from_row)?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(Error::from)
-    }
-
-    /// Load private session text only for the explicit matching opt-in.
-    pub(crate) fn list_session_match_text(&self) -> Result<Vec<SessionMatchText>> {
-        let mut statement = self.connection.prepare(
-            "SELECT id, name, preview FROM sessions WHERE text_imported = 1 ORDER BY id",
-        )?;
-        statement
-            .query_map([], |row| {
-                Ok(SessionMatchText {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    preview: row.get(2)?,
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(Error::from)
+        list_session_metadata_on(&self.connection)
     }
 
     /// Find one durable session by its adapter-owned identity.
@@ -366,6 +341,37 @@ impl Registry {
                 source_thread_id: source_thread_id.to_owned(),
             })
     }
+}
+
+pub(crate) fn list_session_metadata_on(
+    connection: &rusqlite::Connection,
+) -> Result<Vec<SessionMetadata>> {
+    let query = format!(
+        "{SESSION_METADATA_SELECT} ORDER BY s.source_updated_at DESC,
+         s.source_kind, s.source_thread_id"
+    );
+    let mut statement = connection.prepare(&query)?;
+    statement
+        .query_map([], session_metadata_from_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Error::from)
+}
+
+pub(crate) fn list_session_match_text_on(
+    connection: &rusqlite::Connection,
+) -> Result<Vec<SessionMatchText>> {
+    let mut statement = connection
+        .prepare("SELECT id, name, preview FROM sessions WHERE text_imported = 1 ORDER BY id")?;
+    statement
+        .query_map([], |row| {
+            Ok(SessionMatchText {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                preview: row.get(2)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Error::from)
 }
 
 fn validate_observations(observations: &[SessionObservation]) -> Result<()> {

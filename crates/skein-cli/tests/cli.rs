@@ -863,6 +863,426 @@ read -r _ || true
 
 #[cfg(unix)]
 #[test]
+fn conducts_one_private_prompt_with_atomic_route_and_idempotent_status_lookup()
+-> Result<(), Box<dyn Error>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir()?;
+    let data = temp.path().join("data");
+    let config = temp.path().join("config");
+    let project = temp.path().join("alpha-renderer");
+    std::fs::create_dir(&project)?;
+    assert!(
+        skein(&data, &config)
+            .arg("project")
+            .arg("add")
+            .arg(&project)
+            .args(["--name", "Alpha Renderer"])
+            .output()?
+            .status
+            .success()
+    );
+    let project = project.canonicalize()?;
+    let protocol_log = temp.path().join("conductor-protocol.jsonl");
+    let script = temp.path().join("fake-codex-conductor");
+    let thread_response = json!({
+        "id": 3,
+        "result": {
+            "thread": {"id": "conductor-thread", "sessionId": "conductor-session"},
+            "model": "synthetic-model",
+            "modelProvider": "synthetic-provider",
+            "cwd": project,
+            "approvalPolicy": "never",
+            "sandbox": {"type": "dangerFullAccess"}
+        }
+    });
+    std::fs::write(
+        &script,
+        format!(
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+read -r initialize
+printf '%s\n' "$initialize" >> '{}'
+printf '%s\n' '{{"id":1,"result":{{"userAgent":"synthetic"}}}}'
+read -r initialized
+printf '%s\n' "$initialized" >> '{}'
+read -r account
+printf '%s\n' "$account" >> '{}'
+printf '%s\n' '{{"id":2,"result":{{"requiresOpenaiAuth":true,"account":{{"type":"chatgpt","email":null,"planType":"pro"}}}}}}'
+read -r thread || exit 0
+printf '%s\n' "$thread" >> '{}'
+printf '%s\n' '{}'
+read -r turn
+printf '%s\n' "$turn" >> '{}'
+printf '%s\n' '{{"id":4,"result":{{"turn":{{"id":"conductor-turn","status":"inProgress","items":[]}}}}}}'
+printf '%s\n' '{{"method":"turn/started","params":{{"threadId":"conductor-thread","turn":{{"id":"conductor-turn","status":"inProgress","items":[]}}}}}}'
+printf '%s\n' '{{"method":"turn/completed","params":{{"threadId":"conductor-thread","turn":{{"id":"conductor-turn","status":"completed","items":[]}}}}}}'
+read -r _ || true
+"#,
+            protocol_log.display(),
+            protocol_log.display(),
+            protocol_log.display(),
+            protocol_log.display(),
+            thread_response,
+            protocol_log.display(),
+        ),
+    )?;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))?;
+
+    let request_id = "30000000-0000-4000-8000-000000000001";
+    let prompt = "continue Alpha Renderer CONDUCTOR_PRIVATE_SENTINEL";
+    let mut child = skein(&data, &config)
+        .env("SKEIN_CODEX_BIN", &script)
+        .args([
+            "conduct",
+            "--full-access",
+            "--request-id",
+            request_id,
+            "--jsonl",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .expect("conductor stdin")
+        .write_all(prompt.as_bytes())?;
+    let output = child.wait_with_output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(!stdout.contains("CONDUCTOR_PRIVATE_SENTINEL"));
+    let records = stdout
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(records[0]["type"], "route");
+    assert_eq!(records[0]["decision"]["action"], "start");
+    assert_eq!(records[0]["decision"]["confidence"], "high");
+    assert!(
+        records.iter().any(|record| {
+            record["type"] == "worker_run" && record["run"]["state"] == "completed"
+        })
+    );
+
+    let protocol = std::fs::read_to_string(&protocol_log)?;
+    let requests = protocol
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request["method"] == "account/read")
+            .count(),
+        2
+    );
+    let turn = requests
+        .iter()
+        .find(|request| request["method"] == "turn/start")
+        .expect("turn/start request");
+    assert_eq!(turn["params"]["input"][0]["text"], prompt);
+    assert_eq!(turn["params"]["sandboxPolicy"]["type"], "dangerFullAccess");
+    assert_eq!(turn["params"]["approvalPolicy"], "never");
+
+    let mut resumed = skein(&data, &config)
+        .env("SKEIN_CODEX_BIN", &script)
+        .args([
+            "conduct",
+            "--full-access",
+            "--request-id",
+            "30000000-0000-4000-8000-000000000002",
+            "--jsonl",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    resumed
+        .stdin
+        .take()
+        .expect("owned-thread resume stdin")
+        .write_all(b"conductor-thread")?;
+    let resumed = resumed.wait_with_output()?;
+    assert!(
+        resumed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    let resumed_records = String::from_utf8(resumed.stdout)?
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(resumed_records[0]["decision"]["action"], "resume");
+    assert_eq!(
+        resumed_records[0]["decision"]["sourceThreadId"],
+        "conductor-thread"
+    );
+    let updated_protocol = std::fs::read_to_string(&protocol_log)?;
+    assert!(updated_protocol.lines().any(|line| {
+        serde_json::from_str::<Value>(line)
+            .is_ok_and(|request| request["method"] == "thread/resume")
+    }));
+
+    let mut retry = skein(&data, &config)
+        .env("SKEIN_CODEX_BIN", temp.path().join("must-not-run"))
+        .args([
+            "conduct",
+            "--full-access",
+            "--request-id",
+            request_id,
+            "--json",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    retry
+        .stdin
+        .take()
+        .expect("retry stdin")
+        .write_all(b"DIFFERENT_PRIVATE_RETRY")?;
+    let retry = retry.wait_with_output()?;
+    assert!(retry.status.success());
+    let retry_text = String::from_utf8(retry.stdout)?;
+    assert!(!retry_text.contains("DIFFERENT_PRIVATE_RETRY"));
+    let retry: Value = serde_json::from_str(&retry_text)?;
+    assert_eq!(retry["reused"], true);
+    assert_eq!(retry["dispatched"], false);
+
+    let database = std::fs::read(data.join("skein.sqlite3"))?;
+    for sentinel in [prompt.as_bytes(), b"DIFFERENT_PRIVATE_RETRY".as_slice()] {
+        assert!(
+            !database
+                .windows(sentinel.len())
+                .any(|window| window == sentinel)
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn conductor_refuses_ambiguous_and_unacknowledged_routes_before_codex_or_control_state()
+-> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let data = temp.path().join("data");
+    let config = temp.path().join("config");
+    for name in ["one", "two"] {
+        let project = temp.path().join(name);
+        std::fs::create_dir(&project)?;
+        assert!(
+            skein(&data, &config)
+                .arg("project")
+                .arg("add")
+                .arg(&project)
+                .args(["--name", "Shared Project"])
+                .output()?
+                .status
+                .success()
+        );
+    }
+
+    let mut missing_ack = skein(&data, &config)
+        .env("SKEIN_CODEX_BIN", temp.path().join("must-not-run"))
+        .arg("conduct")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    missing_ack
+        .stdin
+        .take()
+        .expect("missing ack stdin")
+        .write_all(b"Shared Project")?;
+    let missing_ack = missing_ack.wait_with_output()?;
+    assert!(!missing_ack.status.success());
+    assert!(String::from_utf8_lossy(&missing_ack.stderr).contains("--full-access"));
+
+    let mut ambiguous = skein(&data, &config)
+        .env("SKEIN_CODEX_BIN", temp.path().join("must-not-run"))
+        .args(["conduct", "--full-access", "--json"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    ambiguous
+        .stdin
+        .take()
+        .expect("ambiguous stdin")
+        .write_all(b"Shared Project")?;
+    let ambiguous = ambiguous.wait_with_output()?;
+    assert!(!ambiguous.status.success());
+    let report: Value = serde_json::from_slice(&ambiguous.stdout)?;
+    assert_eq!(report["recommendation"]["confidence"], "low");
+    assert_eq!(report["recommendation"]["ambiguous"], true);
+
+    let paths = skein_core::SkeinPaths::new(config, data);
+    let registry = skein_core::Registry::open_read_only(&paths)?;
+    assert!(registry.list_control_runs()?.is_empty());
+    assert!(
+        registry
+            .conductor_decision_by_request_id("30000000-0000-4000-8000-000000000099")?
+            .is_none()
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn conductor_launch_failure_returns_durable_auto_request_status() -> Result<(), Box<dyn Error>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir()?;
+    let data = temp.path().join("data");
+    let config = temp.path().join("config");
+    let project = temp.path().join("project");
+    std::fs::create_dir(&project)?;
+    assert!(
+        skein(&data, &config)
+            .arg("project")
+            .arg("add")
+            .arg(&project)
+            .args(["--name", "Synthetic Project"])
+            .output()?
+            .status
+            .success()
+    );
+    let script = temp.path().join("fake-codex-auth-only");
+    std::fs::write(
+        &script,
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+read -r _
+printf '%s\n' '{"id":1,"result":{"userAgent":"synthetic"}}'
+read -r _
+read -r _
+printf '%s\n' '{"id":2,"result":{"requiresOpenaiAuth":true,"account":{"type":"chatgpt","email":null,"planType":"pro"}}}'
+read -r _ || true
+"#,
+    )?;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))?;
+
+    let mut child = skein(&data, &config)
+        .env("SKEIN_CODEX_BIN", &script)
+        .env("SKEIN_TEST_FAIL_WORKER_LAUNCH", "1")
+        .args(["conduct", "--full-access", "--json"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .expect("launch failure stdin")
+        .write_all(b"continue Synthetic Project launch-private")?;
+    let failed = child.wait_with_output()?;
+    assert!(!failed.status.success());
+    let status: Value = serde_json::from_slice(&failed.stdout)?;
+    let request_id = status["requestId"].as_str().expect("auto request id");
+    assert!(uuid::Uuid::parse_str(request_id).is_ok());
+    assert_eq!(status["type"], "worker_launch_failed");
+    assert_eq!(status["run"]["state"], "failed");
+    assert_eq!(status["worker"]["state"], "exited");
+    assert_eq!(status["promptReplayAllowed"], false);
+    assert!(!String::from_utf8_lossy(&failed.stdout).contains("launch-private"));
+
+    let mut retry = skein(&data, &config)
+        .env("SKEIN_CODEX_BIN", temp.path().join("must-not-run"))
+        .args([
+            "conduct",
+            "--full-access",
+            "--request-id",
+            request_id,
+            "--json",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    retry
+        .stdin
+        .take()
+        .expect("failure retry stdin")
+        .write_all(b"must not replay")?;
+    let retry = retry.wait_with_output()?;
+    assert!(retry.status.success());
+    let retry: Value = serde_json::from_slice(&retry.stdout)?;
+    assert_eq!(retry["reused"], true);
+    assert_eq!(retry["run"]["state"], "failed");
+    Ok(())
+}
+
+#[test]
+fn conductor_retry_recovers_an_expired_preallocated_worker_without_codex()
+-> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let data = temp.path().join("data");
+    let config = temp.path().join("config");
+    let project = temp.path().join("project");
+    std::fs::create_dir(&project)?;
+    let paths = skein_core::SkeinPaths::new(config.clone(), data.clone());
+    let mut registry = skein_core::Registry::open(&paths)?;
+    let project_id = registry.add_project(&project, Some("Expired Project"))?.id;
+    let request_id = "30000000-0000-4000-8000-000000000099";
+    let outcome = registry.plan_conductor_run(&skein_core::NewConductorRun {
+        request_id,
+        prompt: "continue Expired Project",
+        include_session_text: false,
+        full_access_acknowledged: true,
+        expected: skein_core::ExpectedConductorRoute {
+            project_id,
+            action: "start",
+            source_thread_id: None,
+        },
+    })?;
+    assert!(matches!(
+        outcome,
+        skein_core::ConductorPlanOutcome::Created { .. }
+    ));
+    drop(registry);
+
+    std::thread::sleep(std::time::Duration::from_secs(11));
+    let mut retry = skein(&data, &config)
+        .env("SKEIN_CODEX_BIN", temp.path().join("must-not-run"))
+        .args([
+            "conduct",
+            "--full-access",
+            "--request-id",
+            request_id,
+            "--json",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    retry
+        .stdin
+        .take()
+        .expect("expired retry stdin")
+        .write_all(b"status only")?;
+    let retry = retry.wait_with_output()?;
+    assert!(
+        retry.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retry.stderr)
+    );
+    let status: Value = serde_json::from_slice(&retry.stdout)?;
+    assert_eq!(status["reused"], true);
+    assert_eq!(status["dispatched"], false);
+    assert_eq!(status["run"]["state"], "failed");
+    assert_eq!(status["worker"]["state"], "lost");
+    assert_eq!(status["worker"]["exit_kind"], "lease_lost");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
 fn reads_and_reconciles_exact_lost_worker_turn_without_source_content() -> Result<(), Box<dyn Error>>
 {
     use std::os::unix::fs::PermissionsExt;

@@ -184,6 +184,32 @@ pub fn launch_worker(
     prompt: String,
 ) -> Result<WorkerSnapshot, Box<dyn std::error::Error>> {
     let claim = registry.create_control_worker(run_id)?;
+    launch_worker_with_claim(paths, registry, claim, prompt)
+}
+
+pub fn launch_preallocated_worker(
+    paths: &SkeinPaths,
+    registry: &mut Registry,
+    claim: WorkerClaim,
+    prompt: String,
+) -> Result<WorkerSnapshot, Box<dyn std::error::Error>> {
+    launch_worker_with_claim(paths, registry, claim, prompt)
+}
+
+fn launch_worker_with_claim(
+    paths: &SkeinPaths,
+    registry: &mut Registry,
+    claim: WorkerClaim,
+    prompt: String,
+) -> Result<WorkerSnapshot, Box<dyn std::error::Error>> {
+    let run_id = claim.run_id();
+    if cfg!(debug_assertions)
+        && std::env::var_os("SKEIN_TEST_FAIL_WORKER_LAUNCH").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+    {
+        registry.fail_worker_without_submission(&claim)?;
+        return Err("injected worker launch failure".into());
+    }
     let executable = std::env::current_exe()?;
     let mut worker = Command::new(executable);
     worker
@@ -545,6 +571,16 @@ pub fn serve(paths: SkeinPaths, run_id: i64) -> Result<(), Box<dyn std::error::E
     let submission_deadline = Instant::now() + SUBMISSION_TIMEOUT;
     loop {
         if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
+            let durable_worker = registry
+                .control_worker(run_id)?
+                .ok_or("worker row disappeared")?;
+            if matches!(
+                durable_worker.state,
+                WorkerState::Exited | WorkerState::Lost
+            ) {
+                remove_capability(&paths, run_id);
+                return Ok(());
+            }
             let state = if shared.submitted.load(Ordering::SeqCst) {
                 let run = registry
                     .control_run(run_id)?
@@ -806,7 +842,9 @@ fn run_codex_job(paths: SkeinPaths, claim: WorkerClaim, prompt: String, shared: 
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clear();
-        if let Ok(mut registry) = Registry::open(&paths) {
+        if let Ok(mut registry) = Registry::open(&paths)
+            && registry.fail_worker_without_submission(&claim).is_err()
+        {
             let _ = registry.mark_owned_control_uncertain(claim.run_id(), &claim);
         }
     }
@@ -979,7 +1017,7 @@ fn configure_detached_worker(command: &mut Command) {
 #[cfg(not(any(unix, windows)))]
 fn configure_detached_worker(_command: &mut Command) {}
 
-fn recover_expired(
+pub(crate) fn recover_expired(
     registry: &mut Registry,
     paths: &SkeinPaths,
 ) -> Result<(), Box<dyn std::error::Error>> {

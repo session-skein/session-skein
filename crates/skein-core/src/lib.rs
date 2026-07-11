@@ -1,5 +1,6 @@
 //! Fast, local-first state primitives for Session Skein.
 
+mod conductor;
 mod control;
 mod git;
 mod insight;
@@ -8,6 +9,11 @@ mod registry;
 mod session;
 mod worker;
 
+pub use conductor::ConductorDecision;
+pub use conductor::ConductorEvidence;
+pub use conductor::ConductorPlanOutcome;
+pub use conductor::ExpectedConductorRoute;
+pub use conductor::NewConductorRun;
 pub use control::ControlAction;
 pub use control::ControlActionKind;
 pub use control::ControlActionState;

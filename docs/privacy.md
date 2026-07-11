@@ -57,3 +57,11 @@ still emits only field names, counts, points, and opaque identities—not the ma
 source values. Project cards and day summaries are generated on read and are not
 cached. Project cards may display the already stored Git commit subject; neither view
 reads session transcripts, agent output, commands, diffs, or MCP content.
+
+The conductor uses the same bounded stdin bytes first as an in-memory route query and
+then unchanged as the Codex prompt. Accepted routes persist only request/run IDs,
+selected project and optional opaque thread identity, confidence/score/margin, query
+byte/token counts, explicit text-consent state, and structured evidence
+families/kinds/counts/points. They persist no query, tokens, matched values, candidate
+list, prompt hash, or prose. Reusing a request UUID is a status lookup and never
+replays prompt content.

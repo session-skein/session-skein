@@ -19,6 +19,7 @@ use skein_core::Registry;
 use skein_core::SessionImportReport;
 use skein_core::SessionObservation;
 use skein_core::SkeinPaths;
+use uuid::Uuid;
 
 const MAX_CONTROL_PROMPT_BYTES: usize = 1024 * 1024;
 const MAX_MATCH_QUERY_BYTES: usize = 64 * 1024;
@@ -61,6 +62,8 @@ enum Command {
         #[command(subcommand)]
         command: WorkerCommand,
     },
+    /// Route one private prompt and dispatch only a unique high-confidence Codex worker.
+    Conduct(ConductArgs),
     /// Rank registered projects and linked sessions without dispatching work.
     Match {
         /// Allow explicitly imported session names/previews to influence local scoring.
@@ -78,6 +81,28 @@ enum Command {
         #[command(subcommand)]
         command: SummaryCommand,
     },
+}
+
+#[derive(Debug, Args)]
+struct ConductArgs {
+    /// Explicitly authorize danger-full-access with approval policy never.
+    #[arg(long)]
+    full_access: bool,
+    /// Permit previously opted-in session names/previews to influence local routing.
+    #[arg(long)]
+    include_session_text: bool,
+    /// Stable UUID; reuse is a status lookup and never resubmits prompt content.
+    #[arg(long)]
+    request_id: Option<String>,
+    /// Remain attached to redacted worker events until terminal completion.
+    #[arg(long, conflicts_with = "json")]
+    follow: bool,
+    /// Emit one machine-readable launch object.
+    #[arg(long, conflicts_with = "jsonl")]
+    json: bool,
+    /// Emit route, worker, redacted events, and terminal state as JSONL; implies follow.
+    #[arg(long, conflicts_with = "json")]
+    jsonl: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -642,6 +667,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             WorkerCommand::Serve { run_id } => worker_runtime::serve(paths, run_id)?,
             WorkerCommand::CodexGuard => worker_runtime::codex_guard()?,
         },
+        Command::Conduct(args) => conduct(&paths, args)?,
         Command::Match {
             include_text,
             limit,
@@ -721,6 +747,315 @@ fn worker_start(
         args.json,
         args.jsonl,
     )
+}
+
+fn conduct(paths: &SkeinPaths, args: ConductArgs) -> Result<(), Box<dyn std::error::Error>> {
+    if !args.full_access {
+        return Err(skein_core::Error::InvalidControlRequest(
+            "pass --full-access to acknowledge danger-full-access with approvals disabled"
+                .to_owned(),
+        )
+        .into());
+    }
+    let prompt = read_match_query()?;
+    let request_id = args
+        .request_id
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    if Uuid::parse_str(&request_id).is_err() {
+        return Err(skein_core::Error::InvalidControlRequest(
+            "conductor request id must be a UUID".to_owned(),
+        )
+        .into());
+    }
+
+    let read_only = Registry::open_read_only(paths)?;
+    if read_only.schema_version()? >= 7
+        && let Some(_decision) = read_only.conductor_decision_by_request_id(&request_id)?
+    {
+        drop(read_only);
+        let mut registry = Registry::open(paths)?;
+        worker_runtime::recover_expired(&mut registry, paths)?;
+        let decision = registry
+            .conductor_decision_by_request_id(&request_id)?
+            .ok_or("conductor decision disappeared during recovery")?;
+        let run = registry
+            .control_run(decision.run_id)?
+            .ok_or("conductor run disappeared")?;
+        let worker = registry.control_worker(decision.run_id)?;
+        print_conductor_status(
+            &decision,
+            &run,
+            worker.as_ref(),
+            true,
+            args.json,
+            args.jsonl,
+        )?;
+        if args.follow || args.jsonl {
+            let terminal = worker_runtime::watch(paths, decision.run_id, args.jsonl)?;
+            print_conductor_terminal(&terminal, args.jsonl);
+        }
+        return Ok(());
+    }
+
+    let preflight = read_only.match_conductor_metadata(&skein_core::MatchOptions {
+        query: &prompt,
+        include_text: args.include_session_text,
+        limit: 5,
+        now: unix_timestamp(),
+    })?;
+    let Some(recommendation) = preflight.recommendation.as_ref() else {
+        print_route_refusal(&preflight, args.json, args.jsonl)?;
+        return Err(
+            skein_core::Error::InvalidControlRequest("route_refused:no_match".to_owned()).into(),
+        );
+    };
+    if recommendation.confidence != skein_core::MatchConfidence::High
+        || recommendation.ambiguous
+        || !recommendation.dispatchable
+    {
+        print_route_refusal(&preflight, args.json, args.jsonl)?;
+        return Err(skein_core::Error::InvalidControlRequest(
+            "route_refused:unique_high_confidence_required".to_owned(),
+        )
+        .into());
+    }
+    if let Some(session) = preflight
+        .candidates
+        .first()
+        .and_then(|candidate| candidate.suggested_session.as_ref())
+        && session
+            .evidence
+            .iter()
+            .any(|evidence| evidence.kind == "exact_thread")
+        && matches!(
+            session.resume_blocker.as_deref(),
+            Some("active_run" | "recovery_required")
+        )
+    {
+        print_route_refusal(&preflight, args.json, args.jsonl)?;
+        return Err(skein_core::Error::ControlStateConflict(format!(
+            "thread_{}",
+            session.resume_blocker.as_deref().unwrap_or("unavailable")
+        ))
+        .into());
+    }
+    let expected_project_id = recommendation.project_id;
+    let expected_action = recommendation.action.clone();
+    let expected_thread_id = recommendation.source_thread_id.clone();
+    drop(read_only);
+
+    // Content-free ChatGPT authentication preflight. The detached worker checks again.
+    drop(ControlClient::connect()?);
+    let mut registry = Registry::open(paths)?;
+    let outcome = registry.plan_conductor_run(&skein_core::NewConductorRun {
+        request_id: &request_id,
+        prompt: &prompt,
+        include_session_text: args.include_session_text,
+        full_access_acknowledged: true,
+        expected: skein_core::ExpectedConductorRoute {
+            project_id: expected_project_id,
+            action: &expected_action,
+            source_thread_id: expected_thread_id.as_deref(),
+        },
+    })?;
+    match outcome {
+        skein_core::ConductorPlanOutcome::Created {
+            decision,
+            control,
+            worker,
+        } => {
+            let snapshot = match worker_runtime::launch_preallocated_worker(
+                paths,
+                &mut registry,
+                worker,
+                prompt,
+            ) {
+                Ok(snapshot) => snapshot,
+                Err(_) => {
+                    let run = registry
+                        .control_run(decision.run_id)?
+                        .ok_or("conductor run disappeared after launch failure")?;
+                    let worker = registry.control_worker(decision.run_id)?;
+                    print_conductor_launch_failure(
+                        &decision,
+                        &run,
+                        worker.as_ref(),
+                        args.json,
+                        args.jsonl,
+                    )?;
+                    return Err(skein_core::Error::ControlStateConflict(
+                        "worker_launch_failed_after_commit: inspect the durable run before a new attempt"
+                            .to_owned(),
+                    )
+                    .into());
+                }
+            };
+            if args.jsonl {
+                println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "type": "route",
+                        "decision": decision,
+                        "reused": false
+                    }))?
+                );
+                println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "type": "worker_snapshot",
+                        "snapshot": snapshot
+                    }))?
+                );
+            } else if args.json {
+                print_value(
+                    &serde_json::json!({
+                        "requestId": request_id,
+                        "reused": false,
+                        "dispatched": true,
+                        "decision": decision,
+                        "snapshot": snapshot
+                    }),
+                    true,
+                )?;
+            } else {
+                println!(
+                    "routed {} to project {} with high confidence (score {}, margin {})",
+                    decision.action, decision.project_id, decision.score, decision.runner_up_margin
+                );
+                println!(
+                    "started reconnectable run {} (request {})",
+                    control.run_id, request_id
+                );
+            }
+            if args.follow || args.jsonl {
+                let terminal = worker_runtime::watch(paths, control.run_id, args.jsonl)?;
+                print_conductor_terminal(&terminal, args.jsonl);
+            }
+        }
+        skein_core::ConductorPlanOutcome::Existing { decision, .. } => {
+            let run = registry
+                .control_run(decision.run_id)?
+                .ok_or("conductor run disappeared")?;
+            let worker = registry.control_worker(decision.run_id)?;
+            print_conductor_status(
+                &decision,
+                &run,
+                worker.as_ref(),
+                true,
+                args.json,
+                args.jsonl,
+            )?;
+            if args.follow || args.jsonl {
+                let terminal = worker_runtime::watch(paths, decision.run_id, args.jsonl)?;
+                print_conductor_terminal(&terminal, args.jsonl);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn print_route_refusal(
+    report: &skein_core::MatchReport,
+    json: bool,
+    jsonl: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if jsonl {
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "type": "route_refused",
+                "report": report
+            }))?
+        );
+        Ok(())
+    } else {
+        print_match_report(report, json)
+    }
+}
+
+fn print_conductor_status(
+    decision: &skein_core::ConductorDecision,
+    run: &skein_core::ControlRun,
+    worker: Option<&skein_core::ControlWorker>,
+    reused: bool,
+    json: bool,
+    jsonl: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if jsonl {
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "type": "route_status",
+                "decision": decision,
+                "run": run,
+                "worker": worker,
+                "reused": reused,
+                "dispatched": false
+            }))?
+        );
+    } else if json {
+        print_value(
+            &serde_json::json!({
+                "requestId": decision.request_id,
+                "decision": decision,
+                "run": run,
+                "worker": worker,
+                "reused": reused,
+                "dispatched": false
+            }),
+            true,
+        )?;
+    } else {
+        println!(
+            "request {} already maps to run {}; prompt was not resubmitted",
+            decision.request_id, decision.run_id
+        );
+        println!("run state: {:?}", run.state);
+    }
+    Ok(())
+}
+
+fn print_conductor_launch_failure(
+    decision: &skein_core::ConductorDecision,
+    run: &skein_core::ControlRun,
+    worker: Option<&skein_core::ControlWorker>,
+    json: bool,
+    jsonl: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let value = serde_json::json!({
+        "type": "worker_launch_failed",
+        "requestId": decision.request_id,
+        "decision": decision,
+        "run": run,
+        "worker": worker,
+        "errorClass": "worker_launch_failed_after_commit",
+        "promptReplayAllowed": false
+    });
+    if jsonl {
+        println!("{}", serde_json::to_string(&value)?);
+    } else if json {
+        print_value(&value, true)?;
+    } else {
+        println!(
+            "request {} committed as run {}, but worker launch failed",
+            decision.request_id, decision.run_id
+        );
+        println!("prompt replay is disabled; inspect the durable run before retrying");
+    }
+    Ok(())
+}
+
+fn print_conductor_terminal(run: &skein_core::ControlRun, jsonl: bool) {
+    if jsonl {
+        if let Ok(value) = serde_json::to_string(&serde_json::json!({
+            "type": "worker_run",
+            "run": run
+        })) {
+            println!("{value}");
+        }
+    } else {
+        println!("\nrun {}: {:?}", run.id, run.state);
+    }
 }
 
 fn worker_resume(

@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::Path;
 
+use rusqlite::Connection;
 use serde::Serialize;
 
 use crate::ControlRun;
@@ -13,7 +14,11 @@ use crate::Project;
 use crate::ProjectLinkKind;
 use crate::Registry;
 use crate::Result;
+use crate::control::list_control_runs_on;
+use crate::registry::list_projects_on;
 use crate::session::SessionMetadata;
+use crate::session::list_session_match_text_on;
+use crate::session::list_session_metadata_on;
 
 /// Options for one ephemeral metadata match.
 pub struct MatchOptions<'a> {
@@ -47,6 +52,7 @@ pub struct SessionMatch {
     pub project_link_kind: ProjectLinkKind,
     pub source_updated_at: i64,
     pub resumable: bool,
+    pub resume_blocker: Option<String>,
     pub score: i32,
     pub evidence: Vec<MatchEvidence>,
 }
@@ -103,6 +109,7 @@ pub struct MatchReport {
     pub query_token_count: usize,
     pub as_of: i64,
     pub recommendation: Option<MatchRecommendation>,
+    pub candidate_count: usize,
     pub candidates: Vec<ProjectMatch>,
     pub content_persisted: bool,
 }
@@ -182,72 +189,12 @@ pub struct DaySummary {
 impl Registry {
     /// Rank registered projects and their strongest linked session without writing state.
     pub fn match_metadata(&self, options: &MatchOptions<'_>) -> Result<MatchReport> {
-        let query_tokens = tokens(options.query);
-        let query_lower = options.query.to_lowercase();
-        let terms = MatchTerms {
-            lower: &query_lower,
-            tokens: &query_tokens,
-        };
-        let projects = self.list_projects()?;
-        let exact_path_project_ids = longest_exact_path_matches(&projects, &query_lower);
-        let sessions = self.list_session_metadata()?;
-        let runs = self.list_control_runs()?;
-        let sessions_by_project = group_sessions(&sessions);
-        let runs_by_project = group_runs(&runs);
-        let text = if options.include_text {
-            self.list_session_match_text()?
-                .into_iter()
-                .map(|item| (item.id, (item.name, item.preview)))
-                .collect::<HashMap<_, _>>()
-        } else {
-            HashMap::new()
-        };
-        let mut candidates = projects
-            .into_iter()
-            .filter_map(|project| {
-                let project_id = project.id;
-                build_candidate(
-                    project,
-                    sessions_by_project
-                        .get(&project_id)
-                        .map(Vec::as_slice)
-                        .unwrap_or(&[]),
-                    runs_by_project
-                        .get(&project_id)
-                        .map(Vec::as_slice)
-                        .unwrap_or(&[]),
-                    &text,
-                    &terms,
-                    exact_path_project_ids.contains(&project_id),
-                    options,
-                )
-            })
-            .collect::<Vec<_>>();
-        candidates.sort_by(|left, right| {
-            right
-                .score
-                .cmp(&left.score)
-                .then_with(|| right.latest_matched_at.cmp(&left.latest_matched_at))
-                .then_with(|| {
-                    left.project
-                        .name
-                        .to_lowercase()
-                        .cmp(&right.project.name.to_lowercase())
-                })
-                .then_with(|| left.project.path.cmp(&right.project.path))
-                .then_with(|| left.project.id.cmp(&right.project.id))
-        });
-        let recommendation = recommendation(&candidates);
-        candidates.truncate(options.limit);
-        Ok(MatchReport {
-            schema_version: 1,
-            query_bytes: options.query.len(),
-            query_token_count: query_tokens.len(),
-            as_of: options.now,
-            recommendation,
-            candidates,
-            content_persisted: false,
-        })
+        match_metadata_on(&self.connection, options, false)
+    }
+
+    /// Evaluate matching under the conductor's explicit dispatch policy context.
+    pub fn match_conductor_metadata(&self, options: &MatchOptions<'_>) -> Result<MatchReport> {
+        match_metadata_on(&self.connection, options, true)
     }
 
     /// Render all project cards from already observed metadata only.
@@ -302,145 +249,233 @@ impl Registry {
         let projects = self.list_projects()?;
         let sessions = self.list_session_metadata()?;
         let runs = self.list_control_runs()?;
-        let sessions_by_project = group_sessions(&sessions);
-        let runs_by_project = group_runs(&runs);
-        let mut activities = Vec::new();
-        for project in projects {
-            let project_sessions = sessions_by_project
-                .get(&project.id)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]);
-            let project_runs = runs_by_project
-                .get(&project.id)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]);
-            let session_observations = project_sessions
+        day_summary_from_rows(date, timezone, start_at, end_at, projects, sessions, runs)
+    }
+}
+
+pub(crate) fn match_metadata_on(
+    connection: &Connection,
+    options: &MatchOptions<'_>,
+    dispatch_context: bool,
+) -> Result<MatchReport> {
+    let query_tokens = tokens(options.query);
+    let query_lower = options.query.to_lowercase();
+    let terms = MatchTerms {
+        lower: &query_lower,
+        tokens: &query_tokens,
+    };
+    let projects = list_projects_on(connection)?;
+    let exact_path_project_ids = longest_exact_path_matches(&projects, &query_lower);
+    let sessions = list_session_metadata_on(connection)?;
+    let runs = list_control_runs_on(connection)?;
+    let sessions_by_project = group_sessions(&sessions);
+    let runs_by_project = group_runs(&runs);
+    let text = if options.include_text {
+        list_session_match_text_on(connection)?
+            .into_iter()
+            .map(|item| (item.id, (item.name, item.preview)))
+            .collect::<HashMap<_, _>>()
+    } else {
+        HashMap::new()
+    };
+    let mut candidates = projects
+        .into_iter()
+        .filter_map(|project| {
+            let project_id = project.id;
+            build_candidate(
+                project,
+                sessions_by_project
+                    .get(&project_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
+                runs_by_project
+                    .get(&project_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
+                &text,
+                &terms,
+                exact_path_project_ids.contains(&project_id),
+                options,
+            )
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| right.latest_matched_at.cmp(&left.latest_matched_at))
+            .then_with(|| {
+                left.project
+                    .name
+                    .to_lowercase()
+                    .cmp(&right.project.name.to_lowercase())
+            })
+            .then_with(|| left.project.path.cmp(&right.project.path))
+            .then_with(|| left.project.id.cmp(&right.project.id))
+    });
+    let recommendation = recommendation(&candidates, dispatch_context);
+    let candidate_count = candidates.len();
+    candidates.truncate(options.limit);
+    Ok(MatchReport {
+        schema_version: 1,
+        query_bytes: options.query.len(),
+        query_token_count: query_tokens.len(),
+        as_of: options.now,
+        recommendation,
+        candidate_count,
+        candidates,
+        content_persisted: false,
+    })
+}
+
+fn day_summary_from_rows(
+    date: &str,
+    timezone: &str,
+    start_at: i64,
+    end_at: i64,
+    projects: Vec<Project>,
+    sessions: Vec<SessionMetadata>,
+    runs: Vec<ControlRun>,
+) -> Result<DaySummary> {
+    let sessions_by_project = group_sessions(&sessions);
+    let runs_by_project = group_runs(&runs);
+    let mut activities = Vec::new();
+    for project in projects {
+        let project_sessions = sessions_by_project
+            .get(&project.id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let project_runs = runs_by_project
+            .get(&project.id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let session_observations = project_sessions
+            .iter()
+            .filter(|session| in_window(session.last_seen_at, start_at, end_at))
+            .count();
+        let source_threads_updated = project_sessions
+            .iter()
+            .filter(|session| in_window(session.source_updated_at, start_at, end_at))
+            .count();
+        let runs_created = project_runs
+            .iter()
+            .filter(|run| in_window(run.created_at, start_at, end_at))
+            .count();
+        let terminal = |state| {
+            project_runs
                 .iter()
-                .filter(|session| in_window(session.last_seen_at, start_at, end_at))
-                .count();
-            let source_threads_updated = project_sessions
-                .iter()
-                .filter(|session| in_window(session.source_updated_at, start_at, end_at))
-                .count();
-            let runs_created = project_runs
-                .iter()
-                .filter(|run| in_window(run.created_at, start_at, end_at))
-                .count();
-            let terminal = |state| {
+                .filter(|run| run.state == state)
+                .filter(|run| {
+                    run.terminal_at
+                        .is_some_and(|at| in_window(at, start_at, end_at))
+                })
+                .count()
+        };
+        let recovery_runs = project_runs
+            .iter()
+            .filter(|run| run.state == ControlRunState::RecoveryRequired)
+            .filter(|run| in_window(run.updated_at, start_at, end_at))
+            .count();
+        let git_snapshot_observed = project
+            .metadata_refreshed_at
+            .is_some_and(|at| in_window(at, start_at, end_at));
+        let latest_git_commit_in_window = project
+            .git
+            .as_ref()
+            .and_then(|git| git.last_commit_at)
+            .is_some_and(|at| in_window(at, start_at, end_at));
+        let latest_record_at = project_sessions
+            .iter()
+            .map(|session| session.last_seen_at)
+            .filter(|at| in_window(*at, start_at, end_at))
+            .chain(
+                project_sessions
+                    .iter()
+                    .map(|session| session.source_updated_at)
+                    .filter(|at| in_window(*at, start_at, end_at)),
+            )
+            .chain(
                 project_runs
                     .iter()
-                    .filter(|run| run.state == state)
-                    .filter(|run| {
-                        run.terminal_at
-                            .is_some_and(|at| in_window(at, start_at, end_at))
-                    })
-                    .count()
-            };
-            let recovery_runs = project_runs
-                .iter()
-                .filter(|run| run.state == ControlRunState::RecoveryRequired)
-                .filter(|run| in_window(run.updated_at, start_at, end_at))
-                .count();
-            let git_snapshot_observed = project
-                .metadata_refreshed_at
-                .is_some_and(|at| in_window(at, start_at, end_at));
-            let latest_git_commit_in_window = project
-                .git
-                .as_ref()
-                .and_then(|git| git.last_commit_at)
-                .is_some_and(|at| in_window(at, start_at, end_at));
-            let latest_record_at = project_sessions
-                .iter()
-                .map(|session| session.last_seen_at)
-                .filter(|at| in_window(*at, start_at, end_at))
-                .chain(
-                    project_sessions
-                        .iter()
-                        .map(|session| session.source_updated_at)
-                        .filter(|at| in_window(*at, start_at, end_at)),
-                )
-                .chain(
-                    project_runs
-                        .iter()
-                        .map(|run| run.created_at)
-                        .filter(|at| in_window(*at, start_at, end_at)),
-                )
-                .chain(
-                    project_runs
-                        .iter()
-                        .filter_map(|run| run.terminal_at)
-                        .filter(|at| in_window(*at, start_at, end_at)),
-                )
-                .chain(
-                    project_runs
-                        .iter()
-                        .filter(|run| run.state == ControlRunState::RecoveryRequired)
-                        .map(|run| run.updated_at)
-                        .filter(|at| in_window(*at, start_at, end_at)),
-                )
-                .chain(
-                    project
-                        .metadata_refreshed_at
-                        .filter(|at| in_window(*at, start_at, end_at)),
-                )
-                .chain(
-                    project
-                        .git
-                        .as_ref()
-                        .and_then(|git| git.last_commit_at)
-                        .filter(|at| in_window(*at, start_at, end_at)),
-                )
-                .max();
-            let Some(latest_record_at) = latest_record_at else {
-                continue;
-            };
-            activities.push(DayProjectActivity {
-                project_id: project.id,
-                project_name: project.name,
-                session_observations,
-                source_threads_updated,
-                runs_created,
-                runs_completed: terminal(ControlRunState::Completed),
-                runs_failed: terminal(ControlRunState::Failed),
-                runs_interrupted: terminal(ControlRunState::Interrupted),
-                recovery_runs,
-                latest_record_at,
-                git_snapshot_observed,
-                latest_git_commit_in_window,
-            });
-        }
-        activities.sort_by(|left, right| {
-            right
-                .latest_record_at
-                .cmp(&left.latest_record_at)
-                .then_with(|| {
-                    left.project_name
-                        .to_lowercase()
-                        .cmp(&right.project_name.to_lowercase())
-                })
-                .then_with(|| left.project_id.cmp(&right.project_id))
-        });
-        let sessions = activities
-            .iter()
-            .map(|item| item.session_observations)
-            .sum::<usize>();
-        let completed = activities
-            .iter()
-            .map(|item| item.runs_completed)
-            .sum::<usize>();
-        let recovery = activities
-            .iter()
-            .map(|item| item.recovery_runs)
-            .sum::<usize>();
-        let narrative = if activities.is_empty() {
-            format!("For {date}, current metadata has no bounded project activity record.")
-        } else {
-            format!(
-                "For {date}, current metadata has dated records in {} registered project(s): {sessions} session metadata observation(s), {completed} completed controlled run(s), and {recovery} currently recovery-required run(s).",
-                activities.len()
+                    .map(|run| run.created_at)
+                    .filter(|at| in_window(*at, start_at, end_at)),
             )
+            .chain(
+                project_runs
+                    .iter()
+                    .filter_map(|run| run.terminal_at)
+                    .filter(|at| in_window(*at, start_at, end_at)),
+            )
+            .chain(
+                project_runs
+                    .iter()
+                    .filter(|run| run.state == ControlRunState::RecoveryRequired)
+                    .map(|run| run.updated_at)
+                    .filter(|at| in_window(*at, start_at, end_at)),
+            )
+            .chain(
+                project
+                    .metadata_refreshed_at
+                    .filter(|at| in_window(*at, start_at, end_at)),
+            )
+            .chain(
+                project
+                    .git
+                    .as_ref()
+                    .and_then(|git| git.last_commit_at)
+                    .filter(|at| in_window(*at, start_at, end_at)),
+            )
+            .max();
+        let Some(latest_record_at) = latest_record_at else {
+            continue;
         };
-        Ok(DaySummary {
+        activities.push(DayProjectActivity {
+            project_id: project.id,
+            project_name: project.name,
+            session_observations,
+            source_threads_updated,
+            runs_created,
+            runs_completed: terminal(ControlRunState::Completed),
+            runs_failed: terminal(ControlRunState::Failed),
+            runs_interrupted: terminal(ControlRunState::Interrupted),
+            recovery_runs,
+            latest_record_at,
+            git_snapshot_observed,
+            latest_git_commit_in_window,
+        });
+    }
+    activities.sort_by(|left, right| {
+        right
+            .latest_record_at
+            .cmp(&left.latest_record_at)
+            .then_with(|| {
+                left.project_name
+                    .to_lowercase()
+                    .cmp(&right.project_name.to_lowercase())
+            })
+            .then_with(|| left.project_id.cmp(&right.project_id))
+    });
+    let sessions = activities
+        .iter()
+        .map(|item| item.session_observations)
+        .sum::<usize>();
+    let completed = activities
+        .iter()
+        .map(|item| item.runs_completed)
+        .sum::<usize>();
+    let recovery = activities
+        .iter()
+        .map(|item| item.recovery_runs)
+        .sum::<usize>();
+    let narrative = if activities.is_empty() {
+        format!("For {date}, current metadata has no bounded project activity record.")
+    } else {
+        format!(
+            "For {date}, current metadata has dated records in {} registered project(s): {sessions} session metadata observation(s), {completed} completed controlled run(s), and {recovery} currently recovery-required run(s).",
+            activities.len()
+        )
+    };
+    Ok(DaySummary {
             date: date.to_owned(),
             timezone: timezone.to_owned(),
             start_at,
@@ -457,7 +492,6 @@ impl Registry {
             },
             persisted: false,
         })
-    }
 }
 
 fn group_sessions(sessions: &[SessionMetadata]) -> HashMap<i64, Vec<&SessionMetadata>> {
@@ -553,6 +587,7 @@ fn build_candidate(
         .filter_map(|session| {
             build_session_match(
                 session,
+                runs,
                 text.get(&session.id),
                 terms.lower,
                 terms.tokens,
@@ -561,6 +596,13 @@ fn build_candidate(
             )
         })
         .collect::<Vec<_>>();
+    let cataloged_threads = sessions
+        .iter()
+        .map(|session| session.source_thread_id.as_str())
+        .collect::<HashSet<_>>();
+    session_matches.extend(runs.iter().filter_map(|run| {
+        build_owned_thread_match(run, &cataloged_threads, terms.lower, options.now)
+    }));
     session_matches.sort_by(|left, right| {
         right
             .score
@@ -610,6 +652,42 @@ fn build_candidate(
     })
 }
 
+fn build_owned_thread_match(
+    run: &ControlRun,
+    cataloged_threads: &HashSet<&str>,
+    query_lower: &str,
+    now: i64,
+) -> Option<SessionMatch> {
+    let thread_id = run.source_thread_id.as_deref()?;
+    if cataloged_threads.contains(thread_id) || !query_lower.contains(&thread_id.to_lowercase()) {
+        return None;
+    }
+    let mut evidence = Vec::new();
+    push_evidence(&mut evidence, "session_identity", "exact_thread", 100, 1);
+    let freshness = recency_points(now, run.updated_at);
+    if freshness > 0 {
+        push_evidence(&mut evidence, "session_recency", "updated", freshness, 1);
+    }
+    let resume_blocker = match run.state {
+        ControlRunState::Completed | ControlRunState::Failed | ControlRunState::Interrupted => None,
+        ControlRunState::RecoveryRequired => Some("recovery_required".to_owned()),
+        ControlRunState::Planned | ControlRunState::Starting | ControlRunState::Active => {
+            Some("active_run".to_owned())
+        }
+    };
+    let score = evidence.iter().map(|item| item.points).sum();
+    Some(SessionMatch {
+        source_kind: "codex".to_owned(),
+        source_thread_id: thread_id.to_owned(),
+        project_link_kind: ProjectLinkKind::Automatic,
+        source_updated_at: run.updated_at,
+        resumable: resume_blocker.is_none(),
+        resume_blocker,
+        score,
+        evidence,
+    })
+}
+
 fn longest_exact_path_matches(projects: &[Project], query_lower: &str) -> HashSet<i64> {
     let mut matches = projects
         .iter()
@@ -640,6 +718,7 @@ fn is_path_character(character: char) -> bool {
 
 fn build_session_match(
     session: &SessionMetadata,
+    runs: &[&ControlRun],
     text: Option<&(Option<String>, Option<String>)>,
     query_lower: &str,
     query_tokens: &BTreeSet<String>,
@@ -648,10 +727,8 @@ fn build_session_match(
 ) -> Option<SessionMatch> {
     let mut evidence = Vec::new();
     let exact_thread = query_lower.contains(&session.source_thread_id.to_lowercase());
-    let generic_eligible = !session.ephemeral
-        && session.observed_status_label != "systemError"
-        && !session.source_label.starts_with("subAgent")
-        && session.project_link_kind != ProjectLinkKind::ManualUnbound;
+    let resume_blocker = session_resume_blocker(session, runs);
+    let generic_eligible = resume_blocker.is_none();
     if !exact_thread && !generic_eligible {
         return None;
     }
@@ -728,13 +805,52 @@ fn build_session_match(
         source_thread_id: session.source_thread_id.clone(),
         project_link_kind: session.project_link_kind,
         source_updated_at: session.source_updated_at,
-        resumable: !session.ephemeral,
+        resumable: resume_blocker.is_none(),
+        resume_blocker,
         score,
         evidence,
     })
 }
 
-fn recommendation(candidates: &[ProjectMatch]) -> Option<MatchRecommendation> {
+fn session_resume_blocker(session: &SessionMetadata, runs: &[&ControlRun]) -> Option<String> {
+    if session.ephemeral {
+        return Some("ephemeral".to_owned());
+    }
+    if session.observed_status_label == "systemError" {
+        return Some("system_error".to_owned());
+    }
+    if session.source_label.starts_with("subAgent") {
+        return Some("subagent".to_owned());
+    }
+    if matches!(
+        session.project_link_kind,
+        ProjectLinkKind::ManualUnbound | ProjectLinkKind::Unmatched
+    ) {
+        return Some("unbound".to_owned());
+    }
+    let owning_run = runs.iter().find(|run| {
+        run.source_thread_id.as_deref() == Some(&session.source_thread_id)
+            && matches!(
+                run.state,
+                ControlRunState::Planned
+                    | ControlRunState::Starting
+                    | ControlRunState::Active
+                    | ControlRunState::RecoveryRequired
+            )
+    });
+    owning_run.map(|run| {
+        if run.state == ControlRunState::RecoveryRequired {
+            "recovery_required".to_owned()
+        } else {
+            "active_run".to_owned()
+        }
+    })
+}
+
+fn recommendation(
+    candidates: &[ProjectMatch],
+    dispatch_context: bool,
+) -> Option<MatchRecommendation> {
     let top = candidates.first()?;
     let margin = top.score - candidates.get(1).map_or(0, |candidate| candidate.score);
     let families = top
@@ -775,6 +891,7 @@ fn recommendation(candidates: &[ProjectMatch]) -> Option<MatchRecommendation> {
         .suggested_session
         .as_ref()
         .is_some_and(|session| unique_exact_thread && session.resumable);
+    let dispatchable = dispatch_context && confidence == MatchConfidence::High && !ambiguous;
     Some(MatchRecommendation {
         project_id: top.project.id,
         source_thread_id: continuity
@@ -789,7 +906,7 @@ fn recommendation(candidates: &[ProjectMatch]) -> Option<MatchRecommendation> {
         ambiguous,
         score: top.score,
         runner_up_margin: margin,
-        dispatchable: false,
+        dispatchable,
     })
 }
 
@@ -1010,6 +1127,18 @@ mod tests {
         assert_eq!(recommendation.confidence, MatchConfidence::High);
         assert_eq!(recommendation.action, "resume");
         assert!(!recommendation.dispatchable);
+        let conductor = registry.match_conductor_metadata(&MatchOptions {
+            query: "continue Alpha Renderer 01900000-0000-7000-8000-000000000001",
+            include_text: false,
+            limit: 5,
+            now: 1_000,
+        })?;
+        assert!(
+            conductor
+                .recommendation
+                .expect("conductor recommendation")
+                .dispatchable
+        );
         Ok(())
     }
 

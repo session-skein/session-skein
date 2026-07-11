@@ -17,9 +17,11 @@ they cannot create a candidate alone. Ties use stable metadata ordering.
 Confidence is a deterministic label, not a probability. An exact canonical path is
 high confidence. Exact project-name or source-thread evidence is high only with the
 documented runner-up margin; duplicate identities remain low and ambiguous. Inferred
-matches need documented score and runner-up margins.
-Every alpha-4 recommendation says `dispatchable: false`: `match` never starts, resumes,
-steers, or interrupts Codex.
+matches need documented score and runner-up margins. `match` always says
+`dispatchable: false` and never starts, resumes, steers, or interrupts Codex. The
+conductor evaluates the same ranking in an explicit dispatch context, where only a
+unique high-confidence recommendation becomes dispatchable and is rechecked inside
+the write transaction.
 
 By default, synchronized session names and previews do not participate. `--include-text`
 locally scores only text previously imported with explicit consent. Source values and
