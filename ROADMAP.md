@@ -45,7 +45,8 @@ and a polished TUI only after behavior is observable and safe.
 - [x] One global composer with deterministic conductor routing.
 - [ ] Optional project-scoped tabs around the global composer.
 - [x] Live worker state and bounded redacted event views.
-- [ ] Derived blocker and cost views when reliable source data is available.
+- [x] Actionable blocker views from durable run and session state.
+- [ ] Cost views when reliable source data is available.
 - [x] Daily narrative and project-card views.
 - [x] Keyboard-first recovery of previous work from durable state.
 
