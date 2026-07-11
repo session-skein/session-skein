@@ -1126,8 +1126,9 @@ mod tests {
         registry.add_project(&sibling, Some("API Two"))?;
 
         for (query_path, expected) in [(&nested, "Bar Nested"), (&sibling, "API Two")] {
+            let canonical_query_path = registry.get_project(query_path)?.path;
             let report = registry.match_metadata(&MatchOptions {
-                query: &format!("continue {}", query_path.display()),
+                query: &format!("continue {}", canonical_query_path.display()),
                 include_text: false,
                 limit: 10,
                 now: 1_000,
