@@ -2,6 +2,7 @@
 
 mod control;
 mod git;
+mod insight;
 mod paths;
 mod registry;
 mod session;
@@ -20,6 +21,19 @@ pub use control::ReconciliationObservation;
 pub use control::ReconciliationPlan;
 pub use control::SteerPlan;
 pub use git::GitMetadata;
+pub use insight::DayProjectActivity;
+pub use insight::DaySummary;
+pub use insight::MatchConfidence;
+pub use insight::MatchEvidence;
+pub use insight::MatchOptions;
+pub use insight::MatchRecommendation;
+pub use insight::MatchReport;
+pub use insight::MatchedProject;
+pub use insight::ProjectCard;
+pub use insight::ProjectCardFacts;
+pub use insight::ProjectMatch;
+pub use insight::SessionMatch;
+pub use insight::SummaryCoverage;
 pub use paths::SkeinPaths;
 pub use registry::Project;
 pub use registry::RefreshReport;

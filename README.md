@@ -5,13 +5,14 @@ and activity. It works directly with the locally installed Codex CLI and its exi
 authentication. Planned optional adapters may enrich the view when tools such as tmux
 or Agent Deck are installed, but neither will be required.
 
-The project is in an early foundation phase. Today, the `skein` binary provides a
+The project is in an early alpha phase. Today, the `skein` binary provides a
 secure versioned project registry, diagnostics, bounded incremental Git metadata, and
 a durable Codex session catalog populated through the app-server protocol. It can
 run one audited foreground Codex turn against an explicitly selected project or
 thread. The alpha worker path can keep an explicitly targeted turn alive while CLI
-clients disconnect and reconnect. It does not yet route natural-language work or
-provide the conductor TUI.
+clients disconnect and reconnect. It can rank registered projects and linked sessions
+from one private stdin query and render factual project/day activity views, but it does
+not yet dispatch that recommendation or provide the conductor TUI.
 
 ## Why a skein?
 
@@ -53,6 +54,11 @@ cargo run --release --bin skein -- worker interrupt RUN_ID
 cargo run --release --bin skein -- worker read RUN_ID --json
 cargo run --release --bin skein -- worker reconcile RUN_ID --json
 cargo run --release --bin skein -- worker stop RUN_ID
+printf '%s\n' 'continue the renderer investigation' | \
+  cargo run --release --bin skein -- match --json
+cargo run --release --bin skein -- summary project /path/to/project --json
+cargo run --release --bin skein -- summary projects --json
+cargo run --release --bin skein -- summary day --json
 ```
 
 `doctor` is always read-only and does not migrate an older database. `init` creates
@@ -95,6 +101,14 @@ read redacted source status. A fenced lost worker can be reconciled against the 
 recorded Codex turn; terminal source truth closes the run, while an in-progress or
 missing turn remains recovery-required. No work is replayed or taken over. See
 [docs/workers.md](docs/workers.md).
+
+`match` is the read-only decision layer beneath the future conductor. It reads a
+bounded query from stdin, ranks only explicitly registered projects and linked
+sessions, and reports every scoring contribution. Recency can strengthen a lexical or
+exact-identity match but cannot nominate a project by itself. Recommendations are
+explicitly non-dispatching. `summary project` and `summary day` assemble deterministic
+factual prose from metadata already in SQLite; they do not launch Codex, Git, an LLM,
+or scan a repository. See [docs/matching-summaries.md](docs/matching-summaries.md).
 
 Environment overrides:
 

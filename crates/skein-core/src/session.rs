@@ -21,6 +21,11 @@ const SESSION_SELECT: &str = "SELECT s.id, s.source_kind, s.source_thread_id,
     s.ephemeral, s.name, s.preview, s.text_imported
     FROM sessions s LEFT JOIN projects p ON p.id = s.project_id";
 
+const SESSION_METADATA_SELECT: &str = "SELECT s.id, s.source_kind, s.source_thread_id,
+    s.project_id, s.project_link_kind, s.source_cwd, s.source_updated_at, s.last_seen_at,
+    s.source_label, s.status_label, s.ephemeral, s.text_imported
+    FROM sessions s";
+
 /// Durable metadata for one externally owned agent session.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct Session {
@@ -47,6 +52,30 @@ pub struct Session {
     pub name: Option<String>,
     pub preview: Option<String>,
     pub text_imported: bool,
+}
+
+/// Text-free session projection used by matching and activity summaries.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SessionMetadata {
+    pub id: i64,
+    pub source_kind: String,
+    pub source_thread_id: String,
+    pub project_id: Option<i64>,
+    pub project_link_kind: ProjectLinkKind,
+    pub source_cwd: PathBuf,
+    pub source_updated_at: i64,
+    pub last_seen_at: i64,
+    pub source_label: String,
+    pub observed_status_label: String,
+    pub ephemeral: bool,
+    pub text_imported: bool,
+}
+
+/// Explicitly opted-in private text, queried separately from metadata.
+pub(crate) struct SessionMatchText {
+    pub id: i64,
+    pub name: Option<String>,
+    pub preview: Option<String>,
 }
 
 /// How a durable session is associated with a registered project.
@@ -253,6 +282,36 @@ impl Registry {
             .map_err(Error::from)
     }
 
+    /// List sessions without selecting private name or preview columns.
+    pub(crate) fn list_session_metadata(&self) -> Result<Vec<SessionMetadata>> {
+        let query = format!(
+            "{SESSION_METADATA_SELECT} ORDER BY s.source_updated_at DESC,
+             s.source_kind, s.source_thread_id"
+        );
+        let mut statement = self.connection.prepare(&query)?;
+        statement
+            .query_map([], session_metadata_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Error::from)
+    }
+
+    /// Load private session text only for the explicit matching opt-in.
+    pub(crate) fn list_session_match_text(&self) -> Result<Vec<SessionMatchText>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, name, preview FROM sessions WHERE text_imported = 1 ORDER BY id",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok(SessionMatchText {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    preview: row.get(2)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Error::from)
+    }
+
     /// Find one durable session by its adapter-owned identity.
     pub fn session_by_source(
         &self,
@@ -422,10 +481,36 @@ fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
     })
 }
 
+fn session_metadata_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionMetadata> {
+    Ok(SessionMetadata {
+        id: row.get(0)?,
+        source_kind: row.get(1)?,
+        source_thread_id: row.get(2)?,
+        project_id: row.get(3)?,
+        project_link_kind: ProjectLinkKind::from_str(&row.get::<_, String>(4)?)?,
+        source_cwd: PathBuf::from(row.get::<_, String>(5)?),
+        source_updated_at: row.get(6)?,
+        last_seen_at: row.get(7)?,
+        source_label: row.get(8)?,
+        observed_status_label: row.get(9)?,
+        ephemeral: row.get::<_, i64>(10)? != 0,
+        text_imported: row.get::<_, i64>(11)? != 0,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::SkeinPaths;
+
+    #[test]
+    fn metadata_projection_never_selects_private_text_columns() {
+        let normalized = SESSION_METADATA_SELECT.to_lowercase();
+        assert!(!normalized.contains("s.name"));
+        assert!(!normalized.contains("s.preview"));
+        assert!(!normalized.contains(" name"));
+        assert!(!normalized.contains(" preview"));
+    }
 
     fn observation(cwd: &Path, id: &str) -> SessionObservation {
         SessionObservation {

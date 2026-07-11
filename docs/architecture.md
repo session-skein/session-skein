@@ -26,6 +26,8 @@ Versioned SQLite state + Codex-owned transcripts
   owning core state.
 - Future control operations will be separate from observation and require an
   explicit policy decision.
+- Matching and activity views are ephemeral projections over durable metadata. They
+  persist neither the private query nor generated prose and cannot dispatch work.
 
 ## Control state
 
