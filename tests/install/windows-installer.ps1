@@ -20,11 +20,29 @@ function Set-CaseEnvironment([string]$CaseRoot) {
     $env:Path = (Join-Path $RepoRoot 'tests\fixtures\fake-codex-windows') + ';' + $OriginalProcessPath
 }
 
-function Invoke-Installer([string[]]$Arguments) {
-    & (Join-Path $RepoRoot 'install.ps1') @Arguments
+function Invoke-Installer(
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]]$Arguments
+) {
+    $parameters = @{}
+    for ($index = 0; $index -lt $Arguments.Count; $index++) {
+        $option = [string]$Arguments[$index]
+        if (-not $option.StartsWith('-')) { throw "Invalid installer test option: $option" }
+        $name = $option.TrimStart('-')
+        if ($index + 1 -lt $Arguments.Count -and -not ([string]$Arguments[$index + 1]).StartsWith('-')) {
+            $parameters[$name] = $Arguments[$index + 1]
+            $index++
+        } else {
+            $parameters[$name] = $true
+        }
+    }
+    & (Join-Path $RepoRoot 'install.ps1') @parameters
 }
 
-function Invoke-Git([string[]]$Arguments) {
+function Invoke-Git(
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]]$Arguments
+) {
     & git @Arguments | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "git exited with code $LASTEXITCODE" }
 }
