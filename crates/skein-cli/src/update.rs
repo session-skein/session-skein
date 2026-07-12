@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
+#[cfg(windows)]
+use std::fs::File;
 use std::io::Read;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -7,6 +9,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(windows)]
 use std::process::Stdio;
+#[cfg(windows)]
+use std::thread;
+#[cfg(windows)]
+use std::time::{Duration, Instant};
 
 use semver::Version;
 use serde::Serialize;
@@ -482,8 +488,12 @@ fn schedule_windows(
     let helper = state.join("update-helper.ps1");
     let result = state.join("update-helper.result.json");
     let log = state.join("update-helper.log");
+    let bootstrap_stdout = state.join("update-helper.bootstrap.stdout.log");
+    let bootstrap_stderr = state.join("update-helper.bootstrap.stderr.log");
     let _ = fs::remove_file(&result);
     let _ = fs::remove_file(&log);
+    let _ = fs::remove_file(&bootstrap_stdout);
+    let _ = fs::remove_file(&bootstrap_stderr);
     let quote = |value: &str| value.replace('\'', "''");
     let mut script = format!(
         r#"$ErrorActionPreference='Stop'
@@ -543,15 +553,80 @@ if ($actualHash -ne $expectedHash.ToLowerInvariant()) {{ throw "installer snapsh
         .into());
     }
     let mut command = Command::new("pwsh");
+    let stdout = File::create(&bootstrap_stdout)?;
+    let stderr = File::create(&bootstrap_stderr)?;
     command
         .args(["-NoProfile", "-File"])
-        .arg(helper)
+        .arg(&helper)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP: the helper must outlive
-        // the updating executable and must not retain CI/pipeline console handles.
-        .creation_flags(0x0000_0008 | 0x0000_0200);
-    command.spawn()?;
-    Ok(true)
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        // CREATE_NEW_PROCESS_GROUP gives the helper an independent control group.
+        // Windows does not tie child lifetime to parent lifetime; dedicated stdio
+        // files prevent pipeline handles from keeping the updater invocation open.
+        .creation_flags(0x0000_0200);
+    let mut child = command.spawn()?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(content) = fs::read_to_string(&result)
+            && let Ok(value) = serde_json::from_str::<serde_json::Value>(&content)
+        {
+            match value["status"].as_str() {
+                Some("running") => return Ok(true),
+                Some("failed") => {
+                    return Err(helper_start_error(
+                        "helper reported failure before startup handshake",
+                        Some(&content),
+                        &bootstrap_stdout,
+                        &bootstrap_stderr,
+                        &helper,
+                    ));
+                }
+                _ => {}
+            }
+        }
+        if let Some(status) = child.try_wait()? {
+            return Err(helper_start_error(
+                &format!("helper exited before startup handshake with {status}"),
+                fs::read_to_string(&result).ok().as_deref(),
+                &bootstrap_stdout,
+                &bootstrap_stderr,
+                &helper,
+            ));
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(helper_start_error(
+                "helper did not publish running status within 10 seconds",
+                fs::read_to_string(&result).ok().as_deref(),
+                &bootstrap_stdout,
+                &bootstrap_stderr,
+                &helper,
+            ));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(windows)]
+fn helper_start_error(
+    reason: &str,
+    result: Option<&str>,
+    stdout: &Path,
+    stderr: &Path,
+    helper: &Path,
+) -> Box<dyn std::error::Error> {
+    let stdout =
+        fs::read_to_string(stdout).unwrap_or_else(|error| format!("<unreadable: {error}>"));
+    let stderr =
+        fs::read_to_string(stderr).unwrap_or_else(|error| format!("<unreadable: {error}>"));
+    format!(
+        "Windows update helper launch failed: {reason}; helper={}; result={}; bootstrap stdout={}; bootstrap stderr={}",
+        helper.display(),
+        result.unwrap_or("<missing>"),
+        stdout.trim(),
+        stderr.trim()
+    )
+    .into()
 }

@@ -89,12 +89,16 @@ try {
     if (-not $HelperDone -or -not $ReceiptRepublished) {
         $HelperScript = Join-Path $Case 'SessionSkein\install\update-helper.ps1'
         $HelperLog = Join-Path $Case 'SessionSkein\install\update-helper.log'
+        $BootstrapOut = Join-Path $Case 'SessionSkein\install\update-helper.bootstrap.stdout.log'
+        $BootstrapErr = Join-Path $Case 'SessionSkein\install\update-helper.bootstrap.stderr.log'
         $ResultDiagnostic = if (Test-Path $HelperResult) { Get-Content $HelperResult -Raw } else { '<missing>' }
         $LogDiagnostic = if (Test-Path $HelperLog) { Get-Content $HelperLog -Raw } else { '<missing>' }
+        $BootstrapOutDiagnostic = if (Test-Path $BootstrapOut) { Get-Content $BootstrapOut -Raw } else { '<missing>' }
+        $BootstrapErrDiagnostic = if (Test-Path $BootstrapErr) { Get-Content $BootstrapErr -Raw } else { '<missing>' }
         $ScriptDiagnostic = if (Test-Path $HelperScript) { Get-Content $HelperScript -Raw } else { '<missing>' }
         $ProcessDiagnostic = Get-CimInstance Win32_Process -Filter "Name = 'pwsh.exe'" -ErrorAction SilentlyContinue |
             Select-Object ProcessId, ParentProcessId, CommandLine | ConvertTo-Json -Compress
-        throw "Windows update helper timeout. helperDone=$HelperDone receiptRepublished=$ReceiptRepublished result=$ResultDiagnostic log=$LogDiagnostic processes=$ProcessDiagnostic script=$ScriptDiagnostic"
+        throw "Windows update helper timeout. helperDone=$HelperDone receiptRepublished=$ReceiptRepublished result=$ResultDiagnostic log=$LogDiagnostic bootstrapOut=$BootstrapOutDiagnostic bootstrapErr=$BootstrapErrDiagnostic processes=$ProcessDiagnostic script=$ScriptDiagnostic"
     }
     if ($HelperStatus.status -ne 'completed') { throw "Windows update helper returned unexpected status: $($HelperStatus.status)" }
     $Receipt = Get-Content $ReceiptPath -Raw | ConvertFrom-Json
