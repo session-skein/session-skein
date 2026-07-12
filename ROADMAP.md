@@ -71,7 +71,17 @@ and a polished TUI only after behavior is observable and safe.
 
 - [ ] tmux observer for pane correlation and attach hints.
 - [ ] Agent Deck observer when its executable and registry are available.
-- [ ] Optional skill that teaches Session Skein workflows without owning state.
+- [x] Codex skill and plugin that teach Session Skein workflows without owning state.
+
+## Distribution and documentation
+
+- [x] Agent-readable installation contract with idempotent Linux/macOS and Windows
+  setup paths.
+- [x] Organized handbook, guided codebase map, complete CLI/MCP references, and
+  automated documentation drift checks.
+- [x] Codex marketplace manifest that bundles the workflow skill and MCP declaration.
+- [ ] Signed/notarized cross-platform release binaries with reproducible provenance.
+- [ ] Package-manager distribution after the public command/config surface stabilizes.
 
 Missing, outdated, or broken optional integrations must degrade to diagnostics and
 must not affect Codex discovery, control, routing, database startup, or the TUI.

@@ -3,7 +3,7 @@
 All notable changes will be documented here. The project follows Semantic Versioning
 after its first published release.
 
-## [0.5.0-alpha.7] - Unreleased Codex MCP server
+## [0.5.0-alpha.7] - Unreleased
 
 - Added an on-demand stdio MCP server with server instructions, JSON Schema tools,
   structured results, and read/write/destructive/open-world annotations.
@@ -33,6 +33,14 @@ after its first published release.
   and memory-to-project routing until an authoritative refresh is possible.
 - Stop recursive discovery at Git repository boundaries, matching Codex Brain's fast
   scan behavior and avoiding expensive traversal inside network-hosted source trees.
+- Added an organized handbook with a guided codebase map, complete CLI and 24-tool
+  MCP references, installation/operations guides, and automated drift checks.
+- Added idempotent Linux/macOS and Windows installers, a distributable Codex skill,
+  and a repository marketplace plugin with MCP configuration. Direct installs use
+  immutable content-addressed skill snapshots plus receipt-, binary-, and MCP-config
+  rollback so failed upgrades cannot change the active integration.
+- Corrected stale pre-conductor architecture, TUI, worker, schema, pagination, and
+  security documentation.
 
 ## [0.5.0-alpha.6] - 2026-07-11
 

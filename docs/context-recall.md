@@ -17,7 +17,9 @@ and TUI startup refresh apply enabled sources automatically.
 
 Generated-memory recall considers regular Markdown files beneath `memories/`.
 Raw-session recall considers JSONL beneath `sessions/`, but imports a file only when
-its `session_meta.cwd` is an absolute descendant of a persisted approved scan root.
+its observed cwd resolves to an existing directory whose canonical path is beneath a
+canonical persisted approved scan root. Missing paths, non-directories, and symlink
+escapes are rejected.
 Only `response_item` messages with user or assistant roles contribute text. System,
 developer, tool, approval, command, diff, and malformed records are ignored.
 Admitted user/assistant or generated-memory text is not comprehensively redacted and
@@ -29,6 +31,12 @@ explicit maximum up to 10,000. Source files over 1 MiB are skipped; imported tex
 capped at 512 KiB per document; titles at 256 bytes; returned FTS snippets at 2 KiB;
 search at 100 results. Symlinked files and directories are never followed. Stored
 provenance is relative to the selected Codex home.
+
+Candidate files are selected newest-first by modification time, with stable path
+ordering for timestamp ties, before the per-source file budget is consumed. Generated
+memory files may be attributed to one registered project using conservative path/cwd
+metadata. The longest canonical project match wins; conflicting multi-project
+references remain unmapped. Memory attribution never authorizes raw-session import.
 
 Each enabled source is rebuilt atomically with its FTS rows. Settings and approved
 roots are revalidated after the write lock is acquired. Disabling a source changes

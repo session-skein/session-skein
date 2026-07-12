@@ -1,6 +1,6 @@
 # Explainable matching and activity views
 
-Alpha 4 adds a read-only recommendation layer. The query is private stdin data:
+The read-only recommendation layer accepts its query as private stdin data:
 
 ```console
 printf '%s\n' 'continue the checkout failure investigation' | \

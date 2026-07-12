@@ -7,7 +7,7 @@ API key, or a second model subscription.
 
 ## Layout
 
-- **Projects** shows deterministic cards for explicitly registered roots.
+- **Projects** shows deterministic cards for explicitly registered projects.
 - **Work** shows Codex session identities and Skein-owned runs for the selected
   project. Selecting a run follows its bounded, redacted in-memory events.
 - **Activity** shows the selected project narrative and today's metadata digest when
@@ -24,8 +24,9 @@ Glamour-like rendering and `tachyonfx` for effects; usability and low input late
 take priority over animation.
 
 On startup, a separate background thread discovers configured roots and refreshes
-bounded Git/project-document sources; this may take time on a network disk but never
-blocks keyboard input or rendering. Its completion status appears in the footer.
+bounded Git/project-document sources, enabled private context, and content-free Codex
+session metadata; this may take time on a network disk but never blocks keyboard input
+or rendering. Its completion status appears in the footer.
 Ordinary two-second catalog refreshes remain read-only SQLite access. Worker
 snapshots, interrupts, and conductor children also run away from the rendering loop,
 so a slow project disk does not directly block keyboard input.

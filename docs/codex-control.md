@@ -31,8 +31,9 @@ skein session bind THREAD_ID /path/to/registered/project --json
 This foreground compatibility command does not select the project or thread. For a
 reconnectable process and exact interruption, use the separately documented
 `skein worker` commands. The worker path adds exact-turn steer and read-only source
-reconciliation; neither path yet provides a global composer, routing, confidence
-evidence, worker takeover, or the final TUI.
+observation plus durable reconciliation. The global conductor and TUI build on the
+worker path and add routing/confidence evidence; worker lease takeover or reattachment
+after process loss remains unimplemented.
 
 ## Policy boundary
 

@@ -91,10 +91,13 @@ durable redacted state remains.
 - One text turn per worker run.
 - Full-access/no-approval policy only, with explicit acknowledgement.
 - Source reads are metadata-only; there is no source-content display.
-- The standalone conductor can route a unique high-confidence prompt, but there is no
-  interactive ambiguity picker, semantic router, global composer, or TUI yet.
+- The conductor and TUI refuse ambiguity; there is no interactive ambiguity picker or
+  semantic/LLM router.
 - `worker stop` refuses an active run; use `worker interrupt`, wait for authoritative
   terminal status, then stop the idle worker.
 - Reconciliation can close exact terminal turns; lease takeover/reattachment is not
   implemented.
 - Codex background terminal processes are not enumerated by the stable app-server API.
+
+See [conductor](conductor.md) for single-prompt routing and [TUI](tui.md) for the
+global composer that monitors these workers.

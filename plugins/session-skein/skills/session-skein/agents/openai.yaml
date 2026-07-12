@@ -1,0 +1,7 @@
+interface:
+  display_name: "Session Skein"
+  short_description: "Route and manage local Codex work"
+  default_prompt: "Use $session-skein to find the right project and continue my Codex work."
+
+policy:
+  allow_implicit_invocation: true
