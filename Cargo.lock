@@ -1227,6 +1227,7 @@ dependencies = [
  "iana-time-zone",
  "ratatui",
  "rmcp",
+ "rusqlite",
  "semver",
  "serde",
  "serde_json",

@@ -45,6 +45,14 @@ const SUBMISSION_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const TERMINAL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
+fn monitor_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
+        })
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum WorkerRequest {
@@ -90,6 +98,10 @@ enum WorkerResponse {
     },
     InterruptAccepted {
         run_id: i64,
+        #[serde(default)]
+        action_id: Option<i64>,
+        #[serde(default)]
+        queued: Option<bool>,
     },
     SteerAccepted {
         run_id: i64,
@@ -122,6 +134,56 @@ pub struct RedactedWorkerEvent {
     pub status: Option<String>,
     pub item_type: Option<String>,
     pub delta_bytes: Option<usize>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InterruptRequestReport {
+    pub run_id: i64,
+    pub action_id: Option<i64>,
+    pub queued: bool,
+    pub repeated: bool,
+    pub cancellation: skein_core::CancellationStatus,
+    pub terminal: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ObserveReport {
+    #[serde(flatten)]
+    pub observation: skein_core::RunObservation,
+    pub timed_out: bool,
+    pub waited_milliseconds: u64,
+}
+
+pub fn observe(
+    paths: &SkeinPaths,
+    run_id: i64,
+    after_cursor: i64,
+    limit: usize,
+    timeout: Duration,
+) -> Result<ObserveReport, Box<dyn std::error::Error>> {
+    if timeout > Duration::from_secs(30) {
+        return Err("observe timeout must not exceed 30 seconds".into());
+    }
+    let started = Instant::now();
+    loop {
+        let registry = Registry::open_read_only(paths)?;
+        let observation = registry.observe_run(run_id, after_cursor, limit, monitor_now())?;
+        let ready = !observation.events.is_empty()
+            || observation.terminal
+            || observation.recovery_required
+            || observation.has_more_events;
+        let elapsed = started.elapsed();
+        if ready || elapsed >= timeout {
+            return Ok(ObserveReport {
+                observation,
+                timed_out: !ready && elapsed >= timeout,
+                waited_milliseconds: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+            });
+        }
+        thread::sleep(POLL_INTERVAL.min(timeout.saturating_sub(elapsed)));
+    }
 }
 
 #[derive(Default)]
@@ -292,14 +354,26 @@ pub fn stop(paths: &SkeinPaths, run_id: i64) -> Result<(), Box<dyn std::error::E
     }
 }
 
-pub fn interrupt(paths: &SkeinPaths, run_id: i64) -> Result<(), Box<dyn std::error::Error>> {
+pub fn interrupt(
+    paths: &SkeinPaths,
+    run_id: i64,
+) -> Result<InterruptRequestReport, Box<dyn std::error::Error>> {
     let mut registry = Registry::open(paths)?;
     recover_expired(&mut registry, paths)?;
     if let Some(run) = registry.control_run(run_id)?
         && terminal(run.state)
     {
-        return Ok(());
+        let observation = registry.observe_run(run_id, 0, 1, monitor_now())?;
+        return Ok(InterruptRequestReport {
+            run_id,
+            action_id: observation.cancellation.action_id,
+            queued: false,
+            repeated: observation.cancellation.requested,
+            cancellation: observation.cancellation,
+            terminal: true,
+        });
     }
+    let prior = registry.observe_run(run_id, 0, 1, monitor_now())?;
     let connection = registry.worker_connection(run_id)?;
     match request(
         &connection.endpoint,
@@ -309,7 +383,22 @@ pub fn interrupt(paths: &SkeinPaths, run_id: i64) -> Result<(), Box<dyn std::err
             capability: read_capability(paths, run_id)?,
         },
     )? {
-        WorkerResponse::InterruptAccepted { run_id: accepted } if accepted == run_id => Ok(()),
+        WorkerResponse::InterruptAccepted {
+            run_id: accepted,
+            action_id,
+            queued,
+        } if accepted == run_id => {
+            let observation = registry.observe_run(run_id, 0, 1, monitor_now())?;
+            let queued = queued.unwrap_or(!prior.cancellation.requested);
+            Ok(InterruptRequestReport {
+                run_id,
+                action_id: action_id.or(observation.cancellation.action_id),
+                queued,
+                repeated: !queued,
+                cancellation: observation.cancellation,
+                terminal: observation.terminal,
+            })
+        }
         WorkerResponse::Error { code, message } => Err(format!("{code}: {message}").into()),
         _ => Err("worker returned an unexpected interrupt response".into()),
     }
@@ -467,10 +556,12 @@ pub fn durable_snapshot(
     let run = registry
         .control_run(run_id)?
         .ok_or_else(|| format!("worker run {run_id} was not found"))?;
+    let observation = registry.observe_run(run_id, 0, 20, monitor_now())?;
     Ok(serde_json::json!({
         "run": run,
         "worker": registry.control_worker(run_id)?,
-        "liveEventsAvailable": registry.worker_connection(run_id).is_ok()
+        "liveEventsAvailable": registry.worker_connection(run_id).is_ok(),
+        "observation": observation
     }))
 }
 
@@ -793,16 +884,19 @@ fn handle_request(
                 .unwrap_or_else(|error| error.into_inner());
             let mut registry = Registry::open(paths)?;
             let interrupt = registry.plan_owned_interrupt(claim.run_id(), claim)?;
-            if interrupt.should_dispatch
+            let queued = interrupt.should_dispatch
                 && shared
                     .interrupt_queued
                     .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_ok()
-            {
+                    .is_ok();
+            let action_id = interrupt.action_id;
+            if queued {
                 commands.push_back(RuntimeCommand::Interrupt(interrupt));
             }
             Ok(WorkerResponse::InterruptAccepted {
                 run_id: claim.run_id(),
+                action_id: Some(action_id),
+                queued: Some(queued),
             })
         }
         WorkerRequest::Steer {
@@ -1261,5 +1355,155 @@ mod tests {
         assert_eq!(latest, (MAX_EVENTS + 1) as u64);
         assert_eq!(oldest, Some(2));
         assert!(truncated);
+    }
+
+    #[test]
+    fn zero_timeout_returns_nonterminal_and_terminal_without_sleeping() {
+        let temp = tempfile::tempdir().expect("synthetic observe state");
+        let project = temp.path().join("project");
+        std::fs::create_dir(&project).expect("synthetic project");
+        let paths = SkeinPaths::new(temp.path().join("config"), temp.path().join("data"));
+        let mut registry = Registry::open(&paths).expect("registry");
+        registry.add_project(&project, None).expect("project");
+        let plan = registry
+            .plan_control_run(&skein_core::NewControlRun {
+                project_path: &project,
+                resume_thread_id: None,
+                prompt: "private synthetic observe prompt",
+                full_access_acknowledged: true,
+            })
+            .expect("plan");
+        let cursor = registry
+            .observe_run(plan.run_id, 0, 100, monitor_now())
+            .expect("initial observation")
+            .next_cursor;
+        drop(registry);
+        let waiting = observe(&paths, plan.run_id, cursor, 50, Duration::ZERO).expect("observe");
+        assert!(waiting.timed_out);
+        assert!(!waiting.observation.terminal);
+
+        let mut registry = Registry::open(&paths).expect("registry");
+        registry
+            .begin_control_action(plan.thread_action_id)
+            .expect("begin thread");
+        registry
+            .acknowledge_thread_action(
+                plan.thread_action_id,
+                "synthetic-thread",
+                Some("synthetic-session"),
+            )
+            .expect("ack thread");
+        registry
+            .begin_control_action(plan.turn_action_id)
+            .expect("begin turn");
+        registry
+            .acknowledge_turn_action(plan.turn_action_id, "synthetic-turn")
+            .expect("ack turn");
+        registry
+            .complete_control_run(plan.run_id, "completed")
+            .expect("complete");
+        drop(registry);
+        let terminal = observe(&paths, plan.run_id, 0, 50, Duration::ZERO).expect("observe");
+        assert!(!terminal.timed_out);
+        assert!(terminal.observation.terminal);
+    }
+
+    #[test]
+    fn observing_an_expired_worker_never_recovers_or_mutates_it() {
+        let temp = tempfile::tempdir().expect("synthetic read-only observe state");
+        let project = temp.path().join("project");
+        std::fs::create_dir(&project).expect("synthetic project");
+        let paths = SkeinPaths::new(temp.path().join("config"), temp.path().join("data"));
+        let mut registry = Registry::open(&paths).expect("registry");
+        registry.add_project(&project, None).expect("project");
+        let plan = registry
+            .plan_control_run(&skein_core::NewControlRun {
+                project_path: &project,
+                resume_thread_id: None,
+                prompt: "private expired-worker prompt",
+                full_access_acknowledged: true,
+            })
+            .expect("plan");
+        let claim = registry
+            .create_control_worker(plan.run_id)
+            .expect("worker allocation");
+        registry
+            .mark_worker_ready(&claim, "127.0.0.1:12345", 42)
+            .expect("ready worker");
+        drop(registry);
+
+        let database = rusqlite::Connection::open(paths.database()).expect("raw test database");
+        database
+            .execute(
+                "UPDATE control_workers SET lease_acquired_at = 0, heartbeat_at = 0,
+                        lease_expires_at = 0 WHERE run_id = ?1",
+                [plan.run_id],
+            )
+            .expect("expire worker deterministically");
+        let durable_state = |connection: &rusqlite::Connection| {
+            let run: (String, Option<i64>) = connection
+                .query_row(
+                    "SELECT state, terminal_at FROM control_runs WHERE id = ?1",
+                    [plan.run_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("run state");
+            let worker: (String, i64, i64, i64, Option<i64>, Option<String>) = connection
+                .query_row(
+                    "SELECT state, lease_epoch, heartbeat_at, lease_expires_at,
+                            terminal_at, exit_kind
+                       FROM control_workers WHERE run_id = ?1",
+                    [plan.run_id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                        ))
+                    },
+                )
+                .expect("worker state");
+            let actions = {
+                let mut statement = connection
+                    .prepare(
+                        "SELECT id, state, terminal_at, error_class FROM control_actions
+                          WHERE run_id = ?1 ORDER BY id",
+                    )
+                    .expect("action statement");
+                statement
+                    .query_map([plan.run_id], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<i64>>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                        ))
+                    })
+                    .expect("actions")
+                    .collect::<Result<Vec<_>, _>>()
+                    .expect("action rows")
+            };
+            (run, worker, actions)
+        };
+        let before = durable_state(&database);
+        drop(database);
+
+        let report =
+            observe(&paths, plan.run_id, 0, 50, Duration::ZERO).expect("read-only observe");
+        assert!(
+            report
+                .observation
+                .worker_health
+                .as_ref()
+                .is_some_and(|health| health.stale)
+        );
+        assert_eq!(report.observation.recommended_next_action, "reconcile");
+        assert!(!report.observation.recovery_required);
+
+        let database = rusqlite::Connection::open(paths.database()).expect("raw test database");
+        assert_eq!(durable_state(&database), before);
     }
 }

@@ -37,6 +37,11 @@ turns, actions, and append-only events are committed before app-server mutations
 Observed session status never drives the control state machine.
 
 The compatibility control path owns one foreground stdio app-server connection. The
+durable monitor projects bounded redacted action events behind a stable cursor plus
+cancellation phases and lease health. Optional bounded long-polling rereads that
+projection; it owns no worker and starts no daemon.
+Each poll uses a read-only registry. Expired leases are diagnosed, not recovered;
+recovery and reconciliation remain explicit mutation surfaces.
 worker path assigns a run to a per-run process with a heartbeat lease and fencing
 epoch. Every worker mutation records and verifies that owner. A detached process owns
 the Codex connection behind a child guard, while clients use authenticated loopback

@@ -55,8 +55,12 @@ dispatch.
 ## Operate an existing run
 
 - Inspect: `get_run {"run_id":N}`.
+- Monitor: `observe_run` with returned `nextCursor`; timeout is nonterminal.
+  Observation is read-only; call explicit reconciliation only when its diagnostics
+  recommend it and the user intends that mutation.
 - Steer: generate a UUID, then `steer_run` with exact run ID and text.
 - Interrupt: inspect, confirm user intent, then `interrupt_run` with exact run ID.
+  Treat queued as request-only and observe for acknowledgement and terminality.
 - Recover: generate/reuse a reconciliation UUID, then `reconcile_run` on an exact
   recovery-required run.
 

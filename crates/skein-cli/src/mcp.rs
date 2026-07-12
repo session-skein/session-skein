@@ -215,6 +215,18 @@ fn tool_catalog(allow_control: bool) -> Vec<Tool> {
             true,
         ),
         tool(
+            "observe_run",
+            "Observe bounded durable redacted run events and cancellation/worker health from a stable cursor. Optional timeout_ms long-polls for at most 30000 ms.",
+            json!({
+                "run_id": {"type": "integer", "minimum": 1},
+                "after_cursor": {"type": "integer", "minimum": 0, "default": 0},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 50},
+                "timeout_ms": {"type": "integer", "minimum": 0, "maximum": 30000, "default": 0}
+            }),
+            &["run_id"],
+            true,
+        ),
+        tool(
             "get_day_summary",
             "Return a deterministic metadata-only activity digest for a local calendar day.",
             json!({"date": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"}}),
@@ -473,6 +485,7 @@ fn execute_local_tool(paths: &SkeinPaths, name: &str, arguments: Value) -> Resul
         "list_sessions" => list_sessions(paths, parse(arguments)?),
         "list_runs" => list_runs(paths, parse(arguments)?),
         "get_run" => get_run(paths, parse(arguments)?),
+        "observe_run" => observe_run(paths, parse(arguments)?),
         "get_day_summary" => get_day_summary(paths, parse(arguments)?),
         "get_recent_activity" => get_recent_activity(paths, parse(arguments)?),
         "get_activity_status" => get_activity_status(paths),
@@ -527,6 +540,17 @@ struct ListArgs {
 #[derive(Deserialize)]
 struct RunArgs {
     run_id: i64,
+}
+
+#[derive(Deserialize)]
+struct ObserveArgs {
+    run_id: i64,
+    #[serde(default)]
+    after_cursor: i64,
+    #[serde(default = "default_monitor_limit")]
+    limit: usize,
+    #[serde(default)]
+    timeout_ms: u64,
 }
 
 #[derive(Default, Deserialize)]
@@ -1148,8 +1172,27 @@ fn steer_run(paths: &SkeinPaths, args: SteerArgs) -> Result<Value, String> {
 }
 
 fn interrupt_run(paths: &SkeinPaths, args: RunArgs) -> Result<Value, String> {
-    worker_runtime::interrupt(paths, args.run_id).map_err(|error| error.to_string())?;
-    Ok(json!({"ok": true, "runId": args.run_id, "interruptQueued": true}))
+    let report =
+        worker_runtime::interrupt(paths, args.run_id).map_err(|error| error.to_string())?;
+    Ok(json!({"ok": true, "result": report}))
+}
+
+fn observe_run(paths: &SkeinPaths, args: ObserveArgs) -> Result<Value, String> {
+    if !(1..=skein_core::MAX_MONITOR_EVENTS).contains(&args.limit) {
+        return Err("limit must be in 1..=100".to_owned());
+    }
+    if args.timeout_ms > 30_000 {
+        return Err("timeout_ms must be in 0..=30000".to_owned());
+    }
+    let report = worker_runtime::observe(
+        paths,
+        args.run_id,
+        args.after_cursor,
+        args.limit,
+        std::time::Duration::from_millis(args.timeout_ms),
+    )
+    .map_err(|error| error.to_string())?;
+    serde_json::to_value(report).map_err(|error| error.to_string())
 }
 
 fn reconcile_run(paths: &SkeinPaths, args: ReconcileArgs) -> Result<Value, String> {
@@ -1375,6 +1418,10 @@ const fn default_activity_limit() -> usize {
     50
 }
 
+const fn default_monitor_limit() -> usize {
+    50
+}
+
 fn default_activity_hours() -> f64 {
     24.0
 }
@@ -1455,6 +1502,17 @@ mod tests {
             panic!("get_run tool missing")
         };
         assert_eq!(get_run.input_schema["required"], json!(["run_id"]));
+        let Some(observe) = tools.iter().find(|tool| tool.name == "observe_run") else {
+            panic!("observe_run tool missing")
+        };
+        assert_eq!(observe.input_schema["required"], json!(["run_id"]));
+        assert_eq!(
+            observe
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.read_only_hint),
+            Some(true)
+        );
         let Some(reconcile) = tools.iter().find(|tool| tool.name == "reconcile_run") else {
             panic!("reconcile_run tool missing")
         };

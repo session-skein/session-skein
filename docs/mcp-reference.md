@@ -19,6 +19,7 @@ The server returns structured JSON inside MCP content. A fresh database may retu
 | `list_sessions` | read | none | limit 100; optional project |
 | `list_runs` | read | none | limit 100; optional project/active |
 | `get_run` | read | `run_id` | redaction-safe detail |
+| `observe_run` | read/wait | `run_id` | cursor 0; limit 50; timeout 0 |
 | `get_day_summary` | read | none | local today; optional ISO date |
 | `get_recent_activity` | read | none | 24 hours; limit 50 |
 | `get_activity_status` | read | none | catalog counts/timestamps |
@@ -209,7 +210,12 @@ UUID is idempotent.
 
 ### `interrupt_run`
 
-Requires positive `run_id` and interrupts the exact active source turn.
+Requires positive `run_id` and requests interruption of the exact active source turn.
+Queue acceptance is not terminal cancellation. `observe_run` accepts a stable cursor,
+limit 1–100, and timeout up to 30 seconds and returns durable events, cancellation,
+terminal/recovery state, pending actions, lease health, and next-action guidance.
+`observe_run` opens the registry read-only on every poll and never performs recovery,
+reconciliation, dispatch, or any other state mutation.
 
 ### `reconcile_run`
 

@@ -1,5 +1,14 @@
 # Reconnectable Codex workers
 
+`worker observe` is the durable reconnectable monitor. Its event-ID cursor advances
+without duplicates; reports include more-events state, cancellation phase, pending
+actions, terminal/recovery state, heartbeat age, lease health, and a recommended next
+action. Optional wait is bounded to 30 seconds and needs no daemon. Queued or
+acknowledged interrupt is not terminal cancellation; repeats are idempotent.
+Observation opens state read-only on every poll. It never recovers a lease, reconciles
+a run, dispatches control, or changes actions/workers; stale state only changes the
+reported health and recommended next action.
+
 Session Skein can start one explicitly targeted Codex turn in an on-demand worker.
 The worker owns the Codex app-server connection; the launching CLI and later watchers
 are clients and may exit without terminating the turn. No systemd unit, separately
@@ -11,6 +20,8 @@ printf '%s\n' 'Run the focused tests.' | \
 
 skein worker list --active --json
 skein worker status RUN_ID --json
+skein worker observe RUN_ID --after-cursor 0 --limit 50 --json
+skein worker observe RUN_ID --after-cursor CURSOR --timeout-ms 30000 --json
 skein worker watch RUN_ID --jsonl
 printf '%s\n' 'Only inspect the failing test.' | skein worker steer RUN_ID
 skein worker interrupt RUN_ID
