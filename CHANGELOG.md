@@ -3,7 +3,15 @@
 All notable changes will be documented here. The project follows Semantic Versioning
 after its first published release.
 
-## [0.5.0-alpha.7] - Unreleased
+## [0.5.0-alpha.8] - Unreleased
+
+### Added
+
+- Added a PR-tested, tag-published preview release pipeline for native Linux x86_64,
+  macOS x86_64/arm64, and Windows x86_64 packages with deterministic archives,
+  machine-readable manifests, SHA-256 checksums, and GitHub provenance attestations.
+
+## [0.5.0-alpha.7]
 
 - Added an on-demand stdio MCP server with server instructions, JSON Schema tools,
   structured results, and read/write/destructive/open-world annotations.

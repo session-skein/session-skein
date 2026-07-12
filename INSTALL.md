@@ -35,6 +35,12 @@ control operation its per-request acknowledgement.
 `--binary` / `-Binary` is the explicit advanced path for an already-built native
 executable and does not require the Rust or C build toolchains.
 
+Unsigned preview archives are available through GitHub Releases for four native
+targets. Verify their SHA-256 checksum and GitHub provenance before passing the
+extracted executable to `--binary` or `-Binary`; see
+[preview releases](docs/releases.md). Source installation remains the recommended
+default. The installers do not select, download, or update release assets themselves.
+
 Check the two required programs:
 
 ```console
