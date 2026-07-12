@@ -49,7 +49,7 @@ GitHub also records build-provenance attestations for every published asset. Wit
 GitHub CLI installed, verify an asset against the canonical repository:
 
 ```console
-gh attestation verify session-skein-v0.5.0-alpha.9-x86_64-unknown-linux-gnu.tar.gz \
+gh attestation verify session-skein-v0.5.0-alpha.10-x86_64-unknown-linux-gnu.tar.gz \
   --repo session-skein/session-skein
 ```
 

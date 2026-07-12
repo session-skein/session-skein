@@ -3,10 +3,14 @@
 All notable changes will be documented here. The project follows Semantic Versioning
 after its first published release.
 
-## [0.5.0-alpha.9] - Unreleased
+## [0.5.0-alpha.10] - 2026-07-12
 
 ### Added
 
+- Added a Markdown-backed GitHub Pages handbook with canonical documentation reused
+  from the repository and automated rendered-link validation.
+- Added structured freshness diagnostics, scoped progress reporting, and explicit
+  source coverage so slow indexing work is visible without inventing completeness.
 - Added durable cursor-based worker observation with bounded wait, cancellation
   phases, lease/heartbeat health, pending-action diagnostics, and truthful idempotent
   interrupt reports across CLI and MCP.
@@ -22,6 +26,11 @@ after its first published release.
 - Added schema-11 content-free byte checkpoints for verified unchanged reuse and
   append-tail parsing of explicitly enabled raw-session context files, with safe full
   fallback and structured work accounting.
+
+## [0.5.0-alpha.9] - 2026-07-12
+
+### Added
+
 - Added the receipt-gated, CLI-only `skein update` workflow with check-only status,
   exact-version selection, downgrade/reinstall policy, and transactional delegation
   to the verified binary-first installer snapshot. Current-version decisions use the

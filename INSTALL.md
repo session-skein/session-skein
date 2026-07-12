@@ -60,7 +60,7 @@ re-fetches an installer after resolution. To pin the release yourself:
 
 ```console
 curl -fsSL https://raw.githubusercontent.com/session-skein/session-skein/main/install.sh | \
-  bash -s -- --version 0.5.0-alpha.9 --control
+  bash -s -- --version 0.5.0-alpha.10 --control
 ```
 
 Useful options:
@@ -113,7 +113,7 @@ Invoke-WebRequest https://raw.githubusercontent.com/session-skein/session-skein/
 ```
 
 Downloading to a file keeps parameters and errors explicit. `-Version
-0.5.0-alpha.9` pins a release; otherwise `-Channel preview` resolves the same approved
+0.5.0-alpha.10` pins a release; otherwise `-Channel preview` resolves the same approved
 preview pointer as Unix.
 
 PowerShell parameters mirror the Unix installer: `-Control`, `-CatalogOnly`,
