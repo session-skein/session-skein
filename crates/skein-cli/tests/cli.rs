@@ -207,7 +207,7 @@ fn recursively_indexes_an_approved_root_and_removes_it_after_disconnect()
         String::from_utf8_lossy(&removed.stderr)
     );
     let removed: Value = serde_json::from_slice(&removed.stdout)?;
-    assert_eq!(removed["path"], root.to_string_lossy().as_ref());
+    assert_eq!(removed["path"], added["root"]["path"]);
     Ok(())
 }
 
