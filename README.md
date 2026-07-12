@@ -101,7 +101,9 @@ before enabling transcript recall or worker control.
 
 ## Documentation
 
-Start at the [handbook](docs/index.md). Its guided paths cover:
+Read the [web documentation](https://session-skein.github.io/session-skein/) or start
+at the repository [handbook](docs/index.md). Both render the same canonical Markdown.
+Its guided paths cover:
 
 - [installation and Codex setup](INSTALL.md)
 - [getting started](docs/getting-started.md)

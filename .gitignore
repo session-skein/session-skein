@@ -4,3 +4,5 @@
 *.swp
 *.tmp
 .DS_Store
+/.pages-source/
+/_site/
