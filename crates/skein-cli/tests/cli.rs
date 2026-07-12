@@ -212,6 +212,146 @@ fn recursively_indexes_an_approved_root_and_removes_it_after_disconnect()
 }
 
 #[test]
+fn scoped_index_refreshes_only_the_selected_project_and_rejects_mixed_scope()
+-> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let data = temp.path().join("data");
+    let config = temp.path().join("config");
+    let first = temp.path().join("first-project");
+    let sibling = temp.path().join("sibling-project");
+    for (path, marker) in [(&first, "Selected Comet"), (&sibling, "Sibling Nebula")] {
+        std::fs::create_dir_all(path)?;
+        assert!(
+            Command::new("git")
+                .arg("init")
+                .arg(path)
+                .output()?
+                .status
+                .success()
+        );
+        std::fs::write(path.join("README.md"), format!("# {marker}\n"))?;
+        assert!(
+            skein(&data, &config)
+                .args(["project", "add"])
+                .arg(path)
+                .output()?
+                .status
+                .success()
+        );
+    }
+
+    let output = skein(&data, &config)
+        .args(["index", "--project"])
+        .arg(&first)
+        .args(["--format", "json"])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(report["scope"]["kind"], "project");
+    assert_eq!(report["discovery"].as_array().map(Vec::len), Some(0));
+    assert_eq!(report["refreshed"].as_array().map(Vec::len), Some(1));
+    assert_eq!(report["documents"].as_array().map(Vec::len), Some(1));
+    assert_eq!(report["context"]["status"], "deferred");
+    let sibling_search = skein(&data, &config)
+        .args(["search", "nebula", "--format", "json"])
+        .output()?;
+    let sibling_search: Value = serde_json::from_slice(&sibling_search.stdout)?;
+    assert!(
+        sibling_search["documents"]
+            .as_array()
+            .is_some_and(Vec::is_empty)
+    );
+
+    let mixed = skein(&data, &config)
+        .args(["index", "--project"])
+        .arg(&first)
+        .arg("--scan-root")
+        .arg(temp.path())
+        .output()?;
+    assert!(!mixed.status.success());
+    Ok(())
+}
+
+#[test]
+fn scan_root_scope_isolated_offline_and_unregistered_roots() -> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let data = temp.path().join("data");
+    let config = temp.path().join("config");
+    let selected_root = temp.path().join("selected-root");
+    let other_root = temp.path().join("other-root");
+    let selected = selected_root.join("selected");
+    let other = other_root.join("other");
+    for (root, repository, title) in [
+        (&selected_root, &selected, "Selected Root"),
+        (&other_root, &other, "Other Root"),
+    ] {
+        std::fs::create_dir_all(repository)?;
+        assert!(
+            Command::new("git")
+                .arg("init")
+                .arg(repository)
+                .output()?
+                .status
+                .success()
+        );
+        std::fs::write(repository.join("README.md"), format!("# {title}\n"))?;
+        assert!(
+            skein(&data, &config)
+                .args(["scan-root", "add"])
+                .arg(root)
+                .args(["--recursive"])
+                .output()?
+                .status
+                .success()
+        );
+    }
+
+    let scoped = skein(&data, &config)
+        .args(["index", "--scan-root"])
+        .arg(&selected_root)
+        .args(["--format", "json"])
+        .output()?;
+    assert!(scoped.status.success());
+    let scoped: Value = serde_json::from_slice(&scoped.stdout)?;
+    assert_eq!(scoped["discovery"].as_array().map(Vec::len), Some(1));
+    assert_eq!(scoped["documents"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        scoped["documents"][0]["projectPath"],
+        std::fs::canonicalize(&selected)?.to_string_lossy().as_ref()
+    );
+
+    let unregistered = temp.path().join("unregistered");
+    std::fs::create_dir_all(unregistered.join("hidden/.git"))?;
+    let rejected = skein(&data, &config)
+        .args(["index", "--scan-root"])
+        .arg(&unregistered)
+        .output()?;
+    assert!(!rejected.status.success());
+
+    let offline_path = selected_root.clone();
+    std::fs::rename(&selected_root, temp.path().join("offline-root"))?;
+    let offline = skein(&data, &config)
+        .args(["index", "--scan-root"])
+        .arg(&offline_path)
+        .args(["--format", "json"])
+        .output()?;
+    assert!(
+        offline.status.success(),
+        "{}",
+        String::from_utf8_lossy(&offline.stderr)
+    );
+    let offline: Value = serde_json::from_slice(&offline.stdout)?;
+    assert_eq!(offline["discovery"][0]["unreachable"], true);
+    assert_eq!(offline["deferred"][0]["cachedProjectsRetained"], true);
+    assert_eq!(offline["documents"].as_array().map(Vec::len), Some(1));
+    Ok(())
+}
+
+#[test]
 fn tui_rejects_non_interactive_stdio_without_creating_state() -> Result<(), Box<dyn Error>> {
     let temp = tempfile::tempdir()?;
     let data = temp.path().join("data");
@@ -301,6 +441,18 @@ fn mcp_stdio_lists_legacy_tools_and_calls_read_and_write_paths() -> Result<(), B
         .iter()
         .filter_map(|tool| tool["name"].as_str())
         .collect::<Vec<_>>();
+    let refresh_schema = listed["result"]["tools"]
+        .as_array()
+        .and_then(|tools| tools.iter().find(|tool| tool["name"] == "refresh_index"))
+        .expect("refresh_index schema");
+    assert_eq!(
+        refresh_schema["inputSchema"]["properties"]["project"]["type"],
+        "string"
+    );
+    assert_eq!(
+        refresh_schema["inputSchema"]["properties"]["scan_root"]["type"],
+        "string"
+    );
     for name in [
         "search_projects",
         "get_project",
@@ -370,6 +522,50 @@ fn mcp_stdio_lists_legacy_tools_and_calls_read_and_write_paths() -> Result<(), B
         enabled_private_index["result"]["structuredContent"]["settings"]["includeCodexSessions"],
         true
     );
+
+    let scoped_refresh = mcp_request(
+        &mut stdin,
+        &mut stdout,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 51,
+            "method": "tools/call",
+            "params": {
+                "name": "refresh_index",
+                "arguments": {"project": first}
+            }
+        }),
+    )?;
+    assert_eq!(scoped_refresh["result"]["isError"], false);
+    assert_eq!(
+        scoped_refresh["result"]["structuredContent"]["scope"]["kind"],
+        "project"
+    );
+    assert_eq!(
+        scoped_refresh["result"]["structuredContent"]["reports"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(
+        scoped_refresh["result"]["structuredContent"]["sessions"]["status"],
+        "deferred"
+    );
+
+    let mixed_refresh = mcp_request(
+        &mut stdin,
+        &mut stdout,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 52,
+            "method": "tools/call",
+            "params": {
+                "name": "refresh_index",
+                "arguments": {"project": first, "scan_root": second}
+            }
+        }),
+    )?;
+    assert_eq!(mixed_refresh["result"]["isError"], true);
 
     let removed = mcp_request(
         &mut stdin,

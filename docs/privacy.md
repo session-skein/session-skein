@@ -103,6 +103,12 @@ raw rollout transcripts. `refresh_index` may read enabled context sources, and
 model context. Codex may send that context to OpenAI or another configured provider;
 Session Skein itself performs no such network request.
 
+Scoped `refresh_index` calls never broaden filesystem authority: an exact project
+selector performs no traversal, and a scan-root selector traverses only the matching
+configured policy. Both selectors are validated before traversal. Context and session
+sources retain their global atomic replacement boundary and are deferred during a
+scoped refresh rather than partially replaced.
+
 The legacy `set_codex_memory_indexing` and `set_codex_session_indexing` tool names map
 to durable explicit gates. Both are disabled by default. Raw-session recall requires
 an approved scan root and admits only bounded user/assistant message text; disabling

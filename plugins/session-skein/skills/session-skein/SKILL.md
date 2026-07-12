@@ -30,6 +30,10 @@ its database, matching, or worker logic in the skill.
 3. Register an exact repository when one is enough. Add a recursive scan root only
    after the user explicitly requests recursion; keep the depth bounded.
 4. Refresh the index, then search. Do not guess a project from recency alone.
+   Prefer `refresh_index {"project":"/exact/repository"}` when one registered
+   project is enough, or `refresh_index {"scan_root":"/approved/root"}` when only
+   one configured root should be traversed. Never pass both selectors. Scoped calls
+   intentionally defer the global context and session sources.
 
 ## Recover before starting duplicate work
 

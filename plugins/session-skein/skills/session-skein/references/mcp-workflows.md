@@ -7,7 +7,10 @@
    - `add_project {"path":"/explicit/repository"}`; or
    - `add_scan_root {"path":"/explicit/workspace","recursive":true,"max_depth":16}`
      only with recursive authorization.
-3. `refresh_index {}`.
+3. Refresh the narrowest useful scope: `refresh_index {"project":"/explicit/repository"}`
+   or `refresh_index {"scan_root":"/explicit/workspace"}`. Use `refresh_index {}`
+   only when global context/session synchronization and every configured root are
+   intended. The selectors are mutually exclusive.
 4. `sync_codex_sessions {}` when a full bounded session pass is useful.
 
 ## Find prior work

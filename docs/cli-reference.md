@@ -35,7 +35,7 @@ skein
 │   ├── add PATH [--recursive [--max-depth 0..64]]
 │   ├── list
 │   └── remove PATH
-├── index [--working-tree] [--force]
+├── index [--project PATH | --scan-root PATH] [--working-tree] [--force]
 ├── search QUERY... [--limit 1..50] [--include-session-text]
 ├── context
 │   ├── status

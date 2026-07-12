@@ -261,7 +261,7 @@ CREATE INDEX sessions_source_updated
 CREATE INDEX sessions_source_session
     ON sessions(source_kind, source_session_id);";
 
-const PROJECT_SELECT: &str = "SELECT p.id, p.name, p.path, p.updated_at,
+pub(crate) const PROJECT_SELECT: &str = "SELECT p.id, p.name, p.path, p.updated_at,
             m.refreshed_at, m.vcs_kind, m.head_ref, m.head_oid,
             m.last_commit_at, m.last_commit_subject, m.tracked_dirty
      FROM projects p

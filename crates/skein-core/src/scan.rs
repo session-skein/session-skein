@@ -14,6 +14,7 @@ use crate::Project;
 use crate::Registry;
 use crate::Result;
 use crate::registry::unix_timestamp;
+use crate::registry::{PROJECT_SELECT, project_from_row};
 
 /// Default depth for an explicitly recursive root. The root itself is depth zero.
 pub const DEFAULT_RECURSIVE_MAX_DEPTH: u16 = 16;
@@ -223,6 +224,34 @@ impl Registry {
             .into_iter()
             .map(|root| self.discover_root(root))
             .collect()
+    }
+
+    /// Return projects previously discovered from exactly one registered root.
+    ///
+    /// The root is resolved before any traversal and project membership comes only
+    /// from durable provenance, so cached projects remain available while a root is
+    /// offline.
+    pub fn projects_for_scan_root(&self, path: &Path) -> Result<Vec<Project>> {
+        let normalized = if path.exists() {
+            fs::canonicalize(path).map_err(|source| Error::Io {
+                path: path.to_path_buf(),
+                source,
+            })?
+        } else {
+            canonicalize_existing_ancestor(path)?
+        };
+        let root = self
+            .scan_root_by_path(&normalized)?
+            .ok_or_else(|| Error::ScanRootNotRegistered(normalized.clone()))?;
+        let query = format!(
+            "{PROJECT_SELECT} JOIN scan_root_projects srp ON srp.project_id = p.id
+             WHERE srp.scan_root_id = ?1 ORDER BY p.name COLLATE NOCASE, p.path"
+        );
+        let mut statement = self.connection.prepare(&query)?;
+        statement
+            .query_map([root.id], project_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Error::from)
     }
 
     fn discover_root(&self, root: ScanRoot) -> Result<DiscoveryReport> {
@@ -625,6 +654,43 @@ mod tests {
         let removed = registry.remove_scan_root(&stored.path)?;
         assert_eq!(removed.id, stored.id);
         assert!(registry.list_scan_roots()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn root_project_lookup_is_exact_and_survives_an_offline_root() -> Result<()> {
+        let (temp, registry) = isolated_registry()?;
+        let first_root = temp.path().join("first-root");
+        let second_root = temp.path().join("second-root");
+        let first = first_root.join("first");
+        let second = second_root.join("second");
+        create_repository(&first)?;
+        create_repository(&second)?;
+        for root in [&first_root, &second_root] {
+            registry.add_scan_root(
+                root,
+                ScanRootOptions {
+                    recursive: true,
+                    max_depth: None,
+                },
+            )?;
+            registry.discover_scan_root(root)?;
+        }
+
+        assert_eq!(
+            registry
+                .projects_for_scan_root(&first_root)?
+                .into_iter()
+                .map(|project| project.path)
+                .collect::<Vec<_>>(),
+            vec![canonical(&first)?]
+        );
+        let stored_path = canonical(&first_root)?;
+        fs::rename(&first_root, temp.path().join("offline")).map_err(|source| Error::Io {
+            path: first_root,
+            source,
+        })?;
+        assert_eq!(registry.projects_for_scan_root(&stored_path)?.len(), 1);
         Ok(())
     }
 

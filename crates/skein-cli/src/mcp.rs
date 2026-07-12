@@ -290,10 +290,12 @@ fn tool_catalog(allow_control: bool) -> Vec<Tool> {
         ),
         tool(
             "refresh_index",
-            "Discover repositories, refresh bounded Git metadata and project identity documents, synchronize content-free Codex session metadata, and refresh explicitly enabled private context sources.",
+            "Refresh all configured sources, exactly one registered project, or exactly one configured scan root. Project and scan_root are mutually exclusive; scoped refreshes defer global context and session sources.",
             json!({
                 "working_tree": {"type": "boolean", "default": false},
-                "force": {"type": "boolean", "default": false}
+                "force": {"type": "boolean", "default": false},
+                "project": {"type": "string", "minLength": 1},
+                "scan_root": {"type": "string", "minLength": 1}
             }),
             &[],
             false,
@@ -569,6 +571,8 @@ struct RefreshArgs {
     working_tree: bool,
     #[serde(default)]
     force: bool,
+    project: Option<String>,
+    scan_root: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -947,33 +951,28 @@ fn remove_scan_root(paths: &SkeinPaths, args: PathArgs) -> Result<Value, String>
 }
 
 fn refresh_index(paths: &SkeinPaths, args: RefreshArgs) -> Result<Value, String> {
-    let mut registry = Registry::open(paths).map_err(error_string)?;
-    let discovery = registry.discover_all_scan_roots().map_err(error_string)?;
-    let reports = crate::refresh_git_resilient(&registry, args.working_tree, args.force)
-        .map_err(error_string)?;
-    let documents = crate::refresh_documents_resilient(&mut registry).map_err(error_string)?;
-    let codex_home = crate::codex_home(None).map_err(error_string)?;
-    let context = registry
-        .refresh_context_documents(
-            &codex_home,
-            skein_core::ContextDocumentRefreshOptions::default(),
-        )
-        .map_err(error_string)?;
-    let sessions = match crate::sync_codex_catalog_default(paths) {
-        Ok(report) => json!({"ok": true, "report": report}),
-        Err(error) => json!({"ok": false, "error": error.to_string()}),
+    let scope = match (args.project, args.scan_root) {
+        (Some(_), Some(_)) => {
+            return Err("project and scan_root are mutually exclusive".to_owned());
+        }
+        (Some(path), None) => crate::indexing::IndexScope::Project(path.into()),
+        (None, Some(path)) => crate::indexing::IndexScope::ScanRoot(path.into()),
+        (None, None) => crate::indexing::IndexScope::All,
     };
-    Ok(json!({
-        "ok": true,
-        "discovery": discovery,
-        "reports": reports,
-        "documents": documents,
-        "context": context,
-        "sessions": sessions,
-        "repositoryContentScanned": true,
-        "repositoryContentScope": "bounded_identity_documents",
-        "gitFetchPerformed": false
-    }))
+    let report = crate::indexing::refresh_index(paths, scope, args.working_tree, args.force)
+        .map_err(error_string)?;
+    let mut result = serde_json::to_value(report).map_err(error_string)?;
+    let object = result
+        .as_object_mut()
+        .ok_or_else(|| "index report was not an object".to_owned())?;
+    object.insert("ok".to_owned(), json!(true));
+    object.insert("repositoryContentScanned".to_owned(), json!(true));
+    object.insert(
+        "repositoryContentScope".to_owned(),
+        json!("bounded_identity_documents"),
+    );
+    object.insert("gitFetchPerformed".to_owned(), json!(false));
+    Ok(result)
 }
 
 async fn refresh_activity(paths: &SkeinPaths, args: RefreshActivityArgs) -> Result<Value, String> {
