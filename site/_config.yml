@@ -1,0 +1,14 @@
+title: Session Skein
+description: Local-first project, session, recall, and Codex worker orchestration
+url: https://session-skein.github.io
+baseurl: /session-skein
+repository: session-skein/session-skein
+markdown: kramdown
+strict_front_matter: true
+plugins:
+  - jekyll-relative-links
+relative_links:
+  enabled: true
+  collections: true
+exclude:
+  - README.md

@@ -1,0 +1,42 @@
+- title: Start
+  links:
+    - label: Overview
+      url: /
+    - label: Installation
+      url: /INSTALL.html
+    - label: Quickstart
+      url: /docs/getting-started.html
+    - label: Update and uninstall
+      url: /docs/maintenance.html
+- title: Understand
+  links:
+    - label: Core concepts
+      url: /docs/concepts.html
+    - label: Privacy
+      url: /docs/privacy.html
+    - label: Architecture
+      url: /docs/architecture.html
+    - label: Indexing and search
+      url: /docs/indexing-and-search.html
+- title: Operate
+  links:
+    - label: CLI reference
+      url: /docs/cli-reference.html
+    - label: MCP and Codex
+      url: /docs/mcp.html
+    - label: Conductor
+      url: /docs/conductor.html
+    - label: TUI
+      url: /docs/tui.html
+    - label: Troubleshooting
+      url: /docs/troubleshooting.html
+- title: Project
+  links:
+    - label: Releases
+      url: /docs/releases.html
+    - label: Security
+      url: /SECURITY.html
+    - label: Contributing
+      url: /CONTRIBUTING.html
+    - label: Changelog
+      url: /CHANGELOG.html

@@ -63,6 +63,34 @@ fn handbook_has_required_entry_points() {
 }
 
 #[test]
+fn pages_site_reuses_canonical_markdown_and_deploys_only_from_main() {
+    let root = repo_root();
+    for path in [
+        "site/index.md",
+        "site/_config.yml",
+        "site/_data/navigation.yml",
+        "site/_layouts/default.html",
+        "site/assets/site.css",
+        "scripts/stage-pages.py",
+        "scripts/check-pages-links.py",
+        ".github/workflows/pages.yml",
+    ] {
+        assert!(root.join(path).is_file(), "missing Pages contract: {path}");
+    }
+    let stage = read(root.join("scripts/stage-pages.py"));
+    assert!(stage.contains(".rglob(\"*.md\")"));
+    assert!(stage.contains("canonical_source"));
+    let workflow = read(root.join(".github/workflows/pages.yml"));
+    assert!(workflow.contains("pull_request:"));
+    assert!(workflow.contains("github.event_name != 'pull_request'"));
+    assert!(workflow.contains("github.ref == 'refs/heads/main'"));
+    assert!(workflow.contains("pages: write"));
+    assert!(workflow.contains("id-token: write"));
+    assert!(workflow.contains("permissions:\n  contents: read"));
+    assert!(workflow.contains("scripts/check-pages-links.py _site"));
+}
+
+#[test]
 fn local_markdown_links_resolve() {
     let root = repo_root();
     let mut markdown = Vec::new();
@@ -93,7 +121,12 @@ fn local_markdown_links_resolve() {
                 if path_part.is_empty() {
                     continue;
                 }
-                let target = file.parent().expect("markdown parent").join(path_part);
+                let parent = if file.starts_with(root.join("site")) {
+                    root.as_path()
+                } else {
+                    file.parent().expect("markdown parent")
+                };
+                let target = parent.join(path_part);
                 if !target.exists() {
                     failures.push(format!(
                         "{}:{} -> {}",
