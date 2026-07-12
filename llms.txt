@@ -1,0 +1,52 @@
+# Session Skein
+
+> A fast, local-first control plane for Codex CLI projects, sessions, recall, and
+> audited reconnectable workers.
+
+Session Skein uses the locally installed Codex CLI and its existing ChatGPT
+authentication. It requires no API key, daemon, systemd unit, tmux server, or Agent
+Deck installation. Private state lives in a per-user SQLite database.
+
+## Install this repository
+
+- Read [INSTALL.md](INSTALL.md) completely; it is the normative human/agent contract.
+- Linux/macOS catalog profile: `./install.sh`
+- Linux/macOS control profile: `./install.sh --control`
+- Windows catalog profile: `./install.ps1`
+- Windows control profile: `./install.ps1 -Control`
+- Verify `skein --version`, `skein doctor`, the `session-skein` MCP registration,
+  and the skill path under the active `CODEX_HOME`.
+- Installation must not add scan roots, enable transcript/memory recall, or start a
+  Codex worker without separate user intent.
+
+## Documentation map
+
+- [Handbook home](docs/index.md)
+- [Getting started](docs/getting-started.md)
+- [Concepts and glossary](docs/concepts.md)
+- [Codebase map](docs/codebase-map.md)
+- [Indexing and search](docs/indexing-and-search.md)
+- [CLI reference](docs/cli-reference.md)
+- [MCP setup](docs/mcp.md)
+- [MCP tool reference](docs/mcp-reference.md)
+- [State and configuration](docs/state-and-configuration.md)
+- [Privacy](docs/privacy.md)
+- [Maintenance](docs/maintenance.md)
+- [Troubleshooting](docs/troubleshooting.md)
+- [Architecture](docs/architecture.md)
+- [Roadmap](ROADMAP.md)
+
+## Source map
+
+- `crates/skein-core`: durable domain model, SQLite, indexing, matching, control,
+  worker fencing, and conductor policy.
+- `crates/skein-codex`: Codex app-server protocol adapter.
+- `crates/skein-cli`: CLI, human/JSON output, Ratatui TUI, MCP server, and worker
+  process/IPC runtime.
+- `plugins/session-skein`: distributable Codex plugin and workflow skill.
+
+## Development contract
+
+Read [AGENTS.md](AGENTS.md) and [CONTRIBUTING.md](CONTRIBUTING.md). Keep observation
+separate from control; use only synthetic public fixtures; run formatting, strict
+Clippy, all-feature tests, release build, and RustSec audit.

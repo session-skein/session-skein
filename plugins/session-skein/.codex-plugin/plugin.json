@@ -1,0 +1,40 @@
+{
+  "name": "session-skein",
+  "version": "0.5.0-alpha.7",
+  "description": "Local Codex project, session, recall, and audited worker conductor",
+  "author": {
+    "name": "Session Skein contributors",
+    "url": "https://github.com/session-skein"
+  },
+  "homepage": "https://github.com/session-skein/session-skein",
+  "repository": "https://github.com/session-skein/session-skein",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "conductor",
+    "sessions",
+    "projects",
+    "mcp"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Session Skein",
+    "shortDescription": "Route and control local Codex work",
+    "longDescription": "Catalog local projects and Codex sessions and search bounded project context. Use a separately explicit control-enabled MCP profile for audited workers.",
+    "developerName": "Session Skein contributors",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/session-skein/session-skein",
+    "privacyPolicyURL": "https://github.com/session-skein/session-skein/blob/main/docs/privacy.md",
+    "defaultPrompt": [
+      "Find the right project for this task.",
+      "Show my active Codex runs.",
+      "Conduct this task in the correct project."
+    ]
+  }
+}

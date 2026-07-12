@@ -14,7 +14,9 @@ personal or proprietary information.
 - Project-document recall is explicit through registered projects and `index`; it
   stores bounded identity-file text privately and never follows symlinks.
 - Raw transcripts remain source-owned unless a user explicitly enables bounded
-  user/assistant recall beneath an approved root.
+  user/assistant recall beneath an approved root. The observed cwd must be an
+  existing directory and both cwd and root are canonicalized, rejecting missing
+  paths, non-directories, and symlink escapes.
 - Exports are opt-in, inspectable, and redacted before publication.
 - Diagnostics must describe locations and health without dumping content.
 - Tests use synthetic names and temporary paths.
@@ -55,6 +57,9 @@ personal or proprietary information.
   prompts, commands, diffs, or agent prose present inside a memory or user/assistant
   message. Storage is bounded and owner-private; disabling a source and refreshing
   deletes that source's indexed rows.
+- Generated-memory project attribution uses conservative path/cwd evidence and the
+  longest registered-project match. Conflicting references remain unmapped, and
+  memory text never grants raw-session authorization.
 
 Session Skein performs no telemetry and has no external network client. Its worker IPC
 is IPv4 loopback-only, its app-server transport is local, and it stores no Codex

@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+state="${FAKE_CODEX_STATE:?FAKE_CODEX_STATE is required}"
+
+if [ "${1:-}" != "mcp" ]; then
+  printf 'fake codex supports only mcp\n' >&2
+  exit 2
+fi
+shift
+
+case "${1:-}" in
+  get)
+    [ "${2:-}" = "session-skein" ] || exit 2
+    if [ "${FAKE_CODEX_FAIL_GET:-0}" = "1" ]; then
+      exit 1
+    fi
+    if [ -f "$state.fail-get-once" ]; then
+      rm -f "$state.fail-get-once"
+      exit 1
+    fi
+    [ -f "$state" ] || exit 1
+    cat "$state"
+    ;;
+  remove)
+    [ "${2:-}" = "session-skein" ] || exit 2
+    rm -f "$state"
+    ;;
+  add)
+    [ "${2:-}" = "session-skein" ] || exit 2
+    [ "${FAKE_CODEX_FAIL_ADD:-}" != "before" ] || exit 1
+    shift 2
+    while [ "${1:-}" != "--" ]; do
+      case "${1:-}" in
+        --env) shift 2 ;;
+        *) exit 2 ;;
+      esac
+    done
+    [ "${1:-}" = "--" ] || exit 2
+    shift
+    command_path="${1:?missing MCP command}"
+    shift
+    mkdir -p "$(dirname -- "$state")"
+    args='["mcp"]'
+    if [ "${2:-}" = "--allow-control" ] || [ "${1:-}" = "--allow-control" ]; then
+      args='["mcp","--allow-control"]'
+    fi
+    cat > "$state" <<EOF
+{"name":"session-skein","transport":{"type":"stdio","command":"$command_path","args":$args}}
+EOF
+    [ "${FAKE_CODEX_FAIL_VERIFY:-0}" != "1" ] || touch "$state.fail-get-once"
+    [ "${FAKE_CODEX_FAIL_ADD:-}" != "after" ] || exit 1
+    ;;
+  *)
+    printf 'unsupported fake codex mcp command: %s\n' "${1:-}" >&2
+    exit 2
+    ;;
+esac

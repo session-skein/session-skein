@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "session-skein": {
+      "title": "Session Skein",
+      "description": "Search local Codex projects and sessions, then operate audited workers.",
+      "command": "skein",
+      "args": [
+        "mcp"
+      ],
+      "startup_timeout_sec": 10,
+      "tool_timeout_sec": 120
+    }
+  }
+}

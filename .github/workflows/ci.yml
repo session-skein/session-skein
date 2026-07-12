@@ -28,7 +28,11 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --all-features
-      - run: cargo build --workspace --release
+      - run: cargo build --workspace --release --locked
+      - run: bash -n install.sh
+      - run: ./install.sh --help
+      - name: Test installer lifecycle and collision safety
+        run: tests/install/unix-installer.sh target/release/skein
 
   security-audit:
     name: RustSec audit
@@ -58,3 +62,15 @@ jobs:
           toolchain: 1.95.0
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo test --workspace --all-features
+      - if: runner.os != 'Windows'
+        run: bash -n install.sh && ./install.sh --help
+      - if: runner.os != 'Windows'
+        name: Smoke-test isolated Unix installer lifecycle
+        run: tests/install/unix-installer.sh target/debug/skein
+      - if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./install.ps1 -Help
+      - if: runner.os == 'Windows'
+        name: Smoke-test isolated Windows installer lifecycle
+        shell: pwsh
+        run: ./tests/install/windows-installer.ps1 -Binary target/debug/skein.exe

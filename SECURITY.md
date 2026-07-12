@@ -1,7 +1,8 @@
 # Security policy
 
 Session Skein is pre-release software and should not yet be treated as a security
-boundary. Do not expose its state database or future control endpoints to a network.
+boundary. Do not expose its state database, worker capability files, authenticated
+loopback IPC, or MCP stdio transport to a network or another user.
 
 Please report suspected vulnerabilities privately through GitHub's security advisory
 feature once the canonical repository is published. Do not include real transcripts,

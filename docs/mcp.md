@@ -46,8 +46,8 @@ annotations and model-supplied arguments are not authorization. Register plain
 `conduct` independently requires `full_access_acknowledged=true` and a caller-created
 request UUID. It invokes the same atomic conductor used by the CLI. Reusing a UUID is
 status-only and never replays prompt content. Prompt-bearing `steer_run` also requires
-its caller UUID. Read-only `reconcile_run` requires a caller UUID as well so a lost
-response can be retried without inventing a new operation identity.
+its caller UUID. `reconcile_run` requires a caller UUID as well so its durable
+evidence/state update can be retried without inventing a new operation identity.
 
 ## Native tools
 
@@ -57,6 +57,7 @@ Read-only catalog and recovery tools:
 - `get_project`
 - `suggest_codex_command`
 - `list_projects`
+- `list_scan_roots`
 - `list_sessions`
 - `list_runs`
 - `get_run`
@@ -67,7 +68,11 @@ Read-only catalog and recovery tools:
 
 Explicit writes and control:
 
+- `set_codex_memory_indexing`
+- `set_codex_session_indexing`
 - `add_project`
+- `add_scan_root`
+- `remove_scan_root`
 - `refresh_index`
 - `refresh_activity`
 - `sync_codex_sessions`
@@ -79,6 +84,9 @@ Explicit writes and control:
 All MCP results are structured JSON. Session and run results are content-free or
 redaction-safe. Live answer text, commands, diffs, approval payloads, and MCP payloads
 remain Codex-owned.
+
+See the [complete MCP reference](mcp-reference.md) for every argument, default,
+bound, annotation, privacy gate, and retry contract.
 
 ## Codex Brain compatibility
 

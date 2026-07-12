@@ -24,14 +24,14 @@ Versioned SQLite state + Codex-owned transcripts
   dependency.
 - Optional adapters read source data incrementally and preserve provenance without
   owning core state.
-- Future control operations will be separate from observation and require an
-  explicit policy decision.
+- Control operations remain separate from observation and require an explicit
+  capability and per-operation policy decision.
 - Matching and activity views are ephemeral projections over durable metadata. They
   persist neither the private query nor generated prose and cannot dispatch work.
 
 ## Control state
 
-Schema version 7 keeps control intent separate from imported sessions. Immutable
+The versioned schema keeps control intent separate from imported sessions. Immutable
 policy snapshots record the exact authority acknowledged for a run. Skein-owned runs,
 turns, actions, and append-only events are committed before app-server mutations.
 Observed session status never drives the control state machine.
@@ -61,8 +61,9 @@ exact-run interruption use the fenced worker API. Dispatch invokes the current
 `skein conduct` executable with a private stdin prompt, a stable request UUID, and a
 strictly bounded one-response JSON protocol. Invalid or lost child output is
 reconciled from durable content-free state and never causes prompt replay.
-One startup worker performs configured scan-root, Git, and bounded document refresh
-away from the render loop, then requests a fresh read-only catalog snapshot.
+One startup worker performs configured scan-root, Git, bounded document, enabled
+context, and content-free Codex session refresh away from the render loop, then
+requests a fresh read-only catalog snapshot.
 
 The MCP server is another presentation/controller adapter over the same boundaries.
 Codex starts `skein mcp` on demand over stdio; no listener, daemon, token, or extra
@@ -110,8 +111,10 @@ relative paths.
 
 `skein-codex` is isolated from the core state model. It launches the locally installed
 Codex app-server over stdio, performs the documented initialize handshake, and makes
-one bounded `thread/list` request. It does not parse Codex's private rollout JSONL
-format and does not persist preview results.
+bounded `thread/list` requests. Preview reads one page; explicit synchronization may
+follow opaque cursors within page and thread caps. It does not parse Codex's private
+rollout JSONL format unless the caller opts into Codex's repair mode, and preview does
+not persist results.
 
 An explicit session sync converts a bounded preview page into source-neutral durable
 metadata. It stores the Codex thread identity and chronology, observed cwd, last
@@ -140,3 +143,6 @@ avoids that I/O rather than relying on language speed to hide it.
 Source adapters are subordinate compatibility modules. Product identity and core
 types do not use another product's name. The project will prefer documented formats
 and commands, tolerate missing tools, and surface adapter versions in diagnostics.
+
+See the [codebase map](codebase-map.md) for module ownership, end-to-end sequence
+diagrams, and guided source paths.
