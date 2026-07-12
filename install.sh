@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 
 # Session Skein installer for Linux and macOS.
-# It builds one source revision, preflights every destination, and records hashes so
+# It verifies one published release or builds an explicit source revision, preflights
+# every destination, and records hashes so
 # uninstall never deletes a user-replaced binary or integration.
 
 set -euo pipefail
@@ -9,6 +10,8 @@ umask 077
 
 ORIGINAL_ARGS=("$@")
 REPO_URL="${SKEIN_REPO_URL:-https://github.com/session-skein/session-skein.git}"
+RELEASE_BASE_URL="${SKEIN_RELEASE_BASE_URL:-https://github.com/session-skein/session-skein/releases/download}"
+RELEASE_CHANNEL_URL="${SKEIN_RELEASE_CHANNEL_URL:-https://raw.githubusercontent.com/session-skein/session-skein/main/release-channels}"
 PROFILE="catalog"
 PROFILE_FLAGS=0
 BINARY_SOURCE=""
@@ -21,6 +24,17 @@ REPLACE_MCP=0
 REPLACE_SKILL=0
 UPDATE=0
 UNINSTALL=0
+RELEASE_VERSION=""
+RELEASE_CHANNEL="preview"
+RESOLVED_FROM_CHANNEL=0
+DOWNLOAD_DIR=""
+
+cleanup() {
+  if [ -n "$DOWNLOAD_DIR" ] && [ -d "$DOWNLOAD_DIR" ]; then
+    rm -rf -- "$DOWNLOAD_DIR"
+  fi
+}
+trap cleanup EXIT HUP INT TERM
 
 usage() {
   cat <<'USAGE'
@@ -35,19 +49,23 @@ Options:
   --catalog-only     Register read/catalog MCP tools only (default)
   --control          Expose audited conduct, steer, interrupt, and reconcile tools
   --binary PATH      Install an already-built skein executable
-  --source PATH      Build and install a Session Skein checkout
+  --source PATH      Explicitly build and install a Session Skein checkout
+  --version VERSION  Install one exact published version
+  --channel preview  Resolve the newest approved preview (default)
   --bin-dir PATH     Install the executable here (default: ~/.local/bin)
   --replace-binary   Back up and replace an unowned destination binary
   --no-mcp           Do not change MCP configuration
   --no-skill         Do not change the Codex skill
   --replace-mcp      Replace a conflicting MCP entry (a JSON backup is retained)
   --replace-skill    Back up and replace a conflicting skill path
-  --update           Fast-forward the managed checkout and re-run its new installer
+  --update           Update an explicit Git source checkout and reinstall
   --uninstall        Remove only hash/target-matched installer-owned integration
   -h, --help         Show this help
 
 Environment:
   SKEIN_REPO_URL       Override the Git clone URL
+  SKEIN_RELEASE_BASE_URL    Override the release asset base (testing/mirror only)
+  SKEIN_RELEASE_CHANNEL_URL Override the channel-file base (testing/mirror only)
   SKEIN_INSTALL_SOURCE Override the managed checkout path
   SKEIN_BIN_DIR        Override the default binary directory
   CODEX_HOME           Override the Codex home (default: ~/.codex)
@@ -86,6 +104,16 @@ while [ "$#" -gt 0 ]; do
       SOURCE_OVERRIDE="$2"
       shift
       ;;
+    --version)
+      [ "$#" -ge 2 ] || die "--version requires a version"
+      RELEASE_VERSION="$2"
+      shift
+      ;;
+    --channel)
+      [ "$#" -ge 2 ] || die "--channel requires a name"
+      RELEASE_CHANNEL="$2"
+      shift
+      ;;
     --bin-dir)
       [ "$#" -ge 2 ] || die "--bin-dir requires a path"
       BIN_DIR="$2"
@@ -107,6 +135,11 @@ done
 [ "$PROFILE_FLAGS" -le 1 ] || die "choose either --catalog-only or --control"
 [ -z "$BINARY_SOURCE" ] || [ -z "$SOURCE_OVERRIDE" ] || \
   die "--binary and --source are mutually exclusive"
+[ -z "$BINARY_SOURCE" ] || [ -z "$RELEASE_VERSION" ] || \
+  die "--binary and --version are mutually exclusive"
+[ -z "$SOURCE_OVERRIDE" ] || [ -z "$RELEASE_VERSION" ] || \
+  die "--source and --version are mutually exclusive"
+[ "$RELEASE_CHANNEL" = "preview" ] || die "unsupported channel: $RELEASE_CHANNEL (expected preview)"
 
 CODEX_HOME_DIR="${CODEX_HOME:-$HOME/.codex}"
 INSTALL_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/session-skein/install"
@@ -122,6 +155,8 @@ MANAGED_SOURCE="${SKEIN_INSTALL_SOURCE:-${XDG_DATA_HOME:-$HOME/.local/share}/ses
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P || true)"
 SOURCE_DIR=""
 SOURCE_COMMIT=""
+SOURCE_RECEIPT=""
+PLUGIN_DIR=""
 INSTALLED_BINARY="$BIN_DIR/skein"
 
 receipt_value() {
@@ -295,17 +330,123 @@ resolve_source() {
 
   [ -f "$SOURCE_DIR/plugins/session-skein/skills/session-skein/SKILL.md" ] || \
     die "source is missing the bundled Session Skein skill: $SOURCE_DIR"
+  PLUGIN_DIR="$SOURCE_DIR/plugins/session-skein"
   if [ -d "$SOURCE_DIR/.git" ]; then
     SOURCE_COMMIT="$(git -C "$SOURCE_DIR" rev-parse HEAD 2>/dev/null || true)"
   fi
 }
 
-NEED_SOURCE=0
-[ -z "$BINARY_SOURCE" ] && NEED_SOURCE=1
-[ "$NO_SKILL" -eq 0 ] && NEED_SOURCE=1
-[ "$UPDATE" -eq 1 ] && NEED_SOURCE=1
-if [ "$NEED_SOURCE" -eq 1 ]; then
+detect_release_target() {
+  os="$(uname -s 2>/dev/null || true)"
+  arch="$(uname -m 2>/dev/null || true)"
+  case "$os:$arch" in
+    Linux:x86_64|Linux:amd64) printf '%s\n' x86_64-unknown-linux-gnu ;;
+    Darwin:x86_64|Darwin:amd64) printf '%s\n' x86_64-apple-darwin ;;
+    Darwin:arm64|Darwin:aarch64) printf '%s\n' aarch64-apple-darwin ;;
+    *) die "unsupported release platform: ${os:-unknown}/${arch:-unknown}; supported: Linux x86_64, macOS x86_64, macOS arm64" ;;
+  esac
+}
+
+download_file() {
+  url="$1"
+  destination="$2"
+  command -v curl >/dev/null 2>&1 || die "curl is required for binary installation"
+  case "$url" in
+    https://*) curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-all-errors \
+      "$url" -o "$destination" || die "download failed: $url" ;;
+    *) [ "${SKEIN_ALLOW_INSECURE_TEST_DOWNLOADS:-0}" = "1" ] || \
+         die "refusing non-HTTPS release URL: $url"
+       curl -fsSL "$url" -o "$destination" || die "download failed: $url" ;;
+  esac
+}
+
+resolve_release() {
+  target="$(detect_release_target)"
+  command -v tar >/dev/null 2>&1 || die "tar is required for binary installation"
+  DOWNLOAD_DIR="$(mktemp -d)"
+  if [ -z "$RELEASE_VERSION" ]; then
+    channel_file="$DOWNLOAD_DIR/channel"
+    download_file "$RELEASE_CHANNEL_URL/$RELEASE_CHANNEL" "$channel_file"
+    RELEASE_VERSION="$(tr -d '[:space:]' < "$channel_file")"
+    RESOLVED_FROM_CHANNEL=1
+  fi
+  if [[ ! "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+    die "invalid release version: $RELEASE_VERSION"
+  fi
+  [ "$RESOLVED_FROM_CHANNEL" -eq 0 ] || [[ "$RELEASE_VERSION" == *-* ]] || \
+    die "preview channel resolved a non-preview version: $RELEASE_VERSION"
+  tag="v$RELEASE_VERSION"
+  archive="session-skein-$tag-$target.tar.gz"
+  release_url="$RELEASE_BASE_URL/$tag"
+  note "Downloading Session Skein $RELEASE_VERSION for $target"
+  download_file "$release_url/release-manifest.json" "$DOWNLOAD_DIR/release-manifest.json"
+  download_file "$release_url/SHA256SUMS" "$DOWNLOAD_DIR/SHA256SUMS"
+  grep -Eq "\"version\"[[:space:]]*:[[:space:]]*\"$RELEASE_VERSION\"" "$DOWNLOAD_DIR/release-manifest.json" || \
+    die "release manifest version does not match $RELEASE_VERSION"
+  grep -Eq "\"tag\"[[:space:]]*:[[:space:]]*\"$tag\"" "$DOWNLOAD_DIR/release-manifest.json" || \
+    die "release manifest tag does not match $tag"
+  grep -Eq "\"name\"[[:space:]]*:[[:space:]]*\"$archive\"" "$DOWNLOAD_DIR/release-manifest.json" || \
+    die "release manifest does not contain $archive"
+  [ "$(awk -v name="$archive" 'index($0, "\"name\"") && index($0, "\"" name "\"") { count++ } END { print count + 0 }' "$DOWNLOAD_DIR/release-manifest.json")" -eq 1 ] || \
+    die "release manifest does not select exactly one $archive asset"
+  manifest_hash="$(awk -v name="$archive" '
+    index($0, "\"name\"") && index($0, "\"" name "\"") { selected=1 }
+    selected && index($0, "\"sha256\"") {
+      value=$0
+      sub(/^.*"sha256"[[:space:]]*:[[:space:]]*"/, "", value)
+      sub(/".*/, "", value)
+      print value
+      exit
+    }
+    selected && index($0, "}") { exit }
+  ' "$DOWNLOAD_DIR/release-manifest.json")"
+  expected_hash="$(awk -v name="$archive" '$2 == name { print $1 }' "$DOWNLOAD_DIR/SHA256SUMS")"
+  [[ "$expected_hash" =~ ^[0-9a-fA-F]{64}$ ]] || \
+    die "SHA256SUMS does not contain exactly one valid hash for $archive"
+  [ "$(awk -v name="$archive" '$2 == name { count++ } END { print count + 0 }' "$DOWNLOAD_DIR/SHA256SUMS")" -eq 1 ] || \
+    die "SHA256SUMS contains duplicate entries for $archive"
+  [ "$(printf '%s' "$manifest_hash" | tr 'A-F' 'a-f')" = "$(printf '%s' "$expected_hash" | tr 'A-F' 'a-f')" ] || \
+    die "release manifest and SHA256SUMS disagree for $archive"
+  download_file "$release_url/$archive" "$DOWNLOAD_DIR/$archive"
+  [ "$(sha256_file "$DOWNLOAD_DIR/$archive")" = "$(printf '%s' "$expected_hash" | tr 'A-F' 'a-f')" ] || \
+    die "checksum verification failed for $archive"
+
+  while IFS= read -r entry; do
+    case "$entry" in
+      /*|../*|*/../*|*/..) die "release archive contains an unsafe path: $entry" ;;
+    esac
+  done < <(tar -tzf "$DOWNLOAD_DIR/$archive")
+  if tar -tvzf "$DOWNLOAD_DIR/$archive" | awk 'substr($1,1,1) != "-" && substr($1,1,1) != "d" { found=1 } END { exit !found }'; then
+    die "release archive contains a link or special-file entry"
+  fi
+  tar -xzf "$DOWNLOAD_DIR/$archive" -C "$DOWNLOAD_DIR"
+  SOURCE_DIR="$DOWNLOAD_DIR/session-skein-$tag-$target"
+  [ -d "$SOURCE_DIR" ] || die "release archive has no expected top-level directory"
+  [ ! -L "$SOURCE_DIR/skein" ] && [ -f "$SOURCE_DIR/skein" ] || die "release archive has no regular skein executable"
+  [ -f "$SOURCE_DIR/plugin/.codex-plugin/plugin.json" ] || die "release archive has no plugin metadata"
+  [ -f "$SOURCE_DIR/plugin/skills/session-skein/SKILL.md" ] || die "release archive has no bundled skill"
+  if find "$SOURCE_DIR" -type l -print -quit | grep -q .; then
+    die "release archive extracted a symbolic link"
+  fi
+  sed -n 's/^[[:space:]]*"version":[[:space:]]*"\([^"]*\)".*/\1/p' \
+    "$SOURCE_DIR/release-package.json" | grep -Fxq "$RELEASE_VERSION" || \
+    die "release package version does not match $RELEASE_VERSION"
+  grep -Eq "\"target\"[[:space:]]*:[[:space:]]*\"$target\"" "$SOURCE_DIR/release-package.json" || \
+    die "release package target does not match $target"
+  BINARY_SOURCE="$SOURCE_DIR/skein"
+  PLUGIN_DIR="$SOURCE_DIR/plugin"
+  chmod 0755 "$BINARY_SOURCE"
+  SOURCE_RECEIPT="release:$tag:$target"
+}
+
+if [ -n "$SOURCE_OVERRIDE" ] || [ "$UPDATE" -eq 1 ]; then
   resolve_source
+  SOURCE_RECEIPT="$SOURCE_DIR"
+elif [ -z "$BINARY_SOURCE" ]; then
+  resolve_release
+elif [ "$NO_SKILL" -eq 0 ]; then
+  resolve_source
+  SOURCE_RECEIPT="$SOURCE_DIR"
 fi
 
 if [ -z "$BINARY_SOURCE" ]; then
@@ -339,6 +480,8 @@ if [[ "$VERSION_OUTPUT" =~ ^skein\ ([0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?)
 else
   die "--binary did not identify itself as 'skein VERSION'"
 fi
+[ -z "$RELEASE_VERSION" ] || [ "$ACTUAL_VERSION" = "$RELEASE_VERSION" ] || \
+  die "downloaded binary reports $ACTUAL_VERSION, expected $RELEASE_VERSION"
 VALIDATION_DIR="$(mktemp -d)"
 DOCTOR_JSON="$(SKEIN_CONFIG_DIR="$VALIDATION_DIR/config" \
   SKEIN_DATA_DIR="$VALIDATION_DIR/data" "$BINARY_SOURCE" --format json doctor 2>/dev/null || true)"
@@ -354,7 +497,7 @@ done
 
 if [ -n "$SOURCE_DIR" ] && [ "$NO_SKILL" -eq 0 ]; then
   SKILL_VERSION="$(sed -n 's/^[[:space:]]*"version":[[:space:]]*"\([^"]*\)".*/\1/p' \
-    "$SOURCE_DIR/plugins/session-skein/.codex-plugin/plugin.json" | head -n 1)"
+    "$PLUGIN_DIR/.codex-plugin/plugin.json" | head -n 1)"
   [ "$SKILL_VERSION" = "$ACTUAL_VERSION" ] || \
     die "binary $ACTUAL_VERSION and bundled skill/plugin $SKILL_VERSION do not match"
 fi
@@ -387,7 +530,7 @@ SKILL_SOURCE="$PREVIOUS_SKILL_SOURCE"
 SKILL_BACKUP="$PREVIOUS_SKILL_BACKUP"
 SKILL_ACTION="none"
 if [ "$NO_SKILL" -eq 0 ]; then
-  DESIRED_SKILL_ORIGIN="$SOURCE_DIR/plugins/session-skein/skills/session-skein"
+  DESIRED_SKILL_ORIGIN="$PLUGIN_DIR/skills/session-skein"
   DESIRED_SKILL_HASH="$(sha256_tree "$DESIRED_SKILL_ORIGIN")"
   DESIRED_SKILL_SOURCE="$SKILL_SNAPSHOT_ROOT/$ACTUAL_VERSION-$DESIRED_SKILL_HASH"
   DESIRED_SKILL_TARGET="$CODEX_HOME_DIR/skills/session-skein"
@@ -527,7 +670,7 @@ version=$ACTUAL_VERSION
 binary=$INSTALLED_BINARY
 binary_hash=$INSTALLED_HASH
 binary_backup=$BINARY_BACKUP
-source=$SOURCE_DIR
+source=${SOURCE_RECEIPT:-$SOURCE_DIR}
 source_commit=$SOURCE_COMMIT
 skill=$SKILL_TARGET
 skill_source=$SKILL_SOURCE

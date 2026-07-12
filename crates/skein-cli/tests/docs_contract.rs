@@ -321,6 +321,8 @@ fn installers_expose_parallel_public_controls() {
         ("--control", "-Control"),
         ("--binary", "-Binary"),
         ("--source", "-Source"),
+        ("--version", "-Version"),
+        ("--channel", "-Channel"),
         ("--bin-dir", "-BinDir"),
         ("--replace-binary", "-ReplaceBinary"),
         ("--no-mcp", "-NoMcp"),
@@ -336,4 +338,46 @@ fn installers_expose_parallel_public_controls() {
             "missing {powershell_option}"
         );
     }
+}
+
+#[test]
+fn binary_first_installers_enforce_release_supply_chain_contract() {
+    let root = repo_root();
+    let shell = read(root.join("install.sh"));
+    let powershell = read(root.join("install.ps1"));
+    let ci = read(root.join(".github/workflows/ci.yml"));
+    let channel = read(root.join("release-channels/preview"));
+    let manifest: Value = serde_json::from_str(&read(
+        root.join("plugins/session-skein/.codex-plugin/plugin.json"),
+    ))
+    .expect("plugin manifest");
+
+    assert_eq!(channel.trim(), manifest["version"]);
+    for target in [
+        "x86_64-unknown-linux-gnu",
+        "x86_64-apple-darwin",
+        "aarch64-apple-darwin",
+    ] {
+        assert!(shell.contains(target), "Unix installer lacks {target}");
+    }
+    assert!(powershell.contains("x86_64-pc-windows-msvc"));
+    for contract in [
+        "release-manifest.json",
+        "SHA256SUMS",
+        "release-package.json",
+    ] {
+        assert!(shell.contains(contract));
+        assert!(powershell.contains(contract));
+    }
+    assert!(shell.contains("checksum verification failed"));
+    assert!(shell.contains("unsafe path"));
+    assert!(powershell.contains("Checksum verification failed"));
+    assert!(powershell.contains("unsafe path"));
+    assert!(
+        !shell.contains("eval "),
+        "installer must not evaluate downloaded text"
+    );
+    assert!(!powershell.contains("Invoke-Expression"));
+    assert!(ci.contains("tests/install/unix-release-installer.sh"));
+    assert!(ci.contains("tests/install/windows-release-installer.ps1"));
 }

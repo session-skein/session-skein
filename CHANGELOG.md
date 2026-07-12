@@ -10,6 +10,9 @@ after its first published release.
 - Added a PR-tested, tag-published preview release pipeline for native Linux x86_64,
   macOS x86_64/arm64, and Windows x86_64 packages with deterministic archives,
   machine-readable manifests, SHA-256 checksums, and GitHub provenance attestations.
+- Added binary-first Linux/macOS and Windows installers with explicit preview-channel
+  or exact-version resolution, canonical release URLs, checksum/manifest enforcement,
+  traversal-safe extraction, bundled-skill installation, and receipt-safe reinstall.
 
 ## [0.5.0-alpha.7]
 

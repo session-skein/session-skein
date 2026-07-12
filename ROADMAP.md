@@ -84,8 +84,8 @@ and a polished TUI only after behavior is observable and safe.
 - [x] Unsigned preview archives for Linux x86_64, macOS x86_64/arm64, and Windows
   x86_64 with deterministic packaging, checksums, manifests, and GitHub provenance.
 - [ ] Sign and notarize macOS releases and Authenticode-sign Windows releases.
-- [ ] Make installers binary-first only after the signed asset/install trust contract
-  is designed; do not silently replace the source-first path.
+- [x] Binary-first Unix and Windows installers with explicit preview-channel/version
+  resolution, checksums, archive safety, bundled skills, and receipt-safe reinstall.
 - [ ] Add an explicit `skein update` flow after signed release selection and rollback
   semantics are defined.
 - [ ] Package-manager distribution after the public command/config surface stabilizes.
