@@ -7,6 +7,8 @@ BINARY="${1:-$REPO_ROOT/target/debug/skein}"
 BINARY="$(CDPATH= cd -- "$(dirname -- "$BINARY")" && pwd -P)/$(basename -- "$BINARY")"
 FAKE_BIN="$REPO_ROOT/tests/fixtures/fake-codex"
 ORIGINAL_PATH="$PATH"
+TRUE_BIN="/usr/bin/true"
+[ -x "$TRUE_BIN" ] || TRUE_BIN="/bin/true"
 ROOT="$(mktemp -d)"
 trap 'rm -rf "$ROOT"' EXIT
 
@@ -46,7 +48,7 @@ test ! -e "$clean/codex/config.toml"
 # An unowned binary is refused before state/skill mutation.
 binary_collision="$ROOT/binary-collision"
 mkdir -p "$binary_collision/bin"
-cp /bin/true "$binary_collision/bin/skein"
+cp "$TRUE_BIN" "$binary_collision/bin/skein"
 if run_install "$binary_collision" "$REPO_ROOT/install.sh" --binary "$BINARY" \
   --bin-dir "$binary_collision/bin" --no-mcp >/dev/null 2>&1; then
   printf 'unowned binary collision unexpectedly succeeded\n' >&2
@@ -64,7 +66,7 @@ test "$(hash_file "$binary_collision/bin/skein")" = "$original_hash"
 
 # A generic successful executable is not accepted as Session Skein.
 identity="$ROOT/identity"
-if run_install "$identity" "$REPO_ROOT/install.sh" --binary /bin/true \
+if run_install "$identity" "$REPO_ROOT/install.sh" --binary "$TRUE_BIN" \
   --bin-dir "$identity/bin" --no-skill --no-mcp >/dev/null 2>&1; then
   printf 'non-Skein binary unexpectedly succeeded\n' >&2
   exit 1
@@ -155,7 +157,7 @@ test ! -e "$changed_home/other-codex/skills/session-skein"
 # Missing installed replacements still restore their user-owned backups.
 missing="$ROOT/missing-replacements"
 mkdir -p "$missing/bin" "$missing/codex/skills/session-skein"
-cp /bin/true "$missing/bin/skein"
+cp "$TRUE_BIN" "$missing/bin/skein"
 touch "$missing/codex/skills/session-skein/user-owned"
 missing_binary_hash="$(hash_file "$missing/bin/skein")"
 run_install "$missing" "$REPO_ROOT/install.sh" --binary "$BINARY" \
@@ -245,7 +247,7 @@ run_install "$update_case" "$REPO_ROOT/install.sh" --uninstall >/dev/null
 modified="$ROOT/modified"
 run_install "$modified" "$REPO_ROOT/install.sh" --binary "$BINARY" \
   --bin-dir "$modified/bin" --no-skill --no-mcp >/dev/null
-cp /bin/true "$modified/bin/skein"
+cp "$TRUE_BIN" "$modified/bin/skein"
 run_install "$modified" "$REPO_ROOT/install.sh" --uninstall >/dev/null
 test -e "$modified/bin/skein"
 test -e "$modified/state/session-skein/install/receipt"
