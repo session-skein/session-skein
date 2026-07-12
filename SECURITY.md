@@ -19,3 +19,9 @@ Preview release assets include SHA-256 checksums and GitHub artifact attestation
 but the executables are not code-signed. macOS builds are not notarized and Windows
 builds do not carry an Authenticode signature. Verify provenance and checksums before
 execution. Platform signing and notarization remain planned work.
+
+The binary-first installers are part of the release supply-chain boundary. Their
+default URLs are pinned to the canonical repository, preview resolution produces an
+exact version before asset download, and archives are verified before extraction.
+Repository/channel URL overrides are intended only for controlled mirrors and tests;
+using one transfers trust to that endpoint.

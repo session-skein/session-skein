@@ -27,26 +27,27 @@ Ask Codex:
 > Install and configure https://github.com/session-skein/session-skein with the
 > control-enabled MCP profile.
 
-Or install directly on Linux/macOS:
+Install the current verified preview directly on Linux/macOS:
 
 ```console
-git clone https://github.com/session-skein/session-skein.git
-cd session-skein
-./install.sh --control
+curl -fsSL https://raw.githubusercontent.com/session-skein/session-skein/main/install.sh |
+  bash -s -- --control
 ```
 
 On Windows PowerShell:
 
 ```powershell
-git clone https://github.com/session-skein/session-skein.git
-Set-Location session-skein
-./install.ps1 -Control
+$installer = Join-Path $env:TEMP 'session-skein-install.ps1'
+Invoke-WebRequest https://raw.githubusercontent.com/session-skein/session-skein/main/install.ps1 -OutFile $installer
+& $installer -Control
 ```
 
 The safe default is catalog-only MCP. `--control` / `-Control` additionally
 exposes the audited conduct, steer, interrupt, and reconcile tools. See
 [INSTALL.md](INSTALL.md) for one-line installation, source-build behavior,
 collision handling, verification, updates, plugin installation, and uninstall.
+The normal path downloads the native release archive, validates its published
+manifest and SHA-256 checksum, and installs the bundled skill without Git or Rust.
 
 ## Five-minute start
 

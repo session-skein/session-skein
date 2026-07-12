@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  Build and install one Session Skein source revision for local Codex on Windows.
+  Verify and install one Session Skein release for local Codex on Windows.
 
 .DESCRIPTION
   Preflights every destination, validates the binary identity and doctor JSON, and
@@ -13,6 +13,9 @@ param(
     [switch]$Control,
     [string]$Binary,
     [string]$Source,
+    [string]$Version,
+    [ValidateSet('preview')]
+    [string]$Channel = 'preview',
     [string]$BinDir,
     [switch]$ReplaceBinary,
     [switch]$NoMcp,
@@ -25,9 +28,15 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+if ($PSVersionTable.PSVersion.Major -lt 7) {
+    throw 'PowerShell 7 or newer is required. Install it from https://aka.ms/powershell.'
+}
 $OriginalParameters = @{}
 foreach ($entry in $PSBoundParameters.GetEnumerator()) { $OriginalParameters[$entry.Key] = $entry.Value }
 $RepoUrl = if ($env:SKEIN_REPO_URL) { $env:SKEIN_REPO_URL } else { 'https://github.com/session-skein/session-skein.git' }
+$ReleaseBaseUrl = if ($env:SKEIN_RELEASE_BASE_URL) { $env:SKEIN_RELEASE_BASE_URL.TrimEnd('/') } else { 'https://github.com/session-skein/session-skein/releases/download' }
+$ReleaseChannelUrl = if ($env:SKEIN_RELEASE_CHANNEL_URL) { $env:SKEIN_RELEASE_CHANNEL_URL.TrimEnd('/') } else { 'https://raw.githubusercontent.com/session-skein/session-skein/main/release-channels' }
 $CodexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
 $LocalAppDataRoot = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { Join-Path $HOME 'AppData\Local' }
 $InstallStateDir = Join-Path $LocalAppDataRoot 'SessionSkein\install'
@@ -55,14 +64,16 @@ Options:
   -CatalogOnly       Register read/catalog MCP tools only (default)
   -Control           Expose audited conduct, steer, interrupt, and reconcile tools
   -Binary PATH       Install an already-built skein.exe
-  -Source PATH       Build and install a Session Skein checkout
+  -Source PATH       Explicitly build and install a Session Skein checkout
+  -Version VERSION   Install one exact published preview version
+  -Channel preview   Resolve the approved preview channel (default)
   -BinDir PATH       Override the executable destination
   -ReplaceBinary     Back up and replace an unowned destination binary
   -NoMcp             Do not change MCP configuration
   -NoSkill           Do not change the Codex skill
   -ReplaceMcp        Replace a conflicting MCP entry (a JSON backup is retained)
   -ReplaceSkill      Back up and replace a conflicting skill path
-  -Update            Fast-forward the managed checkout and re-run its new installer
+  -Update            Update an explicit Git source checkout and reinstall
   -Uninstall         Remove only hash/target-matched installer-owned integration
   -Help              Show this help
 '@
@@ -206,11 +217,17 @@ function Remove-OwnedIntegration {
 if ($Help) { Show-Usage; return }
 if ($CatalogOnly -and $Control) { throw 'Choose either -CatalogOnly or -Control.' }
 if ($Binary -and $Source) { throw '-Binary and -Source are mutually exclusive.' }
+if ($Binary -and $Version) { throw '-Binary and -Version are mutually exclusive.' }
+if ($Source -and $Version) { throw '-Source and -Version are mutually exclusive.' }
 if ($Uninstall) { Remove-OwnedIntegration; return }
 
+$DownloadDir = ''
+try {
 $Previous = Get-Receipt
 $SourceDir = ''
 $SourceCommit = ''
+$SourceReceipt = ''
+$PluginDir = ''
 $Reexecuted = $false
 
 function Resolve-Source {
@@ -248,21 +265,129 @@ function Resolve-Source {
 
     $skill = Join-Path $candidate 'plugins\session-skein\skills\session-skein\SKILL.md'
     if (-not (Test-Path $skill)) { throw "Source is missing the bundled Session Skein skill: $candidate" }
+    $script:PluginDir = Join-Path $candidate 'plugins\session-skein'
     return (Resolve-Path -LiteralPath $candidate).Path
 }
 
-$NeedSource = (-not $Binary) -or (-not $NoSkill) -or $Update
-if ($NeedSource) {
+function Get-ReleaseTarget {
+    if (-not [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
+        [System.Runtime.InteropServices.OSPlatform]::Windows)) {
+        throw 'install.ps1 supports Windows only; use install.sh on Linux or macOS.'
+    }
+    if ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture -ne
+        [System.Runtime.InteropServices.Architecture]::X64) {
+        throw "Unsupported Windows architecture: $([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture). Supported: Windows x86_64."
+    }
+    return 'x86_64-pc-windows-msvc'
+}
+
+function Receive-ReleaseFile([string]$Uri, [string]$Destination) {
+    if (-not $Uri.StartsWith('https://', [System.StringComparison]::OrdinalIgnoreCase) -and
+        $env:SKEIN_ALLOW_INSECURE_TEST_DOWNLOADS -ne '1') {
+        throw "Refusing non-HTTPS release URL: $Uri"
+    }
+    Invoke-WebRequest -UseBasicParsing -Uri $Uri -OutFile $Destination
+}
+
+function Expand-VerifiedRelease([string]$Archive, [string]$Destination) {
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $root = [System.IO.Path]::GetFullPath($Destination).TrimEnd('\') + '\'
+    $zip = [System.IO.Compression.ZipFile]::OpenRead($Archive)
+    try {
+        foreach ($entry in $zip.Entries) {
+            $normalized = $entry.FullName.Replace('/', '\')
+            if ([System.IO.Path]::IsPathRooted($normalized) -or
+                $normalized.Contains(':') -or
+                @($normalized.Split('\')) -contains '..') {
+                throw "Release archive contains an unsafe path: $($entry.FullName)"
+            }
+            $unixType = ($entry.ExternalAttributes -shr 16) -band 0xF000
+            if ($unixType -eq 0xA000) { throw "Release archive contains a symbolic link: $($entry.FullName)" }
+            $target = [System.IO.Path]::GetFullPath((Join-Path $Destination $normalized))
+            if (-not $target.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)) {
+                throw "Release archive escapes its destination: $($entry.FullName)"
+            }
+            if (-not $entry.Name) {
+                New-Item -ItemType Directory -Path $target -Force | Out-Null
+            } else {
+                New-Item -ItemType Directory -Path (Split-Path -Parent $target) -Force | Out-Null
+                [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $target, $false)
+            }
+        }
+    } finally {
+        $zip.Dispose()
+    }
+}
+
+function Resolve-Release {
+    $target = Get-ReleaseTarget
+    $script:DownloadDir = Join-Path ([System.IO.Path]::GetTempPath()) ('skein-release-' + [Guid]::NewGuid())
+    New-Item -ItemType Directory -Path $DownloadDir | Out-Null
+    $resolvedFromChannel = -not $Version
+    if ($resolvedFromChannel) {
+        $channelPath = Join-Path $DownloadDir 'channel'
+        Receive-ReleaseFile "$ReleaseChannelUrl/$Channel" $channelPath
+        $script:Version = (Get-Content -LiteralPath $channelPath -Raw).Trim()
+    }
+    if ($Version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$') {
+        throw "Invalid release version: $Version"
+    }
+    if ($resolvedFromChannel -and -not $Version.Contains('-')) { throw "Preview channel resolved a non-preview version: $Version" }
+    $tag = "v$Version"
+    $archiveName = "session-skein-$tag-$target.zip"
+    $releaseUrl = "$ReleaseBaseUrl/$tag"
+    Write-Host "→ Downloading Session Skein $Version for $target"
+    $manifestPath = Join-Path $DownloadDir 'release-manifest.json'
+    $checksumsPath = Join-Path $DownloadDir 'SHA256SUMS'
+    $archivePath = Join-Path $DownloadDir $archiveName
+    Receive-ReleaseFile "$releaseUrl/release-manifest.json" $manifestPath
+    Receive-ReleaseFile "$releaseUrl/SHA256SUMS" $checksumsPath
+    $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+    if ($manifest.version -ne $Version -or $manifest.tag -ne $tag) { throw 'Release manifest identity mismatch.' }
+    $asset = @($manifest.assets | Where-Object { $_.name -eq $archiveName -and $_.target -eq $target })
+    if ($asset.Count -ne 1) { throw "Release manifest does not select exactly one $archiveName asset." }
+    $checksumMatches = @()
+    foreach ($line in Get-Content -LiteralPath $checksumsPath) {
+        if ($line -match '^([0-9a-fA-F]{64})  (.+)$' -and $Matches[2] -eq $archiveName) {
+            $checksumMatches += $Matches[1].ToLowerInvariant()
+        }
+    }
+    if ($checksumMatches.Count -ne 1) { throw "SHA256SUMS does not contain exactly one hash for $archiveName." }
+    if ($asset[0].sha256 -ne $checksumMatches[0]) { throw 'Release manifest and SHA256SUMS disagree.' }
+    Receive-ReleaseFile "$releaseUrl/$archiveName" $archivePath
+    if ((Get-FileSha $archivePath) -ne $checksumMatches[0]) { throw "Checksum verification failed for $archiveName." }
+    Expand-VerifiedRelease $archivePath $DownloadDir
+    $payload = Join-Path $DownloadDir "session-skein-$tag-$target"
+    $binaryPath = Join-Path $payload 'skein.exe'
+    $pluginPath = Join-Path $payload 'plugin'
+    if (-not (Test-Path -LiteralPath $binaryPath -PathType Leaf)) { throw 'Release archive has no skein.exe.' }
+    if (-not (Test-Path -LiteralPath (Join-Path $pluginPath '.codex-plugin\plugin.json') -PathType Leaf)) { throw 'Release archive has no plugin metadata.' }
+    if (-not (Test-Path -LiteralPath (Join-Path $pluginPath 'skills\session-skein\SKILL.md') -PathType Leaf)) { throw 'Release archive has no bundled skill.' }
+    $package = Get-Content -LiteralPath (Join-Path $payload 'release-package.json') -Raw | ConvertFrom-Json
+    if ($package.version -ne $Version -or $package.target -ne $target) { throw 'Release package identity mismatch.' }
+    $script:SourceDir = $payload
+    $script:PluginDir = $pluginPath
+    $script:BinarySource = $binaryPath
+    $script:SourceReceipt = "release:${tag}:$target"
+}
+
+if ($Source -or $Update) {
     $SourceDir = Resolve-Source
     if ($Reexecuted) { return }
+    $SourceReceipt = $SourceDir
     if (Test-Path (Join-Path $SourceDir '.git')) {
         $SourceCommit = (& git -C $SourceDir rev-parse HEAD 2>$null | Out-String).Trim()
     }
+} elseif (-not $Binary) {
+    Resolve-Release
+} elseif (-not $NoSkill) {
+    $SourceDir = Resolve-Source
+    $SourceReceipt = $SourceDir
 }
 
 if ($Binary) {
     $BinarySource = (Resolve-Path -LiteralPath $Binary).Path
-} else {
+} elseif (-not $BinarySource) {
     if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) { throw 'Rust 1.95+ is required for source installation.' }
     $rustHost = (& rustc -vV 2>$null | Where-Object { $_ -like 'host: *' } | Select-Object -First 1)
     if ($rustHost -like '*-msvc') {
@@ -300,8 +425,9 @@ try {
     Remove-Item -LiteralPath $validationDir -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+if ($Version -and $ActualVersion -ne $Version) { throw "Downloaded binary reports $ActualVersion, expected $Version." }
 if ($SourceDir -and -not $NoSkill) {
-    $plugin = Get-Content -LiteralPath (Join-Path $SourceDir 'plugins\session-skein\.codex-plugin\plugin.json') -Raw | ConvertFrom-Json
+    $plugin = Get-Content -LiteralPath (Join-Path $PluginDir '.codex-plugin\plugin.json') -Raw | ConvertFrom-Json
     if ($plugin.version -ne $ActualVersion) {
         throw "Binary $ActualVersion and bundled skill/plugin $($plugin.version) do not match."
     }
@@ -335,7 +461,7 @@ $SkillSource = if ($Previous) { [string]$Previous.skillSource } else { '' }
 $SkillBackup = if ($Previous) { [string]$Previous.skillBackup } else { '' }
 $SkillAction = 'none'
 if (-not $NoSkill) {
-    $desiredSkillOrigin = Join-Path $SourceDir 'plugins\session-skein\skills\session-skein'
+    $desiredSkillOrigin = Join-Path $PluginDir 'skills\session-skein'
     $desiredSkillHash = Get-TreeSha $desiredSkillOrigin
     $desiredSkillSource = Join-Path $SkillSnapshotRoot "$ActualVersion-$desiredSkillHash"
     $desiredSkillTarget = Join-Path $CodexHome 'skills\session-skein'
@@ -484,7 +610,7 @@ function Write-Receipt {
         binaryBackup = $BinaryBackup
         binDir = $BinDir
         pathAdded = $PathAdded
-        source = $SourceDir
+        source = $SourceReceipt
         sourceCommit = $SourceCommit
         skill = $SkillTarget
         skillSource = $SkillSource
@@ -620,3 +746,8 @@ Invoke-Native $InstalledBinary @('doctor')
 if (-not $NoMcp) { Write-Output (Get-McpJson) }
 Write-Host "`nStart a new Codex session so it discovers the skill and MCP server."
 Write-Host 'No scan root, private context source, daemon, or worker was enabled.'
+} finally {
+    if ($DownloadDir) {
+        Remove-Item -LiteralPath $DownloadDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}

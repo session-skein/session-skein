@@ -74,7 +74,18 @@ SmartScreen may therefore warn or block execution depending on local policy. Ver
 checksums and provenance before making a deliberate local trust decision. Native
 macOS signing/notarization and Windows signing remain roadmap work.
 
-The source installers remain the recommended installation contract. Release archives
-are an explicit advanced binary input to `install.sh --binary` or
-`install.ps1 -Binary`; installers are not yet binary-first, and Session Skein does not
-yet implement an update command.
+The normal installers are binary-first. They intentionally resolve the repository's
+`preview` channel pointer because GitHub's “latest release” endpoint excludes
+prereleases, then pin all downloads to the resolved tag. They require the expected
+archive to appear exactly once in both the release manifest and checksums, verify its
+SHA-256 before extraction, reject unsafe archive paths/links, and require the binary,
+package metadata, and bundled plugin version to agree.
+
+Use `--version` or `-Version` for an exact preview. The default repository and asset
+URLs are fixed to `session-skein/session-skein`. `SKEIN_RELEASE_BASE_URL` and
+`SKEIN_RELEASE_CHANNEL_URL` exist only for documented mirrors and hermetic tests;
+non-HTTPS URLs additionally require `SKEIN_ALLOW_INSECURE_TEST_DOWNLOADS=1` and must
+never be used for a normal installation.
+
+Source builds remain explicit contributor/fallback paths. Session Skein does not yet
+implement a product update command or automatic background update.

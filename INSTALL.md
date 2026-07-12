@@ -22,8 +22,9 @@ control operation its per-request acknowledgement.
 
 - A local Codex CLI installation with a working ChatGPT login.
 - Linux, macOS, Windows, or WSL.
-- `git` for the reviewable managed checkout and bundled skill.
-- Rust 1.95 or newer for normal source installation. The repository pins 1.95.0.
+- `curl` and `tar` on Linux/macOS, or PowerShell 7 or newer on Windows.
+- `git`, Rust 1.95 or newer, and a native toolchain only for explicit source builds.
+  The repository pins Rust 1.95.0.
 - A native C compiler and linker because the locked build compiles bundled SQLite:
   - Debian, Ubuntu, and WSL: `sudo apt install build-essential`;
   - Fedora: `sudo dnf group install development-tools`;
@@ -32,14 +33,10 @@ control operation its per-request acknowledgement.
   - Windows: install Visual Studio Build Tools 2022 with **Desktop development
     with C++** and a Windows 10 or 11 SDK, then use a Developer PowerShell.
 
-`--binary` / `-Binary` is the explicit advanced path for an already-built native
-executable and does not require the Rust or C build toolchains.
-
-Unsigned preview archives are available through GitHub Releases for four native
-targets. Verify their SHA-256 checksum and GitHub provenance before passing the
-extracted executable to `--binary` or `-Binary`; see
-[preview releases](docs/releases.md). Source installation remains the recommended
-default. The installers do not select, download, or update release assets themselves.
+The normal installer selects a published native archive, verifies it against both
+`release-manifest.json` and `SHA256SUMS`, safely extracts it, validates the executable
+version, and installs the archive's matching bundled skill. `--binary` / `-Binary`
+remains available for an already-built native executable.
 
 Check the two required programs:
 
@@ -50,26 +47,20 @@ codex login status
 
 ## Linux and macOS
 
-The reviewable checkout flow is recommended:
-
-```console
-git clone https://github.com/session-skein/session-skein.git
-cd session-skein
-./install.sh                 # catalog-only MCP
-./install.sh --control       # catalog + audited worker control
-```
-
-The installer builds the checkout with its locked dependencies, validates the exact
-`skein VERSION` and JSON `doctor` response, then copies the skill from that same
-revision into an immutable snapshot. The live Codex skill link switches only after
-the executable initializes successfully. Future signed native releases are tracked
-separately on the roadmap.
-
-For a one-line bootstrap, inspect the script first, then run:
+Inspect the bootstrap script, then install the approved preview channel:
 
 ```console
 curl -fsSL https://raw.githubusercontent.com/session-skein/session-skein/main/install.sh | \
   bash -s -- --control
+```
+
+The script is fetched once. It resolves `release-channels/preview`, then pins every
+metadata and archive request to that exact `vVERSION` GitHub Release; it never
+re-fetches an installer after resolution. To pin the release yourself:
+
+```console
+curl -fsSL https://raw.githubusercontent.com/session-skein/session-skein/main/install.sh | \
+  bash -s -- --version 0.5.0-alpha.8 --control
 ```
 
 Useful options:
@@ -78,7 +69,9 @@ Useful options:
 --catalog-only        register read/catalog MCP tools only (default)
 --control             also expose conduct/steer/interrupt/reconcile tools
 --binary PATH         install an already-built skein binary
---source PATH         build and install this checkout
+--source PATH         explicitly build and install this checkout
+--version VERSION     install one exact published preview
+--channel preview     install the approved preview channel (default)
 --bin-dir PATH        override the executable destination directory
 --replace-binary      back up and replace an unowned destination binary
 --no-mcp              do not create Codex MCP configuration
@@ -98,7 +91,8 @@ installed binary hash, skill target, and complete MCP-configuration hash. If any
 those are later changed by the user or another package manager, uninstall preserves
 the changed object and keeps the receipt for review.
 
-`--update` fast-forwards the checkout and re-runs its refreshed installer, but the
+`--update` remains a source-checkout operation: it fast-forwards the checkout and
+re-runs its refreshed installer. The
 active skill never points into that mutable checkout. A build, validation, or
 initialization failure leaves the prior content-addressed skill snapshot active.
 
@@ -110,21 +104,18 @@ must identify itself as Session Skein and return a valid JSON `doctor` report.
 ## Windows PowerShell
 
 ```powershell
-git clone https://github.com/session-skein/session-skein.git
-Set-Location session-skein
-./install.ps1                 # catalog-only MCP
-./install.ps1 -Control        # catalog + audited worker control
+$installer = Join-Path $env:TEMP 'session-skein-install.ps1'
+Invoke-WebRequest https://raw.githubusercontent.com/session-skein/session-skein/main/install.ps1 -OutFile $installer
+& $installer -Control
 ```
 
-One-line bootstrap after reviewing `install.ps1`:
-
-```powershell
-iwr -useb https://raw.githubusercontent.com/session-skein/session-skein/main/install.ps1 | iex
-```
+Downloading to a file keeps parameters and errors explicit. `-Version
+0.5.0-alpha.8` pins a release; otherwise `-Channel preview` resolves the same approved
+preview pointer as Unix.
 
 PowerShell parameters mirror the Unix installer: `-Control`, `-CatalogOnly`,
-`-Binary`, `-Source`, `-BinDir`, `-ReplaceBinary`, `-NoMcp`, `-NoSkill`, `-ReplaceMcp`,
-`-ReplaceSkill`, `-Update`, and `-Uninstall`.
+`-Binary`, `-Source`, `-Version`, `-Channel`, `-BinDir`, `-ReplaceBinary`, `-NoMcp`,
+`-NoSkill`, `-ReplaceMcp`, `-ReplaceSkill`, `-Update`, and `-Uninstall`.
 
 On Windows, the installer adds its binary directory to the user `PATH` only when
 needed, remembers whether it did so across updates, and removes only that owned entry
@@ -200,7 +191,17 @@ codex plugin add session-skein@session-skein
 
 Codex caches installed plugins. Start a new thread after reinstalling.
 
-## Manual source installation
+## Contributor/source installation
+
+Source builds are explicit:
+
+```console
+git clone https://github.com/session-skein/session-skein.git
+cd session-skein
+./install.sh --source . --control
+```
+
+Windows uses `./install.ps1 -Source . -Control` from a Developer PowerShell.
 
 The installer is convenience, not magic. Its essential source path is:
 
@@ -217,14 +218,18 @@ For control-enabled MCP, append `--allow-control`. Copy or symlink
 
 ## Update and uninstall
 
-From the installed checkout or a fresh clone:
+To reinstall or move to the currently approved preview, rerun the normal remote
+installer. Receipt ownership permits replacement only when the installed objects are
+still unchanged. There is no `skein update` command yet.
+
+For an explicit source checkout:
 
 ```console
 ./install.sh --update --control
 ./install.sh --uninstall
 ```
 
-Windows uses `./install.ps1 -Update -Control` and
+Windows source mode uses `./install.ps1 -Update -Control` and
 `./install.ps1 -Uninstall`.
 
 Uninstall preserves the SQLite database, project registry, and Codex-owned files.

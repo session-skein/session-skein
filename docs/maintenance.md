@@ -4,7 +4,12 @@ This page covers updates, backups, restore, reset, plugin refresh, and uninstall
 
 ## Update
 
-From a managed or fresh checkout on Linux/macOS:
+There is no `skein update` command yet. To reinstall or move to the approved preview,
+rerun the normal binary-first installer; unchanged installer-owned objects are
+replaced through the receipt rollback path.
+
+The legacy `--update` / `-Update` flags are only for explicit source checkouts. From
+a managed or fresh checkout on Linux/macOS:
 
 ```console
 ./install.sh --update --control
@@ -135,7 +140,7 @@ contain authentication, configuration, sessions, plugins, and memories.
 
 ## Source checkout
 
-The installer may keep a managed checkout so updates remain reviewable. The active
+Source-mode installation may keep a managed checkout so updates remain reviewable. The active
 skill link points to a content-addressed private snapshot, not into the checkout, so
 removing the checkout does not immediately break skill discovery. Keep the checkout
 when you want `--update`; otherwise a future install can clone it again.
