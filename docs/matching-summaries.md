@@ -23,6 +23,12 @@ conductor evaluates the same ranking in an explicit dispatch context, where only
 unique high-confidence recommendation becomes dispatchable and is rechecked inside
 the write transaction.
 
+Match report schema version 2 adds stable one-based candidate `rank`, a `selection`
+object containing project and optional source-thread IDs, and top-level `resolution`
+guidance. These fields are additive; existing project, score, evidence,
+recommendation, and candidate-count fields retain their meanings. An explicit
+selection resolves the existing ranking and never changes its evidence or prompt.
+
 By default, synchronized session names and previews do not participate. `--include-text`
 locally scores only text previously imported with explicit consent. Source values and
 query tokens are not echoed in the evidence, and the query/result are never stored.

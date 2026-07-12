@@ -78,6 +78,13 @@ source values. Project cards and day summaries are generated on read and are not
 cached. Project cards may display the already stored Git commit subject; neither view
 reads session transcripts, agent output, commands, diffs, or MCP content.
 
+Quick project search does not query private context rows. Explicit deep search reports
+gates, freshness, bounds, and possible truncation before returning bounded private
+snippets. Diagnostics and ambiguous-route evidence contain no transcript excerpt.
+Current per-source gates are enforced by every private-context query. Turning a gate
+off revokes search access immediately even if rows remain stored until reconciliation;
+turning it back on can expose retained owner-private rows with their prior freshness.
+
 The conductor uses the same bounded stdin bytes first as an in-memory route query and
 then unchanged as the Codex prompt. Accepted routes persist only request/run IDs,
 selected project and optional opaque thread identity, confidence/score/margin, query

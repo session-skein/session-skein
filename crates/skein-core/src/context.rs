@@ -420,6 +420,10 @@ impl Registry {
         let Some(query) = context_fts_query(query) else {
             return Ok(Vec::new());
         };
+        let settings = self.get_recall_settings()?;
+        if !settings.include_codex_memories && !settings.include_codex_sessions {
+            return Ok(Vec::new());
+        }
         let limit = limit.clamp(1, MAX_CONTEXT_SEARCH_RESULTS);
         let mut statement = self.connection.prepare(
             "SELECT d.id, d.source_kind, d.source_path, d.project_id, p.path,
@@ -430,12 +434,19 @@ impl Registry {
                JOIN context_documents d ON d.id = context_documents_fts.rowid
                LEFT JOIN projects p ON p.id = d.project_id
               WHERE context_documents_fts MATCH ?1
+                AND ((d.source_kind = 'codex_memory' AND ?2)
+                  OR (d.source_kind = 'codex_session' AND ?3))
               ORDER BY bm25(context_documents_fts), d.source_kind, d.source_path
-              LIMIT ?2",
+              LIMIT ?4",
         )?;
         statement
             .query_map(
-                params![query, i64::try_from(limit).unwrap_or(i64::MAX)],
+                params![
+                    query,
+                    settings.include_codex_memories,
+                    settings.include_codex_sessions,
+                    i64::try_from(limit).unwrap_or(i64::MAX)
+                ],
                 |row| {
                     let source: String = row.get(1)?;
                     let source_kind = ContextSourceKind::parse(&source).ok_or_else(|| {
@@ -1445,6 +1456,87 @@ mod tests {
             registry
                 .search_context_documents("memory-private-marker", 10)?
                 .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn live_source_gates_immediately_filter_retained_private_rows() -> Result<()> {
+        let (temp, mut registry, codex_home) = registry()?;
+        let approved = temp.path().join("approved");
+        let project = approved.join("project");
+        fs::create_dir_all(&project).map_err(|source| Error::Io {
+            path: project.clone(),
+            source,
+        })?;
+        registry.add_project(&project, None)?;
+        registry.add_scan_root(&approved, ScanRootOptions::default())?;
+        write(
+            &codex_home.join("memories/summary.md"),
+            b"# Synthetic memory\nshared-private-marker memory-gate-marker",
+        )?;
+        let session = format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"cwd\":{cwd:?}}}}}\n\
+             {{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"shared-private-marker session-gate-marker\"}}]}}}}\n",
+            cwd = project.to_string_lossy()
+        );
+        write(
+            &codex_home.join("sessions/session.jsonl"),
+            session.as_bytes(),
+        )?;
+        let both = RecallSettings {
+            include_codex_memories: true,
+            include_codex_sessions: true,
+        };
+        registry.set_recall_settings(both)?;
+        registry
+            .refresh_context_documents(&codex_home, ContextDocumentRefreshOptions::default())?;
+        assert_eq!(
+            registry
+                .search_context_documents("shared-private-marker", 10)?
+                .len(),
+            2
+        );
+
+        registry.set_recall_settings(RecallSettings {
+            include_codex_memories: false,
+            include_codex_sessions: true,
+        })?;
+        assert!(
+            registry
+                .search_context_documents("memory-gate-marker", 10)?
+                .is_empty()
+        );
+        let session_only = registry.search_context_documents("shared-private-marker", 10)?;
+        assert_eq!(session_only.len(), 1);
+        assert_eq!(session_only[0].source_kind, ContextSourceKind::CodexSession);
+
+        registry.set_recall_settings(RecallSettings {
+            include_codex_memories: true,
+            include_codex_sessions: false,
+        })?;
+        assert!(
+            registry
+                .search_context_documents("session-gate-marker", 10)?
+                .is_empty()
+        );
+        let memory_only = registry.search_context_documents("shared-private-marker", 10)?;
+        assert_eq!(memory_only.len(), 1);
+        assert_eq!(memory_only[0].source_kind, ContextSourceKind::CodexMemory);
+
+        registry.set_recall_settings(RecallSettings::default())?;
+        assert!(
+            registry
+                .search_context_documents("shared-private-marker", 10)?
+                .is_empty()
+        );
+        registry.set_recall_settings(both)?;
+        assert_eq!(
+            registry
+                .search_context_documents("shared-private-marker", 10)?
+                .len(),
+            2,
+            "re-enabling may reveal retained rows without a source refresh"
         );
         Ok(())
     }

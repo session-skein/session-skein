@@ -36,6 +36,7 @@ pub struct NewConductorRun<'a> {
     pub include_session_text: bool,
     pub full_access_acknowledged: bool,
     pub expected: ExpectedConductorRoute<'a>,
+    pub explicit_selection: bool,
 }
 
 /// One selected candidate evidence contribution with no matched source value.
@@ -110,7 +111,11 @@ impl Registry {
             &MatchOptions {
                 query: input.prompt,
                 include_text: input.include_session_text,
-                limit: 1,
+                limit: if input.explicit_selection {
+                    crate::MAX_MATCH_CANDIDATES
+                } else {
+                    1
+                },
                 now,
             },
             true,
@@ -119,28 +124,65 @@ impl Registry {
             .recommendation
             .as_ref()
             .ok_or_else(|| Error::InvalidControlRequest("route_refused:no_match".to_owned()))?;
-        if recommendation.confidence != MatchConfidence::High || !recommendation.dispatchable {
+        if !input.explicit_selection
+            && (recommendation.confidence != MatchConfidence::High || !recommendation.dispatchable)
+        {
             return Err(Error::InvalidControlRequest(
                 format!("route_refused:confidence_{:?}", recommendation.confidence).to_lowercase(),
             ));
         }
-        if recommendation.ambiguous {
+        if !input.explicit_selection && recommendation.ambiguous {
             return Err(Error::InvalidControlRequest(
                 "route_refused:ambiguous".to_owned(),
             ));
         }
-        let candidate = report.candidates.first().ok_or_else(|| {
-            Error::ControlStateConflict("accepted route had no selected candidate".to_owned())
+        let candidate = if input.explicit_selection {
+            report
+                .candidates
+                .iter()
+                .find(|candidate| candidate.project.id == input.expected.project_id)
+        } else {
+            report.candidates.first()
+        }
+        .ok_or_else(|| {
+            Error::InvalidControlRequest("route_refused:selection_not_ranked".to_owned())
         })?;
-        if recommendation.project_id != input.expected.project_id
-            || recommendation.action != input.expected.action
-            || recommendation.source_thread_id.as_deref() != input.expected.source_thread_id
+        let selected_session = match input.expected.action {
+            "start" => None,
+            "resume" => {
+                let thread_id = input.expected.source_thread_id.ok_or_else(|| {
+                    Error::InvalidControlRequest("invalid expected conductor route".to_owned())
+                })?;
+                Some(
+                    candidate
+                        .suggested_session
+                        .as_ref()
+                        .filter(|session| {
+                            session.source_thread_id == thread_id && session.resumable
+                        })
+                        .ok_or_else(|| {
+                            Error::InvalidControlRequest(
+                                "route_refused:session_not_ranked_or_resumable".to_owned(),
+                            )
+                        })?,
+                )
+            }
+            _ => {
+                return Err(Error::InvalidControlRequest(
+                    "invalid expected conductor route".to_owned(),
+                ));
+            }
+        };
+        if !input.explicit_selection
+            && (recommendation.project_id != input.expected.project_id
+                || recommendation.action != input.expected.action
+                || recommendation.source_thread_id.as_deref() != input.expected.source_thread_id)
         {
             return Err(Error::ControlStateConflict(
                 "route_changed_after_authentication".to_owned(),
             ));
         }
-        if let Some(session) = &candidate.suggested_session
+        if let Some(session) = selected_session
             && session
                 .evidence
                 .iter()
@@ -157,7 +199,7 @@ impl Registry {
         }
         let evidence = selected_evidence(candidate);
         let evidence_score = evidence.iter().map(|item| item.points).sum::<i32>();
-        if evidence_score != recommendation.score || candidate.score != recommendation.score {
+        if evidence_score != candidate.score {
             return Err(Error::ControlStateConflict(
                 "selected route evidence did not sum to its score".to_owned(),
             ));
@@ -166,7 +208,7 @@ impl Registry {
             &transaction,
             &NewControlRun {
                 project_path: &candidate.project.path,
-                resume_thread_id: recommendation.source_thread_id.as_deref(),
+                resume_thread_id: input.expected.source_thread_id,
                 prompt: input.prompt,
                 full_access_acknowledged: input.full_access_acknowledged,
             },
@@ -184,7 +226,7 @@ impl Registry {
             &transaction,
             input,
             &report,
-            recommendation,
+            candidate,
             &evidence,
             control.run_id,
             now,
@@ -262,28 +304,38 @@ fn insert_decision(
     transaction: &Transaction<'_>,
     input: &NewConductorRun<'_>,
     report: &crate::MatchReport,
-    recommendation: &crate::MatchRecommendation,
+    candidate: &crate::ProjectMatch,
     evidence: &[ConductorEvidence],
     run_id: i64,
     now: i64,
 ) -> Result<ConductorDecision> {
+    let recommendation = report.recommendation.as_ref().ok_or_else(|| {
+        Error::ControlStateConflict("accepted conductor report lost recommendation".to_owned())
+    })?;
     transaction.execute(
         "INSERT INTO conductor_decisions (
             request_id, run_id, created_at, matched_at, match_schema_version, project_id,
             source_thread_id, action, confidence, ambiguous, resolution_kind, score,
             runner_up_margin, candidate_count, query_bytes, query_tokens, include_text
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'high', 0, 'automatic', ?9,
-                   ?10, ?11, ?12, ?13, ?14)",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                   ?13, ?14, ?15, ?16, ?17)",
         params![
             input.request_id,
             run_id,
             now,
             report.as_of,
             i64::from(report.schema_version),
-            recommendation.project_id,
-            recommendation.source_thread_id,
-            recommendation.action,
-            recommendation.score,
+            candidate.project.id,
+            input.expected.source_thread_id,
+            input.expected.action,
+            format!("{:?}", recommendation.confidence).to_lowercase(),
+            i64::from(recommendation.ambiguous),
+            if input.explicit_selection {
+                "user_selected"
+            } else {
+                "automatic"
+            },
+            candidate.score,
             recommendation.runner_up_margin,
             i64::try_from(report.candidate_count).unwrap_or(i64::MAX),
             i64::try_from(report.query_bytes).unwrap_or(i64::MAX),
@@ -452,6 +504,7 @@ mod tests {
                 action: "start",
                 source_thread_id: None,
             },
+            explicit_selection: false,
         }
     }
 
@@ -462,6 +515,33 @@ mod tests {
                 row.get(0)
             })
             .map_err(Error::from)
+    }
+
+    fn import_session(
+        registry: &mut Registry,
+        project: std::path::PathBuf,
+        thread_id: &str,
+        updated_at: i64,
+    ) -> Result<()> {
+        registry.import_sessions(&[SessionObservation {
+            source_kind: "codex".to_owned(),
+            source_thread_id: thread_id.to_owned(),
+            source_session_id: None,
+            source_cwd: project,
+            source_created_at: updated_at.saturating_sub(1),
+            source_updated_at: updated_at,
+            source_label: "cli".to_owned(),
+            observed_status_label: "notLoaded".to_owned(),
+            model_provider: Some("openai".to_owned()),
+            source_version: None,
+            parent_source_thread_id: None,
+            forked_from_source_thread_id: None,
+            ephemeral: false,
+            name: None,
+            preview: None,
+            text_imported: false,
+        }])?;
+        Ok(())
     }
 
     #[test]
@@ -588,6 +668,212 @@ mod tests {
     }
 
     #[test]
+    fn explicit_ranked_project_resolves_ambiguity_without_reinterpreting_prompt() -> Result<()> {
+        let (temp, mut registry, project, first_id) = fixture()?;
+        let second = temp.path().join("second");
+        fs::create_dir(&second).map_err(|source| Error::Io {
+            path: second.clone(),
+            source,
+        })?;
+        registry.add_project(&project, Some("Shared Project"))?;
+        let second_id = registry.add_project(&second, Some("Shared Project"))?.id;
+
+        let report = registry.match_conductor_metadata(&MatchOptions {
+            query: "Shared Project",
+            include_text: false,
+            limit: 5,
+            now: 1_000,
+        })?;
+        assert!(
+            report
+                .recommendation
+                .as_ref()
+                .is_some_and(|item| item.ambiguous)
+        );
+        assert!(report.resolution.required);
+        assert_eq!(report.candidates.len(), 2);
+        assert_eq!(report.candidates[0].rank, 1);
+        assert_eq!(report.candidates[1].rank, 2);
+        assert_eq!(count(&registry, "control_runs")?, 0);
+
+        let outcome = registry.plan_conductor_run(&NewConductorRun {
+            request_id: "10000000-0000-4000-8000-000000000013",
+            prompt: "Shared Project",
+            include_session_text: false,
+            full_access_acknowledged: true,
+            expected: ExpectedConductorRoute {
+                project_id: second_id,
+                action: "start",
+                source_thread_id: None,
+            },
+            explicit_selection: true,
+        })?;
+        let ConductorPlanOutcome::Created { decision, .. } = outcome else {
+            panic!("explicit resolution must create one plan");
+        };
+        assert_ne!(decision.project_id, first_id);
+        assert_eq!(decision.project_id, second_id);
+        assert!(decision.ambiguous);
+        assert_eq!(decision.resolution_kind, "user_selected");
+        assert_eq!(count(&registry, "control_runs")?, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_non_top_routes_use_only_the_selected_project_and_thread() -> Result<()> {
+        let (temp, mut registry, first, first_id) = fixture()?;
+        let second = temp.path().join("second");
+        fs::create_dir(&second).map_err(|source| Error::Io {
+            path: second.clone(),
+            source,
+        })?;
+        registry.add_project(&first, Some("Shared Work"))?;
+        let second_id = registry.add_project(&second, Some("Shared Work"))?.id;
+        let thread_a = "21000000-0000-4000-8000-000000000001";
+        let thread_b = "22000000-0000-4000-8000-000000000002";
+        import_session(&mut registry, first, thread_a, 100)?;
+        import_session(&mut registry, second, thread_b, 90)?;
+        let prompt = format!("Shared Work {thread_a}");
+        let report = registry.match_conductor_metadata(&MatchOptions {
+            query: &prompt,
+            include_text: false,
+            limit: 50,
+            now: 100,
+        })?;
+        assert_eq!(report.candidates[0].project.id, first_id);
+        assert_eq!(
+            report
+                .recommendation
+                .as_ref()
+                .and_then(|item| item.source_thread_id.as_deref()),
+            Some(thread_a)
+        );
+        let selected = report
+            .candidates
+            .iter()
+            .find(|candidate| candidate.project.id == second_id)
+            .expect("lower-ranked second project");
+        assert!(selected.score < report.candidates[0].score);
+        assert_eq!(
+            selected.selection.source_thread_id.as_deref(),
+            Some(thread_b)
+        );
+
+        let started = registry.plan_conductor_run(&NewConductorRun {
+            request_id: "10000000-0000-4000-8000-000000000014",
+            prompt: &prompt,
+            include_session_text: false,
+            full_access_acknowledged: true,
+            expected: ExpectedConductorRoute {
+                project_id: second_id,
+                action: "start",
+                source_thread_id: None,
+            },
+            explicit_selection: true,
+        })?;
+        let ConductorPlanOutcome::Created {
+            decision, control, ..
+        } = started
+        else {
+            panic!("non-top explicit start must create");
+        };
+        assert_eq!(decision.project_id, second_id);
+        assert_eq!(decision.source_thread_id, None);
+        let started_run = registry
+            .control_run(control.run_id)?
+            .expect("started run remains durable");
+        assert_eq!(started_run.project_id, second_id);
+        assert_eq!(started_run.source_thread_id, None);
+
+        let resumed = registry.plan_conductor_run(&NewConductorRun {
+            request_id: "10000000-0000-4000-8000-000000000015",
+            prompt: &prompt,
+            include_session_text: false,
+            full_access_acknowledged: true,
+            expected: ExpectedConductorRoute {
+                project_id: second_id,
+                action: "resume",
+                source_thread_id: Some(thread_b),
+            },
+            explicit_selection: true,
+        })?;
+        let ConductorPlanOutcome::Created {
+            decision, control, ..
+        } = resumed
+        else {
+            panic!("selected second session must resume");
+        };
+        assert_eq!(decision.source_thread_id.as_deref(), Some(thread_b));
+        let resumed_run = registry
+            .control_run(control.run_id)?
+            .expect("resumed run remains durable");
+        assert_eq!(resumed_run.source_thread_id.as_deref(), Some(thread_b));
+        assert_ne!(resumed_run.source_thread_id.as_deref(), Some(thread_a));
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_direct_routes_and_blocked_unselected_sessions_are_safe() -> Result<()> {
+        let (_temp, mut registry, project, project_id) = fixture()?;
+        let thread = "23000000-0000-4000-8000-000000000003";
+        import_session(&mut registry, project.clone(), thread, 100)?;
+        registry.plan_control_run(&NewControlRun {
+            project_path: &project,
+            resume_thread_id: Some(thread),
+            prompt: "synthetic active owner",
+            full_access_acknowledged: true,
+        })?;
+        let baseline = count(&registry, "control_runs")?;
+
+        for (request_id, action, source_thread_id) in [
+            ("10000000-0000-4000-8000-000000000016", "resume", None),
+            (
+                "10000000-0000-4000-8000-000000000017",
+                "start",
+                Some(thread),
+            ),
+            ("10000000-0000-4000-8000-000000000018", "unknown", None),
+        ] {
+            let result = registry.plan_conductor_run(&NewConductorRun {
+                request_id,
+                prompt: thread,
+                include_session_text: false,
+                full_access_acknowledged: true,
+                expected: ExpectedConductorRoute {
+                    project_id,
+                    action,
+                    source_thread_id,
+                },
+                explicit_selection: true,
+            });
+            assert!(matches!(result, Err(Error::InvalidControlRequest(_))));
+            assert_eq!(count(&registry, "control_runs")?, baseline);
+            assert_eq!(count(&registry, "conductor_decisions")?, 0);
+        }
+
+        let started = registry.plan_conductor_run(&NewConductorRun {
+            request_id: "10000000-0000-4000-8000-000000000019",
+            prompt: thread,
+            include_session_text: false,
+            full_access_acknowledged: true,
+            expected: ExpectedConductorRoute {
+                project_id,
+                action: "start",
+                source_thread_id: None,
+            },
+            explicit_selection: true,
+        })?;
+        let ConductorPlanOutcome::Created { control, .. } = started else {
+            panic!("project-only start must ignore an unselected blocked session");
+        };
+        let started_run = registry
+            .control_run(control.run_id)?
+            .expect("project-only run remains durable");
+        assert_eq!(started_run.source_thread_id, None);
+        Ok(())
+    }
+
+    #[test]
     fn exact_thread_resumes_only_when_eligible_and_unowned() -> Result<()> {
         let (_temp, mut registry, project, project_id) = fixture()?;
         let thread_id = "20000000-0000-4000-8000-000000000001";
@@ -619,6 +905,7 @@ mod tests {
                 action: "resume",
                 source_thread_id: Some(thread_id),
             },
+            explicit_selection: false,
         };
         let outcome = registry.plan_conductor_run(&input)?;
         let ConductorPlanOutcome::Created { decision, .. } = outcome else {
@@ -627,7 +914,7 @@ mod tests {
         assert_eq!(decision.action, "resume");
         assert_eq!(decision.source_thread_id.as_deref(), Some(thread_id));
 
-        let blocked = registry.plan_conductor_run(&NewConductorRun {
+        let new_thread = registry.plan_conductor_run(&NewConductorRun {
             request_id: "10000000-0000-4000-8000-000000000006",
             prompt: thread_id,
             include_session_text: false,
@@ -637,9 +924,14 @@ mod tests {
                 action: "start",
                 source_thread_id: None,
             },
-        });
-        assert!(matches!(blocked, Err(Error::ControlStateConflict(_))));
-        assert_eq!(count(&registry, "conductor_decisions")?, 1);
+            explicit_selection: false,
+        })?;
+        let ConductorPlanOutcome::Created { decision, .. } = new_thread else {
+            panic!("a blocked prior thread must permit the recommended new-thread start");
+        };
+        assert_eq!(decision.action, "start");
+        assert_eq!(decision.source_thread_id, None);
+        assert_eq!(count(&registry, "conductor_decisions")?, 2);
         Ok(())
     }
 
@@ -703,6 +995,7 @@ mod tests {
                 action: "resume",
                 source_thread_id: Some("owned-thread"),
             },
+            explicit_selection: false,
         })?;
         let ConductorPlanOutcome::Created {
             decision, control, ..

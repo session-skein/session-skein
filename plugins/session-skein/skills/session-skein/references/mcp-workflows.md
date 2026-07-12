@@ -23,6 +23,8 @@
 
 Never let recency alone choose a project. Return candidates/evidence when matching is
 ambiguous.
+Resolve ambiguity only with the chosen ranked `project_id` and optional
+`source_thread_id` in `conduct`; do not rewrite the prompt or guess an identity.
 
 ## Deep recall
 
@@ -30,6 +32,9 @@ ambiguous.
 2. Explain enabled sources and model-context disclosure.
 3. With user intent, repeat `search_projects` or `suggest_codex_command` with
    `include_deep_context:true`.
+
+Use `recall` diagnostics to explain sources, freshness, limits, and possible
+truncation. Enabling and refreshing a source are separate consented operations.
 
 To change policy, call the appropriate `set_codex_*_indexing` tool, then
 `refresh_index`. Enabling generated memories never authorizes raw sessions.

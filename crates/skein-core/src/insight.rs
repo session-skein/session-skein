@@ -20,6 +20,9 @@ use crate::session::SessionMetadata;
 use crate::session::list_session_match_text_on;
 use crate::session::list_session_metadata_on;
 
+/// Shared bound for ranked selectors that may be explicitly resolved by conductor.
+pub const MAX_MATCH_CANDIDATES: usize = 50;
+
 /// Options for one ephemeral metadata match.
 pub struct MatchOptions<'a> {
     pub query: &'a str,
@@ -69,11 +72,23 @@ pub struct MatchedProject {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectMatch {
+    /// Stable one-based position after deterministic scoring and tie-breaking.
+    pub rank: usize,
     pub project: MatchedProject,
     pub score: i32,
     pub latest_matched_at: Option<i64>,
     pub suggested_session: Option<SessionMatch>,
     pub evidence: Vec<MatchEvidence>,
+    /// Exact selectors accepted by conductor explicit resolution.
+    pub selection: MatchSelection,
+}
+
+/// Stable selectors for resolving a ranked route without reinterpreting the query.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MatchSelection {
+    pub project_id: i64,
+    pub source_thread_id: Option<String>,
 }
 
 /// Deterministic confidence label; it is not a probability.
@@ -111,7 +126,19 @@ pub struct MatchReport {
     pub recommendation: Option<MatchRecommendation>,
     pub candidate_count: usize,
     pub candidates: Vec<ProjectMatch>,
+    pub resolution: MatchResolution,
     pub content_persisted: bool,
+}
+
+/// Actionable route-resolution contract shared by CLI JSON and MCP.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MatchResolution {
+    pub required: bool,
+    pub reason: Option<String>,
+    pub cli_template: String,
+    pub mcp_tool: String,
+    pub selector_fields: Vec<String>,
 }
 
 /// Aggregate facts used by a deterministic project card.
@@ -313,17 +340,48 @@ pub(crate) fn match_metadata_on(
             .then_with(|| left.project.path.cmp(&right.project.path))
             .then_with(|| left.project.id.cmp(&right.project.id))
     });
+    for (index, candidate) in candidates.iter_mut().enumerate() {
+        candidate.rank = index + 1;
+        candidate.selection = MatchSelection {
+            project_id: candidate.project.id,
+            source_thread_id: candidate
+                .suggested_session
+                .as_ref()
+                .map(|session| session.source_thread_id.clone()),
+        };
+    }
     let recommendation = recommendation(&candidates, dispatch_context);
+    let resolution_required = recommendation.as_ref().is_none_or(|item| {
+        item.ambiguous || item.confidence != MatchConfidence::High || !item.dispatchable
+    });
+    let resolution_reason = recommendation.as_ref().and_then(|item| {
+        if item.ambiguous {
+            Some("multiple_plausible_candidates".to_owned())
+        } else if item.confidence != MatchConfidence::High {
+            Some("insufficient_confidence".to_owned())
+        } else if !item.dispatchable {
+            Some("dispatch_context_required".to_owned())
+        } else {
+            None
+        }
+    });
     let candidate_count = candidates.len();
     candidates.truncate(options.limit);
     Ok(MatchReport {
-        schema_version: 1,
+        schema_version: 2,
         query_bytes: options.query.len(),
         query_token_count: query_tokens.len(),
         as_of: options.now,
         recommendation,
         candidate_count,
         candidates,
+        resolution: MatchResolution {
+            required: resolution_required,
+            reason: resolution_reason,
+            cli_template: "skein conduct --full-access --project-id PROJECT_ID [--session-id SOURCE_THREAD_ID]".to_owned(),
+            mcp_tool: "conduct".to_owned(),
+            selector_fields: vec!["project_id".to_owned(), "source_thread_id".to_owned()],
+        },
         content_persisted: false,
     })
 }
@@ -521,6 +579,7 @@ fn build_candidate(
     exact_path: bool,
     options: &MatchOptions<'_>,
 ) -> Option<ProjectMatch> {
+    let project_id = project.id;
     let mut evidence = Vec::new();
     let mut latest = None;
     if exact_path {
@@ -640,6 +699,7 @@ fn build_candidate(
             .as_ref()
             .map_or(0, |session| session.score);
     Some(ProjectMatch {
+        rank: 0,
         project: MatchedProject {
             id: project.id,
             name: project.name,
@@ -649,6 +709,10 @@ fn build_candidate(
         latest_matched_at: latest,
         suggested_session,
         evidence,
+        selection: MatchSelection {
+            project_id,
+            source_thread_id: None,
+        },
     })
 }
 

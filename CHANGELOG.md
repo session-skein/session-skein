@@ -7,6 +7,12 @@ after its first published release.
 
 ### Added
 
+- Added actionable ambiguous-route reports with stable ranked project/session
+  selectors, transactionally revalidated explicit resolution, and quick-versus-private
+  recall diagnostics across CLI JSON and MCP.
+- Enforced live per-source recall gates in every private-context query, making
+  revocation immediate before retained rows are reconciled by refresh.
+
 - Added schema-11 content-free byte checkpoints for verified unchanged reuse and
   append-tail parsing of explicitly enabled raw-session context files, with safe full
   fallback and structured work accounting.

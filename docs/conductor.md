@@ -19,6 +19,21 @@ read-only metadata match. No match, low/medium confidence, or ambiguity returns 
 bounded evidence without launching Codex or creating control state. A unique
 high-confidence result receives a content-free ChatGPT-account preflight.
 
+Refusals include ranked candidates with stable project IDs, optional opaque session
+IDs, content-free evidence, and exact selector fields. Preserve the original prompt
+and resolve only the selected ranked identity:
+
+```console
+printf '%s\n' 'the exact original prompt' | \
+  skein conduct --full-access --project-id PROJECT_ID
+printf '%s\n' 'the exact original prompt' | \
+  skein conduct --full-access --project-id PROJECT_ID --session-id SOURCE_THREAD_ID
+```
+
+Selectors are revalidated inside the planning transaction. They cannot select an
+unranked project/session or a worker, and accepted decisions record
+`resolutionKind: user_selected`.
+
 After authentication, Skein begins an immediate SQLite transaction and recomputes the
 route. The selected project, start/resume action, and optional exact thread must match
 the preflight result. The transaction atomically records:
