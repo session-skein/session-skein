@@ -1,5 +1,9 @@
 # Standalone TUI
 
+The selected-run status remains a read-only projection. Durable cancellation and
+lease truth are available through `worker status`/`worker observe`; the TUI never
+labels an interrupt terminal merely because its request was queued.
+
 `skein tui` is a keyboard-first view over Session Skein's existing local registry,
 conductor, and reconnectable Codex workers. Codex CLI and its existing ChatGPT login
 are the runtime. The TUI does not require Agent Deck, tmux, MCP, systemd, a daemon, an

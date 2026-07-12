@@ -234,6 +234,20 @@ enum WorkerCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Observe durable redacted progress from a stable event cursor.
+    Observe {
+        run_id: i64,
+        #[arg(long, default_value_t = 0)]
+        after_cursor: i64,
+        #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..=100))]
+        limit: u32,
+        #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=30_000))]
+        timeout_ms: u64,
+        #[arg(long, conflicts_with = "jsonl")]
+        json: bool,
+        #[arg(long, conflicts_with = "json")]
+        jsonl: bool,
+    },
     /// Attach to redacted live events without owning the worker lifetime.
     Watch {
         /// Numeric Skein run identifier returned by start or resume.
@@ -982,6 +996,36 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             WorkerCommand::Status { run_id, json } => {
                 print_value(&worker_runtime::durable_snapshot(&paths, run_id)?, json)?;
             }
+            WorkerCommand::Observe {
+                run_id,
+                after_cursor,
+                limit,
+                timeout_ms,
+                json,
+                jsonl,
+            } => {
+                let report = worker_runtime::observe(
+                    &paths,
+                    run_id,
+                    after_cursor,
+                    usize::try_from(limit)?,
+                    std::time::Duration::from_millis(timeout_ms),
+                )?;
+                if jsonl {
+                    for event in &report.observation.events {
+                        println!("{}", serde_json::to_string(event)?);
+                    }
+                    println!(
+                        "{}",
+                        serde_json::to_string(&serde_json::json!({
+                            "type": "observation_checkpoint",
+                            "report": report
+                        }))?
+                    );
+                } else {
+                    print_value(&report, json)?;
+                }
+            }
             WorkerCommand::Watch { run_id, jsonl } => {
                 let run = worker_runtime::watch(&paths, run_id, jsonl)?;
                 if jsonl {
@@ -1001,8 +1045,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("stopped worker for run {run_id}");
             }
             WorkerCommand::Interrupt { run_id } => {
-                worker_runtime::interrupt(&paths, run_id)?;
-                println!("interrupt accepted for run {run_id}");
+                let report = worker_runtime::interrupt(&paths, run_id)?;
+                print_value(&report, false)?;
             }
             WorkerCommand::Steer { run_id, request_id } => {
                 let prompt = read_control_prompt()?;

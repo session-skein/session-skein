@@ -1,5 +1,8 @@
 # One-prompt conductor
 
+After dispatch, use `worker observe` (or MCP `observe_run`) with its stable cursor for
+durable monitoring. Interrupt acceptance is a request phase, not terminal completion.
+
 `conduct` is the first standalone entry point above matching and reconnectable Codex
 workers:
 

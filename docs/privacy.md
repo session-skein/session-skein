@@ -43,6 +43,11 @@ personal or proprietary information.
   absent from SQLite, argv, environment variables, logs, and command output.
 - Reconnectable worker events are redacted and retained only in a bounded memory
   window. Historical agent text is not persisted or replayed after a worker exits.
+- Durable monitor events expose only event/action kinds, opaque IDs, timestamps,
+  state, counts, and lease health; detail/failure bodies and private content remain
+  excluded.
+  Observation never invokes recovery, reconciliation, or control mutation while
+  producing those diagnostics.
 - Steer text remains only in authenticated IPC and the worker's memory queue. Durable
   state stores its byte count, opaque request ID, exact turn ID, and fixed outcome.
 - Source reads decode only thread/turn identity, enum-like status, full-history

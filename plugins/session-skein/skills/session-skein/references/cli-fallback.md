@@ -53,12 +53,15 @@ printf '%s\n' 'private prompt' | \
   skein conduct --full-access --request-id UUID --follow
 
 skein worker status RUN_ID
+skein worker observe RUN_ID --after-cursor 0 --json
 skein worker read RUN_ID
 skein worker reconcile RUN_ID --request-id UUID
 ```
 
 Prompts and match queries belong on stdin, not argv. Reuse a request UUID only for
 status/retry of the same logical operation.
+After interrupt, observe from the returned cursor until terminal; queued never means
+cancelled.
 For ambiguity, preserve the original stdin prompt and use the reported `--project-id`,
 plus `--session-id` only for its ranked resumable session.
 

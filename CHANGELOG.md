@@ -7,6 +7,12 @@ after its first published release.
 
 ### Added
 
+- Added durable cursor-based worker observation with bounded wait, cancellation
+  phases, lease/heartbeat health, pending-action diagnostics, and truthful idempotent
+  interrupt reports across CLI and MCP.
+- Made every observation poll strictly read-only; expired leases are reported with
+  explicit recovery guidance and are never recovered as a side effect of monitoring.
+
 - Added actionable ambiguous-route reports with stable ranked project/session
   selectors, transactionally revalidated explicit resolution, and quick-versus-private
   recall diagnostics across CLI JSON and MCP.
