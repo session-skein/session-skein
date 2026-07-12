@@ -12,7 +12,7 @@ Only the latest released version receives security fixes during the pre-1.0 peri
 
 | Version | Supported |
 | --- | --- |
-| `0.5.0-alpha.9` | Yes |
+| `0.5.0-alpha.10` | Yes |
 | Earlier previews | No |
 
 Preview release assets include SHA-256 checksums and GitHub artifact attestations,
