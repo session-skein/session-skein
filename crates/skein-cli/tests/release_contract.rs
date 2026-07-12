@@ -18,7 +18,7 @@ fn read(path: impl AsRef<Path>) -> String {
 
 #[test]
 fn release_workflow_is_pr_testable_tag_gated_and_least_privilege() {
-    let workflow = read(root().join(".github/workflows/release.yml"));
+    let workflow = read(root().join(".github/workflows/release.yml")).replace("\r\n", "\n");
     assert!(workflow.contains("pull_request:"));
     assert!(
         !workflow.contains("    paths:"),
