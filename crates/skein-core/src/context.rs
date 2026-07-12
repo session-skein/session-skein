@@ -652,7 +652,13 @@ fn collect_session_documents(
             continue;
         }
         let Some(cwd) = canonical_existing_directory(&normalized_cwd) else {
-            accounting.unavailable = true;
+            if matching_roots.iter().any(|(root, _)| !root.is_dir()) {
+                accounting.unavailable = true;
+            } else {
+                // The approved root is reachable, so a missing recorded cwd is a
+                // stale/deleted project path rather than an unavailable source.
+                accounting.skipped_outside_roots += 1;
+            }
             continue;
         };
         let authorized = matching_roots
@@ -1224,6 +1230,11 @@ mod tests {
              {{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"outside-session-marker\"}}]}}}}\n",
             cwd = outside.to_string_lossy()
         );
+        let missing_session = format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"cwd\":{cwd:?}}}}}\n\
+             {{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"missing-session-marker\"}}]}}}}\n",
+            cwd = approved.join("deleted-project").to_string_lossy()
+        );
         write(
             &codex_home.join("sessions/2026/inside.jsonl"),
             inside.as_bytes(),
@@ -1231,6 +1242,10 @@ mod tests {
         write(
             &codex_home.join("sessions/2026/outside.jsonl"),
             outside_session.as_bytes(),
+        )?;
+        write(
+            &codex_home.join("sessions/2026/missing.jsonl"),
+            missing_session.as_bytes(),
         )?;
         registry.set_recall_settings(RecallSettings {
             include_codex_memories: false,
@@ -1240,7 +1255,8 @@ mod tests {
         let report = registry
             .refresh_context_documents(&codex_home, ContextDocumentRefreshOptions::default())?;
         assert_eq!(report.sessions.documents, 1);
-        assert_eq!(report.sessions.skipped_outside_roots, 1);
+        assert_eq!(report.sessions.status, ContextSourceRefreshStatus::Updated);
+        assert_eq!(report.sessions.skipped_outside_roots, 2);
         assert_eq!(report.sessions.malformed_lines, 1);
         for marker in ["user-session-marker", "assistant-session-marker"] {
             let hits = registry.search_context_documents(marker, 10)?;
@@ -1255,6 +1271,7 @@ mod tests {
             "developer-secret-marker",
             "tool-secret-marker",
             "outside-session-marker",
+            "missing-session-marker",
         ] {
             assert!(registry.search_context_documents(marker, 10)?.is_empty());
         }
