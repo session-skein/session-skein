@@ -254,9 +254,16 @@ fn plugin_skill_and_installer_versions_match_the_crate() {
 
     let skill_path = root.join("plugins/session-skein/skills/session-skein/SKILL.md");
     let skill = read(&skill_path);
-    assert!(skill.starts_with("---\nname: session-skein\ndescription: "));
-    assert!(skill.matches('\n').count() < 500, "skill must stay concise");
-    assert!(!skill.contains("TODO"), "skill contains a placeholder");
+    let normalized_skill = skill.replace("\r\n", "\n");
+    assert!(normalized_skill.starts_with("---\nname: session-skein\ndescription: "));
+    assert!(
+        normalized_skill.matches('\n').count() < 500,
+        "skill must stay concise"
+    );
+    assert!(
+        !normalized_skill.contains("TODO"),
+        "skill contains a placeholder"
+    );
     assert!(
         skill_path
             .with_file_name("agents")
