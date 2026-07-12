@@ -327,12 +327,14 @@ fn tool_catalog(allow_control: bool) -> Vec<Tool> {
         ),
         tool(
             "conduct",
-            "Route one private prompt and start/resume a reconnectable Codex worker only for a unique high-confidence match. Requires explicit full-access acknowledgement.",
+            "Route one private prompt. Automatic dispatch requires a unique high-confidence match; an exact project_id and optional source_thread_id from a prior ranked result explicitly resolve ambiguity without reinterpretation. Requires explicit full-access acknowledgement.",
             json!({
                 "prompt": {"type": "string", "minLength": 1, "maxLength": 65536},
                 "full_access_acknowledged": {"type": "boolean", "const": true},
                 "request_id": {"type": "string", "format": "uuid"},
-                "include_session_text": {"type": "boolean", "default": false}
+                "include_session_text": {"type": "boolean", "default": false},
+                "project_id": {"type": "integer", "minimum": 1},
+                "source_thread_id": {"type": "string", "minLength": 1}
             }),
             &["prompt", "full_access_acknowledged", "request_id"],
             false,
@@ -608,6 +610,8 @@ struct ConductArgs {
     request_id: String,
     #[serde(default)]
     include_session_text: bool,
+    project_id: Option<i64>,
+    source_thread_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -653,6 +657,19 @@ fn search_projects(paths: &SkeinPaths, args: SearchArgs) -> Result<Value, String
     } else {
         Vec::new()
     };
+    let settings = registry.get_recall_settings().map_err(error_string)?;
+    let freshness = registry
+        .catalog_freshness(unix_timestamp(), skein_core::DEFAULT_STALE_AFTER_SECONDS)
+        .map_err(error_string)?;
+    let private_authorized = settings.include_codex_memories || settings.include_codex_sessions;
+    let mut sources_consulted = vec!["project_metadata", "project_documents"];
+    if args.include_deep_context && settings.include_codex_memories {
+        sources_consulted.push("codex_memory");
+    }
+    if args.include_deep_context && settings.include_codex_sessions {
+        sources_consulted.push("codex_session");
+    }
+    let context_truncated = context_matches.len() == args.limit;
     Ok(json!({
         "ok": true,
         "setupRequired": setup_required,
@@ -660,6 +677,22 @@ fn search_projects(paths: &SkeinPaths, args: SearchArgs) -> Result<Value, String
         "setupHint": setup_required.then_some("Ask the user which directory may be indexed, call add_scan_root (recursive=true only when nested repositories should be discovered), then call refresh_index."),
         "documentMatches": document_matches,
         "contextMatches": context_matches,
+        "recall": {
+            "mode": if args.include_deep_context { "deep_private" } else { "quick_indexed" },
+            "sourcesConsulted": sources_consulted,
+            "privateContextAuthorized": private_authorized,
+            "privateSources": settings,
+            "contextFreshness": freshness.context,
+            "limit": args.limit,
+            "contextReturned": context_matches.len(),
+            "contextPossiblyTruncated": context_truncated,
+            "escalationSuggested": !args.include_deep_context && private_authorized,
+            "escalationReason": (!args.include_deep_context && private_authorized).then_some("quick recall did not consult enabled private context"),
+            "nextTool": (!args.include_deep_context).then_some(json!({
+                "name": "search_projects",
+                "arguments": {"query": "repeat the same private query", "include_deep_context": true}
+            }))
+        },
         "report": report
     }))
 }
@@ -1086,6 +1119,15 @@ async fn conduct(args: ConductArgs) -> Result<Value, String> {
     if args.include_session_text {
         argv.push("--include-session-text".to_owned());
     }
+    if let Some(project_id) = args.project_id {
+        argv.extend(["--project-id".to_owned(), project_id.to_string()]);
+    }
+    if let Some(thread_id) = args.source_thread_id {
+        if args.project_id.is_none() {
+            return Err("source_thread_id requires project_id".to_owned());
+        }
+        argv.extend(["--session-id".to_owned(), thread_id]);
+    }
     let refs = argv.iter().map(String::as_str).collect::<Vec<_>>();
     invoke_cli_json(&refs, Some(args.prompt.as_bytes())).await
 }
@@ -1445,6 +1487,58 @@ mod tests {
         assert_eq!(value["rawTranscriptIndexing"], false);
         assert_eq!(value["generatedMemoryIndexing"], false);
         assert_eq!(value["deepRecallDefault"], false);
+    }
+
+    #[test]
+    fn recall_diagnostics_require_explicit_deep_search_and_do_not_expose_content() {
+        let temp = tempfile::tempdir().expect("temporary recall state");
+        let paths = SkeinPaths::new(temp.path().join("config"), temp.path().join("data"));
+        let registry = Registry::open(&paths).expect("initialize recall state");
+        registry
+            .set_recall_settings(skein_core::RecallSettings {
+                include_codex_memories: true,
+                include_codex_sessions: false,
+            })
+            .expect("enable synthetic memory gate without reading sources");
+
+        let quick = search_projects(
+            &paths,
+            SearchArgs {
+                query: "synthetic query".to_owned(),
+                limit: 5,
+                include_session_text: false,
+                include_deep_context: false,
+            },
+        )
+        .expect("quick recall diagnostics");
+        assert_eq!(quick["recall"]["mode"], "quick_indexed");
+        assert_eq!(quick["recall"]["privateContextAuthorized"], true);
+        assert_eq!(quick["recall"]["escalationSuggested"], true);
+        assert_eq!(quick["contextMatches"], json!([]));
+        assert!(quick["recall"]["contextFreshness"].is_object());
+
+        let deep = search_projects(
+            &paths,
+            SearchArgs {
+                query: "synthetic query".to_owned(),
+                limit: 5,
+                include_session_text: false,
+                include_deep_context: true,
+            },
+        )
+        .expect("explicit deep recall diagnostics");
+        assert_eq!(deep["recall"]["mode"], "deep_private");
+        assert_eq!(deep["recall"]["escalationSuggested"], false);
+        assert_eq!(deep["contextMatches"], json!([]));
+        assert_eq!(
+            deep["recall"]["sourcesConsulted"],
+            json!(["project_metadata", "project_documents", "codex_memory"])
+        );
+        assert!(
+            deep["recall"]["sourcesConsulted"]
+                .as_array()
+                .is_some_and(|sources| !sources.iter().any(|source| source == "codex_session"))
+        );
     }
 
     #[test]

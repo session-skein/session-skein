@@ -64,10 +64,10 @@ domain model. The binary crate composes them.
 | [`recall.rs`](../crates/skein-core/src/recall.rs) | Bounded project identity documents and FTS | Search and project matching |
 | [`context.rs`](../crates/skein-core/src/context.rs) | Defaults-off snippets, verified JSONL tail reuse, and FTS | Deep-context search and global index reports |
 | [`session.rs`](../crates/skein-core/src/session.rs) | Source-neutral thread metadata and project binding | Recovery, routing, summaries |
-| [`insight.rs`](../crates/skein-core/src/insight.rs) | Scoring evidence, project cards, day summaries | `match`, `summary`, conductor plan |
+| [`insight.rs`](../crates/skein-core/src/insight.rs) | Ranked scoring evidence, stable route selectors, project cards, day summaries | `match`, `summary`, conductor plan |
 | [`control.rs`](../crates/skein-core/src/control.rs) | Policies, runs, turns, actions, events, reconciliation | Foreground and worker control |
 | [`worker.rs`](../crates/skein-core/src/worker.rs) | Leases, fencing, ownership, mutation plans | Detached worker runtime |
-| [`conductor.rs`](../crates/skein-core/src/conductor.rs) | Atomic route receipt and fail-closed dispatch plan | CLI, TUI, MCP conduct paths |
+| [`conductor.rs`](../crates/skein-core/src/conductor.rs) | Atomic automatic or explicitly selected route receipt and fail-closed dispatch plan | CLI, TUI, MCP conduct paths |
 
 ## Main data flows
 

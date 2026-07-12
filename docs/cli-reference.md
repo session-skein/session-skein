@@ -151,8 +151,10 @@ session refresh described in [indexing and search](indexing-and-search.md).
 
 ### `search`
 
-Returns ranked projects and document/context hits. `--include-session-text` only
-permits names/previews previously imported with `--include-text`.
+Returns ranked projects and project-document hits. `--include-session-text` only
+permits names/previews previously imported with `--include-text`. `--deep-context`
+explicitly adds enabled private context hits; `recall` reports consulted sources,
+authorization, freshness, limits, truncation, and escalation guidance.
 
 ## Private context
 
@@ -183,6 +185,13 @@ this call; `--max-files` defaults to 1000.
 ### `context search`
 
 Searches only opted-in private context and returns bounded snippets.
+
+### `conduct`
+
+Automatic dispatch requires one unique high-confidence route. Ranked candidates expose
+stable project/session selectors. `--project-id ID` selects one ranked project and
+optional `--session-id THREAD` selects its ranked resumable session; both are
+revalidated transactionally against the unchanged stdin prompt.
 
 ## Codex session metadata
 

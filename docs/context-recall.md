@@ -9,6 +9,8 @@ skein context memories enable
 skein context sessions enable
 skein context refresh
 skein context search webhook reconciliation
+skein search webhook reconciliation
+skein search --deep-context webhook reconciliation
 ```
 
 `CODEX_HOME` selects the source directory, defaulting to `~/.codex`; a one-shot
@@ -42,6 +44,11 @@ Each enabled source is reconciled atomically with its FTS rows. Settings and app
 roots are revalidated after the write lock is acquired. Disabling a source changes
 only its gate; the next `context refresh` or `index` atomically removes that source's
 previous documents.
+
+The gate also applies at query time. Disabling a source immediately makes retained
+rows non-searchable; no refresh is required for revocation. Re-enabling may make
+those owner-private rows searchable again before refresh, with their existing
+freshness timestamps. Refresh when current source coverage is required.
 
 Raw-session JSONL reconciliation is incrementally parsed after the first full build.
 For each admitted file, Skein stores only bounded byte length beside the existing
@@ -78,3 +85,9 @@ MCP search does not expose deep-context snippets by default. A caller must also 
 `include_deep_context=true`; those snippets then enter Codex's model context and may
 be sent by Codex to OpenAI or another configured provider. Session Skein has no
 network client of its own.
+
+General CLI and MCP search returns `recall` diagnostics: quick versus private mode,
+exact consulted source families derived from enabled gates, conservative freshness,
+result limits, possible truncation, and the explicit escalation path. Quick mode never
+queries private context rows. Deep mode searches only already authorized and indexed
+rows; source enablement and refresh remain separate explicit operations.

@@ -34,6 +34,7 @@ do not blindly run both examples.
 
 ```console
 skein search distinctive terms
+skein search --deep-context distinctive terms  # explicit private recall only
 skein session list --project /registered/project
 skein worker list --active
 skein summary project /registered/project
@@ -58,6 +59,8 @@ skein worker reconcile RUN_ID --request-id UUID
 
 Prompts and match queries belong on stdin, not argv. Reuse a request UUID only for
 status/retry of the same logical operation.
+For ambiguity, preserve the original stdin prompt and use the reported `--project-id`,
+plus `--session-id` only for its ranked resumable session.
 
 ## Private context
 

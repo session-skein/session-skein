@@ -97,6 +97,9 @@ enum Command {
         /// Permit explicitly imported session names/previews in metadata scoring.
         #[arg(long)]
         include_session_text: bool,
+        /// Consult enabled private memory/session context after explicit user intent.
+        #[arg(long)]
+        deep_context: bool,
         /// Emit machine-readable JSON.
         #[arg(long)]
         json: bool,
@@ -159,6 +162,12 @@ struct ConductArgs {
     /// Permit previously opted-in session names/previews to influence local routing.
     #[arg(long)]
     include_session_text: bool,
+    /// Select one ranked project by stable ID when automatic routing is ambiguous.
+    #[arg(long)]
+    project_id: Option<i64>,
+    /// Resume this ranked session exactly; requires --project-id.
+    #[arg(long, requires = "project_id")]
+    session_id: Option<String>,
     /// Stable UUID; reuse is a status lookup and never resubmits prompt content.
     #[arg(long)]
     request_id: Option<String>,
@@ -794,6 +803,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             query,
             limit,
             include_session_text,
+            deep_context,
             json,
         } => {
             let query = query.join(" ");
@@ -806,12 +816,40 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 now: unix_timestamp(),
             })?;
             let documents = registry.search_project_documents(&query, limit)?;
-            let context = registry.search_context_documents(&query, limit)?;
+            let settings = registry.get_recall_settings()?;
+            let freshness = registry
+                .catalog_freshness(unix_timestamp(), skein_core::DEFAULT_STALE_AFTER_SECONDS)?;
+            let mut sources_consulted = vec!["project_metadata", "project_documents"];
+            if deep_context && settings.include_codex_memories {
+                sources_consulted.push("codex_memory");
+            }
+            if deep_context && settings.include_codex_sessions {
+                sources_consulted.push("codex_session");
+            }
+            let context = if deep_context {
+                registry.search_context_documents(&query, limit)?
+            } else {
+                Vec::new()
+            };
+            let context_truncated = context.len() == limit;
             print_value(
                 &serde_json::json!({
                     "metadata": metadata,
                     "documents": documents,
-                    "context": context
+                    "context": context,
+                    "recall": {
+                        "mode": if deep_context { "deep_private" } else { "quick_indexed" },
+                        "sourcesConsulted": sources_consulted,
+                        "privateContextAuthorized": settings.include_codex_memories || settings.include_codex_sessions,
+                        "privateSources": settings,
+                        "contextFreshness": freshness.context,
+                        "limit": limit,
+                        "contextReturned": context.len(),
+                        "contextPossiblyTruncated": context_truncated,
+                        "escalationSuggested": !deep_context && (settings.include_codex_memories || settings.include_codex_sessions),
+                        "escalationReason": (!deep_context && (settings.include_codex_memories || settings.include_codex_sessions)).then_some("quick recall did not consult enabled private context"),
+                        "nextCommand": (!deep_context).then_some("skein search --deep-context QUERY")
+                    }
                 }),
                 json,
             )?;
@@ -1130,10 +1168,15 @@ fn conduct(paths: &SkeinPaths, args: ConductArgs) -> Result<(), Box<dyn std::err
         return Ok(());
     }
 
+    let explicit_selection = args.project_id.is_some();
     let preflight = read_only.match_conductor_metadata(&skein_core::MatchOptions {
         query: &prompt,
         include_text: args.include_session_text,
-        limit: 5,
+        limit: if explicit_selection {
+            skein_core::MAX_MATCH_CANDIDATES
+        } else {
+            5
+        },
         now: unix_timestamp(),
     })?;
     let Some(recommendation) = preflight.recommendation.as_ref() else {
@@ -1142,9 +1185,10 @@ fn conduct(paths: &SkeinPaths, args: ConductArgs) -> Result<(), Box<dyn std::err
             skein_core::Error::InvalidControlRequest("route_refused:no_match".to_owned()).into(),
         );
     };
-    if recommendation.confidence != skein_core::MatchConfidence::High
-        || recommendation.ambiguous
-        || !recommendation.dispatchable
+    if !explicit_selection
+        && (recommendation.confidence != skein_core::MatchConfidence::High
+            || recommendation.ambiguous
+            || !recommendation.dispatchable)
     {
         print_route_refusal(&preflight, args.json, args.jsonl)?;
         return Err(skein_core::Error::InvalidControlRequest(
@@ -1152,10 +1196,11 @@ fn conduct(paths: &SkeinPaths, args: ConductArgs) -> Result<(), Box<dyn std::err
         )
         .into());
     }
-    if let Some(session) = preflight
-        .candidates
-        .first()
-        .and_then(|candidate| candidate.suggested_session.as_ref())
+    if !explicit_selection
+        && let Some(session) = preflight
+            .candidates
+            .first()
+            .and_then(|candidate| candidate.suggested_session.as_ref())
         && session
             .evidence
             .iter()
@@ -1172,9 +1217,44 @@ fn conduct(paths: &SkeinPaths, args: ConductArgs) -> Result<(), Box<dyn std::err
         ))
         .into());
     }
-    let expected_project_id = recommendation.project_id;
-    let expected_action = recommendation.action.clone();
-    let expected_thread_id = recommendation.source_thread_id.clone();
+    let (expected_project_id, expected_action, expected_thread_id) =
+        if let Some(project_id) = args.project_id {
+            let candidate = preflight
+                .candidates
+                .iter()
+                .find(|candidate| candidate.project.id == project_id)
+                .ok_or_else(|| {
+                    skein_core::Error::InvalidControlRequest(
+                        "route_refused:selection_not_ranked".to_owned(),
+                    )
+                })?;
+            if let Some(thread_id) = args.session_id.as_deref()
+                && !candidate.suggested_session.as_ref().is_some_and(|session| {
+                    session.source_thread_id == thread_id && session.resumable
+                })
+            {
+                return Err(skein_core::Error::InvalidControlRequest(
+                    "route_refused:session_not_ranked_or_resumable".to_owned(),
+                )
+                .into());
+            }
+            (
+                project_id,
+                if args.session_id.is_some() {
+                    "resume"
+                } else {
+                    "start"
+                }
+                .to_owned(),
+                args.session_id.clone(),
+            )
+        } else {
+            (
+                recommendation.project_id,
+                recommendation.action.clone(),
+                recommendation.source_thread_id.clone(),
+            )
+        };
     drop(read_only);
 
     // Content-free ChatGPT authentication preflight. The detached worker checks again.
@@ -1190,6 +1270,7 @@ fn conduct(paths: &SkeinPaths, args: ConductArgs) -> Result<(), Box<dyn std::err
             action: &expected_action,
             source_thread_id: expected_thread_id.as_deref(),
         },
+        explicit_selection,
     })?;
     match outcome {
         skein_core::ConductorPlanOutcome::Created {
@@ -1530,10 +1611,11 @@ fn print_match_report(
     );
     for (index, candidate) in report.candidates.iter().enumerate() {
         println!(
-            "{}. {} [{}]",
-            index + 1,
+            "{}. {} [{}] (project id {})",
+            candidate.rank.max(index + 1),
             candidate.project.name,
-            candidate.score
+            candidate.score,
+            candidate.project.id
         );
         for evidence in &candidate.evidence {
             println!(
@@ -1550,6 +1632,10 @@ fn print_match_report(
                 );
             }
         }
+    }
+    if report.resolution.required {
+        println!("No work was dispatched. Select one ranked candidate explicitly:");
+        println!("  {}", report.resolution.cli_template);
     }
     Ok(())
 }

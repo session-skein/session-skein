@@ -54,6 +54,10 @@ route change aborts rather than falling through to another project. Process spaw
 prompt submission happen only after commit; an expired worker with no dispatched
 action becomes a deterministic failed run, never an uncertain recovery claim.
 
+Ambiguous and weak automatic matches remain non-dispatching. A caller may select only
+an exact project/session identity from the ranked report; the transaction recomputes
+that set and records `user_selected`, refusing disappeared or mismatched selectors.
+
 The standalone TUI is a presentation and controller layer over these same commands
 and records. Its render loop performs no database, filesystem, Codex, or worker I/O.
 Background catalog reads use a read-only SQLite connection; selected-run polling and

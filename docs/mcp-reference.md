@@ -52,7 +52,11 @@ The server returns structured JSON inside MCP content. A fresh database may retu
 `query` is 1–65,536 characters and `limit` is 1–50. Deep context is false even when
 sources are enabled. Set it true only when the user intends private memory/session
 snippets to enter model context. Results contain ranked evidence and bounded document
-hits, never whole source documents.
+hits, never whole source documents. The `recall` diagnostic reports quick/deep mode,
+consulted sources, private gates, conservative freshness, limits, possible truncation,
+and an explicit escalation input. Quick mode does not query private context rows.
+Deep results and `sourcesConsulted` are filtered by the live memory/session gates, so
+disabling either source revokes its retained rows immediately without a refresh.
 
 ### `get_project`
 
@@ -193,6 +197,9 @@ These tools do not exist unless the server starts with `--allow-control`.
 Prompt length is 1–65,536. Authority must be literal `true`; `request_id` must be a
 UUID. A repeated UUID returns status and never resubmits prompt content. Dispatch
 requires a unique high-confidence route.
+Optional `project_id` and `source_thread_id` select identities from the prior ranked
+report; a thread requires its project. Explicit selectors preserve the original
+prompt, are transactionally revalidated, and cannot select an unranked identity.
 
 ### `steer_run`
 

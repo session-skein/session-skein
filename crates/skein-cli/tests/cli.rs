@@ -1924,6 +1924,23 @@ fn conductor_refuses_ambiguous_and_unacknowledged_routes_before_codex_or_control
     let report: Value = serde_json::from_slice(&ambiguous.stdout)?;
     assert_eq!(report["recommendation"]["confidence"], "low");
     assert_eq!(report["recommendation"]["ambiguous"], true);
+    assert_eq!(report["schemaVersion"], 2);
+    assert_eq!(report["resolution"]["required"], true);
+    assert_eq!(
+        report["resolution"]["reason"],
+        "multiple_plausible_candidates"
+    );
+    assert_eq!(report["candidates"].as_array().map(Vec::len), Some(2));
+    for (index, candidate) in report["candidates"]
+        .as_array()
+        .expect("ranked candidates")
+        .iter()
+        .enumerate()
+    {
+        assert_eq!(candidate["rank"], index + 1);
+        assert!(candidate["selection"]["projectId"].is_i64());
+        assert!(candidate["evidence"].is_array());
+    }
 
     let paths = skein_core::SkeinPaths::new(config, data);
     let registry = skein_core::Registry::open_read_only(&paths)?;
@@ -2043,6 +2060,7 @@ fn conductor_retry_recovers_an_expired_preallocated_worker_without_codex()
             action: "start",
             source_thread_id: None,
         },
+        explicit_selection: false,
     })?;
     assert!(matches!(
         outcome,
