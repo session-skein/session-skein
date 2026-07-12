@@ -62,6 +62,9 @@ configuration API.
 - WAL sidecar files may contain recent state and must be included in a live backup.
 - A newer schema may not be readable by an older binary. Back up before upgrades when
   rollback matters.
+- Schema 11 adds a bounded byte-length checkpoint beside the existing whole-file
+  fingerprint for opted-in raw-session context documents. Older rows start with no
+  checkpoint and therefore receive a safe full parse on their next refresh.
 
 ## Worker capability files
 

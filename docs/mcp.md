@@ -120,5 +120,7 @@ working:
   user/assistant message projections.
 
 This restores scan-root, project-document, and defaults-off bounded context recall
-while keeping recursion explicit. Remaining roadmap work includes incremental
-activity ingestion, richer repository maps/descriptions, and an optional scheduler.
+while keeping recursion explicit. Opted-in raw-session JSONL refreshes reuse verified
+unchanged documents and parse only verified append tails; content-free app-server
+activity synchronization remains a bounded authoritative page walk. Remaining roadmap
+work includes richer repository maps/descriptions and an optional scheduler.

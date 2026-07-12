@@ -153,6 +153,9 @@ Offline roots retain cached project relationships and return a deferral. Scoped 
 also report context and session synchronization as deferred because those are global
 atomic sources.
 
+Global refresh results include the raw-session `mode` and file/byte/record accounting.
+MCP stdout remains JSON-RPC only and never includes private checkpoint content.
+
 ### `refresh_activity`
 
 Compatibility refresh with:

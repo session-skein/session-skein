@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::fs;
 use std::fs::File;
@@ -39,6 +40,7 @@ CREATE TABLE IF NOT EXISTS context_documents (
     title TEXT NOT NULL,
     body TEXT NOT NULL,
     imported_bytes INTEGER NOT NULL CHECK(imported_bytes >= 0 AND imported_bytes <= 524288),
+    source_bytes INTEGER NOT NULL DEFAULT 0 CHECK(source_bytes >= 0 AND source_bytes <= 1048576),
     UNIQUE(source_kind, source_path)
 );
 CREATE INDEX IF NOT EXISTS context_documents_project ON context_documents(project_id, source_kind);
@@ -120,6 +122,18 @@ pub enum ContextSourceRefreshStatus {
     DeferredTruncated,
 }
 
+/// Work strategy used to prepare one bounded source observation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextRefreshMode {
+    Full,
+    Incremental,
+    Unchanged,
+    FallbackFull,
+    Disabled,
+    Deferred,
+}
+
 /// Privacy and bounds accounting for one deep-recall source.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -130,6 +144,8 @@ pub struct ContextSourceRefreshReport {
     pub enabled: bool,
     /// Atomic rebuild decision.
     pub status: ContextSourceRefreshStatus,
+    /// Whether files were fully parsed, incrementally extended, reused, or deferred.
+    pub mode: ContextRefreshMode,
     /// Candidate regular files admitted by this source's file budget.
     pub files_considered: usize,
     /// Documents prepared from this observation; deferred statuses retain prior rows.
@@ -146,6 +162,20 @@ pub struct ContextSourceRefreshReport {
     pub malformed_lines: usize,
     /// Whether this source's configurable file budget stopped discovery.
     pub truncated: bool,
+    /// Source bytes read to prove fingerprints and process changed tails.
+    pub bytes_read: usize,
+    /// JSONL records parsed during this observation.
+    pub records_considered: usize,
+    /// Files reused without JSON/message parsing after full fingerprint verification.
+    pub files_reused: usize,
+    /// Append-only files whose verified prefix reused the prior private document.
+    pub files_incremental: usize,
+    /// Files parsed from the beginning.
+    pub files_full: usize,
+    /// Files which had a checkpoint but safely fell back to a full parse.
+    pub fallback_files: usize,
+    /// Previously indexed files absent or no longer admissible in this observation.
+    pub files_deleted: usize,
 }
 
 /// Result of rebuilding opted-in local context sources.
@@ -198,6 +228,19 @@ struct ContextDocument {
     title: String,
     body: String,
     imported_bytes: usize,
+    source_bytes: usize,
+}
+
+#[derive(Clone)]
+struct ExistingContextDocument {
+    source_path: PathBuf,
+    project_id: Option<i64>,
+    context_path: Option<PathBuf>,
+    fingerprint: String,
+    title: String,
+    body: String,
+    imported_bytes: usize,
+    source_bytes: usize,
 }
 
 #[derive(Default)]
@@ -209,6 +252,14 @@ struct SourceAccounting {
     malformed_lines: usize,
     truncated: bool,
     unavailable: bool,
+    bytes_read: usize,
+    records_considered: usize,
+    files_reused: usize,
+    files_incremental: usize,
+    files_full: usize,
+    fallback_files: usize,
+    files_deleted: usize,
+    had_checkpoints: bool,
 }
 
 struct CollectedFiles {
@@ -277,9 +328,20 @@ impl Registry {
         } else {
             (Vec::new(), SourceAccounting::default())
         };
+        let existing_session_documents = if settings.include_codex_sessions {
+            existing_context_documents(&self.connection, ContextSourceKind::CodexSession)?
+        } else {
+            BTreeMap::new()
+        };
         let (session_documents, mut session_accounting) = if settings.include_codex_sessions {
             let mut remaining = options.max_files;
-            collect_session_documents(codex_home, &approved_roots, &projects, &mut remaining)?
+            collect_session_documents(
+                codex_home,
+                &approved_roots,
+                &projects,
+                &existing_session_documents,
+                &mut remaining,
+            )?
         } else {
             (Vec::new(), SourceAccounting::default())
         };
@@ -435,10 +497,30 @@ fn source_report(
     accounting: SourceAccounting,
     documents: &[ContextDocument],
 ) -> ContextSourceRefreshReport {
+    let mode = if !enabled {
+        ContextRefreshMode::Disabled
+    } else if matches!(
+        status,
+        ContextSourceRefreshStatus::DeferredUnavailable
+            | ContextSourceRefreshStatus::DeferredTruncated
+    ) {
+        ContextRefreshMode::Deferred
+    } else if accounting.fallback_files > 0 {
+        ContextRefreshMode::FallbackFull
+    } else if accounting.files_incremental > 0 || accounting.files_deleted > 0 {
+        ContextRefreshMode::Incremental
+    } else if accounting.files_full > 0 {
+        ContextRefreshMode::Full
+    } else if accounting.files_reused > 0 || accounting.had_checkpoints {
+        ContextRefreshMode::Unchanged
+    } else {
+        ContextRefreshMode::Full
+    };
     ContextSourceRefreshReport {
         source_kind,
         enabled,
         status,
+        mode,
         files_considered: accounting.files_considered,
         documents: documents.len(),
         imported_bytes: documents
@@ -450,7 +532,44 @@ fn source_report(
         skipped_outside_roots: accounting.skipped_outside_roots,
         malformed_lines: accounting.malformed_lines,
         truncated: accounting.truncated,
+        bytes_read: accounting.bytes_read,
+        records_considered: accounting.records_considered,
+        files_reused: accounting.files_reused,
+        files_incremental: accounting.files_incremental,
+        files_full: accounting.files_full,
+        fallback_files: accounting.fallback_files,
+        files_deleted: accounting.files_deleted,
     }
+}
+
+fn existing_context_documents(
+    connection: &rusqlite::Connection,
+    source_kind: ContextSourceKind,
+) -> Result<BTreeMap<PathBuf, ExistingContextDocument>> {
+    let mut statement = connection.prepare(
+        "SELECT source_path, project_id, context_path, fingerprint, title, body,
+                imported_bytes, source_bytes
+           FROM context_documents WHERE source_kind = ?1 ORDER BY source_path",
+    )?;
+    let documents = statement
+        .query_map([source_kind.as_str()], |row| {
+            let source_path = PathBuf::from(row.get::<_, String>(0)?);
+            Ok((
+                source_path.clone(),
+                ExistingContextDocument {
+                    source_path,
+                    project_id: row.get(1)?,
+                    context_path: row.get::<_, Option<String>>(2)?.map(PathBuf::from),
+                    fingerprint: row.get(3)?,
+                    title: row.get(4)?,
+                    body: row.get(5)?,
+                    imported_bytes: usize::try_from(row.get::<_, i64>(6)?).unwrap_or(0),
+                    source_bytes: usize::try_from(row.get::<_, i64>(7)?).unwrap_or(0),
+                },
+            ))
+        })?
+        .collect::<std::result::Result<BTreeMap<_, _>, _>>()?;
+    Ok(documents)
 }
 
 fn existing_sessions_use_unavailable_roots(
@@ -482,7 +601,7 @@ fn replace_context_source(
     documents: &[ContextDocument],
 ) -> Result<ContextSourceRefreshStatus> {
     let mut statement = transaction.prepare(
-        "SELECT source_path, fingerprint, project_id, context_path
+        "SELECT source_path, fingerprint, project_id, context_path, source_bytes
            FROM context_documents WHERE source_kind = ?1 ORDER BY source_path",
     )?;
     let existing = statement
@@ -492,6 +611,7 @@ fn replace_context_source(
                 row.get::<_, String>(1)?,
                 row.get::<_, Option<i64>>(2)?,
                 row.get::<_, Option<String>>(3)?,
+                row.get::<_, i64>(4)?,
             ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -507,6 +627,7 @@ fn replace_context_source(
                     .context_path
                     .as_ref()
                     .map(|path| path.to_string_lossy().into_owned()),
+                i64::try_from(document.source_bytes).unwrap_or(i64::MAX),
             )
         })
         .collect::<Vec<_>>();
@@ -531,8 +652,8 @@ fn replace_context_source(
         transaction.execute(
             "INSERT INTO context_documents (
                 source_kind, source_path, project_id, context_path, fingerprint,
-                refreshed_at, title, body, imported_bytes
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                refreshed_at, title, body, imported_bytes, source_bytes
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 document.source_kind.as_str(),
                 document.source_path.to_string_lossy(),
@@ -546,6 +667,7 @@ fn replace_context_source(
                 document.title,
                 document.body,
                 i64::try_from(document.imported_bytes).unwrap_or(i64::MAX),
+                i64::try_from(document.source_bytes).unwrap_or(i64::MAX),
             ],
         )?;
         let id = transaction.last_insert_rowid();
@@ -579,6 +701,8 @@ fn collect_memory_documents(
                 continue;
             }
         };
+        accounting.bytes_read = accounting.bytes_read.saturating_add(bytes.len());
+        accounting.files_full += 1;
         if bytes.is_empty() {
             accounting.skipped_malformed_or_empty += 1;
             continue;
@@ -602,6 +726,7 @@ fn collect_memory_documents(
             title,
             body,
             imported_bytes,
+            source_bytes: bytes.len(),
         });
     }
     documents.sort_by(|left, right| left.source_path.cmp(&right.source_path));
@@ -612,6 +737,7 @@ fn collect_session_documents(
     codex_home: &Path,
     approved_roots: &[PathBuf],
     projects: &[Project],
+    existing: &BTreeMap<PathBuf, ExistingContextDocument>,
     remaining: &mut usize,
 ) -> Result<(Vec<ContextDocument>, SourceAccounting)> {
     let collected =
@@ -620,10 +746,12 @@ fn collect_session_documents(
         files_considered: collected.paths.len(),
         truncated: collected.truncated,
         unavailable: collected.unavailable,
+        had_checkpoints: !existing.is_empty(),
         ..SourceAccounting::default()
     };
     let mut documents = Vec::new();
     for path in collected.paths {
+        let source_path = relative_source_path(codex_home, &path)?;
         let bytes = match read_bounded_source(&path)? {
             BoundedFile::Bytes(bytes) => bytes,
             BoundedFile::Oversized => {
@@ -631,7 +759,60 @@ fn collect_session_documents(
                 continue;
             }
         };
+        accounting.bytes_read = accounting.bytes_read.saturating_add(bytes.len());
+        let checkpoint = existing.get(&source_path);
+        if let Some(checkpoint) = checkpoint
+            && checkpoint.source_bytes > 0
+            && checkpoint.source_bytes == bytes.len()
+            && checkpoint.fingerprint
+                == content_fingerprint(ContextSourceKind::CodexSession, &path, &bytes)
+            && checkpoint_context_authorized(checkpoint, approved_roots)
+        {
+            accounting.files_reused += 1;
+            documents.push(context_document_from_checkpoint(checkpoint));
+            continue;
+        }
+        if let Some(checkpoint) = checkpoint
+            && checkpoint.source_bytes > 0
+            && bytes.len() > checkpoint.source_bytes
+            && bytes
+                .get(checkpoint.source_bytes.saturating_sub(1))
+                .is_some_and(|byte| *byte == b'\n')
+            && checkpoint.fingerprint
+                == content_fingerprint(
+                    ContextSourceKind::CodexSession,
+                    &path,
+                    &bytes[..checkpoint.source_bytes],
+                )
+            && checkpoint_context_authorized(checkpoint, approved_roots)
+        {
+            let parsed = parse_session_document(&bytes[checkpoint.source_bytes..]);
+            accounting.records_considered += parsed.records_considered;
+            accounting.malformed_lines += parsed.malformed_lines;
+            let tail_cwd_matches = parsed.cwd.as_ref().is_none_or(|cwd| {
+                checkpoint
+                    .context_path
+                    .as_ref()
+                    .is_some_and(|existing| same_canonical_directory(cwd, existing))
+            });
+            if tail_cwd_matches {
+                let mut document = context_document_from_checkpoint(checkpoint);
+                append_preformatted_context(&mut document.body, &parsed.body);
+                document.imported_bytes = document.body.len();
+                document.source_bytes = bytes.len();
+                document.fingerprint =
+                    content_fingerprint(ContextSourceKind::CodexSession, &path, &bytes);
+                accounting.files_incremental += 1;
+                documents.push(document);
+                continue;
+            }
+        }
+        if checkpoint.is_some() {
+            accounting.fallback_files += 1;
+        }
+        accounting.files_full += 1;
         let parsed = parse_session_document(&bytes);
+        accounting.records_considered += parsed.records_considered;
         accounting.malformed_lines += parsed.malformed_lines;
         let Some(recorded_cwd) = parsed.cwd else {
             accounting.skipped_malformed_or_empty += 1;
@@ -681,7 +862,6 @@ fn collect_session_documents(
             accounting.skipped_malformed_or_empty += 1;
             continue;
         }
-        let source_path = relative_source_path(codex_home, &path)?;
         let project_id = projects
             .iter()
             .filter(|project| cwd.starts_with(&project.path))
@@ -702,9 +882,18 @@ fn collect_session_documents(
             title,
             body: parsed.body,
             imported_bytes,
+            source_bytes: bytes.len(),
         });
     }
     documents.sort_by(|left, right| left.source_path.cmp(&right.source_path));
+    accounting.files_deleted = existing
+        .keys()
+        .filter(|path| {
+            !documents
+                .iter()
+                .any(|document| &document.source_path == *path)
+        })
+        .count();
     Ok((documents, accounting))
 }
 
@@ -713,6 +902,7 @@ struct ParsedSession {
     body: String,
     first_user_text: Option<String>,
     malformed_lines: usize,
+    records_considered: usize,
 }
 
 fn parse_session_document(bytes: &[u8]) -> ParsedSession {
@@ -720,10 +910,12 @@ fn parse_session_document(bytes: &[u8]) -> ParsedSession {
     let mut body = String::new();
     let mut first_user_text = None;
     let mut malformed_lines = 0;
+    let mut records_considered = 0;
     for line in bytes.split(|byte| *byte == b'\n') {
         if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
+        records_considered += 1;
         let value = match serde_json::from_slice::<serde_json::Value>(line) {
             Ok(value) => value,
             Err(_) => {
@@ -789,7 +981,53 @@ fn parse_session_document(bytes: &[u8]) -> ParsedSession {
         body,
         first_user_text,
         malformed_lines,
+        records_considered,
     }
+}
+
+fn context_document_from_checkpoint(checkpoint: &ExistingContextDocument) -> ContextDocument {
+    ContextDocument {
+        source_kind: ContextSourceKind::CodexSession,
+        source_path: checkpoint.source_path.clone(),
+        project_id: checkpoint.project_id,
+        context_path: checkpoint.context_path.clone(),
+        fingerprint: checkpoint.fingerprint.clone(),
+        title: checkpoint.title.clone(),
+        body: checkpoint.body.clone(),
+        imported_bytes: checkpoint.imported_bytes,
+        source_bytes: checkpoint.source_bytes,
+    }
+}
+
+fn checkpoint_context_authorized(
+    checkpoint: &ExistingContextDocument,
+    approved_roots: &[PathBuf],
+) -> bool {
+    checkpoint.context_path.as_ref().is_some_and(|cwd| {
+        canonical_existing_directory(cwd).is_some_and(|cwd| {
+            approved_roots
+                .iter()
+                .filter_map(|root| canonical_existing_directory(root))
+                .any(|root| cwd.starts_with(root))
+        })
+    })
+}
+
+fn same_canonical_directory(left: &Path, right: &Path) -> bool {
+    canonical_existing_directory(left) == canonical_existing_directory(right)
+}
+
+fn append_preformatted_context(body: &mut String, tail: &str) {
+    if tail.trim().is_empty() || body.len() >= MAX_DOCUMENT_TEXT_BYTES {
+        return;
+    }
+    if !body.is_empty() {
+        body.push_str("\n\n");
+    }
+    let remaining = MAX_DOCUMENT_TEXT_BYTES.saturating_sub(body.len());
+    let mut tail = tail.to_owned();
+    truncate_context_utf8(&mut tail, remaining);
+    body.push_str(&tail);
 }
 
 fn append_context_message(body: &mut String, role: &str, text: &str) {
@@ -1104,6 +1342,8 @@ impl ContextFingerprint {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write as _;
+
     use tempfile::TempDir;
 
     use super::*;
@@ -1289,6 +1529,174 @@ mod tests {
         ] {
             assert!(registry.search_context_documents(marker, 10)?.is_empty());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn raw_sessions_reuse_verified_files_increment_tails_and_fallback_safely() -> Result<()> {
+        let (temp, mut registry, codex_home) = registry()?;
+        let approved = temp.path().join("approved");
+        let project = approved.join("project");
+        fs::create_dir_all(&project).map_err(|source| Error::Io {
+            path: project.clone(),
+            source,
+        })?;
+        registry.add_project(&project, None)?;
+        registry.add_scan_root(&approved, ScanRootOptions::default())?;
+        registry.set_recall_settings(RecallSettings {
+            include_codex_memories: false,
+            include_codex_sessions: true,
+        })?;
+        let session = codex_home.join("sessions/session.jsonl");
+        let initial = format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"cwd\":{cwd:?}}}}}\n\
+             {{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"initial-tail-marker\"}}]}}}}\n",
+            cwd = project.to_string_lossy()
+        );
+        write(&session, initial.as_bytes())?;
+
+        let first = registry
+            .refresh_context_documents(&codex_home, ContextDocumentRefreshOptions::default())?;
+        assert_eq!(first.sessions.mode, ContextRefreshMode::Full);
+        assert_eq!(first.sessions.files_full, 1);
+        assert_eq!(first.sessions.records_considered, 2);
+
+        registry.connection.execute(
+            "UPDATE context_documents SET source_bytes = 0
+             WHERE source_kind = 'codex_session'",
+            [],
+        )?;
+        let legacy_fallback = registry
+            .refresh_context_documents(&codex_home, ContextDocumentRefreshOptions::default())?;
+        assert_eq!(
+            legacy_fallback.sessions.mode,
+            ContextRefreshMode::FallbackFull
+        );
+        assert_eq!(legacy_fallback.sessions.fallback_files, 1);
+        assert_eq!(legacy_fallback.sessions.files_full, 1);
+        assert_eq!(legacy_fallback.sessions.records_considered, 2);
+        let restored_checkpoint: i64 = registry.connection.query_row(
+            "SELECT source_bytes FROM context_documents
+             WHERE source_kind = 'codex_session'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            restored_checkpoint,
+            i64::try_from(initial.len()).expect("bounded synthetic session length fits i64")
+        );
+
+        let repeat = registry
+            .refresh_context_documents(&codex_home, ContextDocumentRefreshOptions::default())?;
+        assert_eq!(
+            repeat.sessions.status,
+            ContextSourceRefreshStatus::Unchanged
+        );
+        assert_eq!(repeat.sessions.mode, ContextRefreshMode::Unchanged);
+        assert_eq!(repeat.sessions.files_reused, 1);
+        assert_eq!(repeat.sessions.records_considered, 0);
+
+        let appended = "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"appended-tail-marker\"}]}}\n";
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&session)
+            .map_err(|source| Error::Io {
+                path: session.clone(),
+                source,
+            })?
+            .write_all(appended.as_bytes())
+            .map_err(|source| Error::Io {
+                path: session.clone(),
+                source,
+            })?;
+        let incremental = registry
+            .refresh_context_documents(&codex_home, ContextDocumentRefreshOptions::default())?;
+        assert_eq!(incremental.sessions.mode, ContextRefreshMode::Incremental);
+        assert_eq!(incremental.sessions.files_incremental, 1);
+        assert_eq!(incremental.sessions.records_considered, 1);
+        assert_eq!(
+            registry
+                .search_context_documents("appended-tail-marker", 10)?
+                .len(),
+            1
+        );
+
+        let rewritten_text = "rewritten-marker ".repeat(100);
+        let rewritten = format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"cwd\":{cwd:?}}}}}\n\
+             {{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":{text:?}}}]}}}}\n",
+            text = rewritten_text,
+            cwd = project.to_string_lossy()
+        );
+        write(&session, rewritten.as_bytes())?;
+        let fallback = registry
+            .refresh_context_documents(&codex_home, ContextDocumentRefreshOptions::default())?;
+        assert_eq!(fallback.sessions.mode, ContextRefreshMode::FallbackFull);
+        assert_eq!(fallback.sessions.fallback_files, 1);
+        assert!(
+            registry
+                .search_context_documents("appended-tail-marker", 10)?
+                .is_empty()
+        );
+        assert_eq!(
+            registry
+                .search_context_documents("rewritten-marker", 10)?
+                .len(),
+            1
+        );
+
+        write(&session, initial.as_bytes())?;
+        let truncated = registry
+            .refresh_context_documents(&codex_home, ContextDocumentRefreshOptions::default())?;
+        assert_eq!(truncated.sessions.mode, ContextRefreshMode::FallbackFull);
+        assert_eq!(truncated.sessions.fallback_files, 1);
+
+        fs::remove_file(&session).map_err(|source| Error::Io {
+            path: session.clone(),
+            source,
+        })?;
+        let deleted = registry
+            .refresh_context_documents(&codex_home, ContextDocumentRefreshOptions::default())?;
+        assert_eq!(deleted.sessions.mode, ContextRefreshMode::Incremental);
+        assert_eq!(deleted.sessions.files_deleted, 1);
+        assert_eq!(deleted.sessions.documents, 0);
+
+        write(&session, initial.as_bytes())?;
+        registry
+            .refresh_context_documents(&codex_home, ContextDocumentRefreshOptions::default())?;
+        fs::rename(
+            codex_home.join("sessions"),
+            codex_home.join("sessions-offline"),
+        )
+        .map_err(|source| Error::Io {
+            path: codex_home.join("sessions"),
+            source,
+        })?;
+        let unavailable = registry
+            .refresh_context_documents(&codex_home, ContextDocumentRefreshOptions::default())?;
+        assert_eq!(unavailable.sessions.mode, ContextRefreshMode::Deferred);
+        assert_eq!(
+            unavailable.sessions.status,
+            ContextSourceRefreshStatus::DeferredUnavailable
+        );
+        assert_eq!(
+            registry
+                .search_context_documents("initial-tail-marker", 10)?
+                .len(),
+            1
+        );
+
+        registry.set_recall_settings(RecallSettings::default())?;
+        let disabled = registry
+            .refresh_context_documents(&codex_home, ContextDocumentRefreshOptions::default())?;
+        assert_eq!(disabled.sessions.mode, ContextRefreshMode::Disabled);
+        assert_eq!(disabled.sessions.bytes_read, 0);
+        assert_eq!(disabled.sessions.records_considered, 0);
+        assert!(
+            registry
+                .search_context_documents("initial-tail-marker", 10)?
+                .is_empty()
+        );
         Ok(())
     }
 

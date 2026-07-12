@@ -57,6 +57,9 @@ personal or proprietary information.
   prompts, commands, diffs, or agent prose present inside a memory or user/assistant
   message. Storage is bounded and owner-private; disabling a source and refreshing
   deletes that source's indexed rows.
+- Raw-session incremental checkpoints add only bounded source byte length beside the
+  existing private whole-file fingerprint. They contain no transcript excerpt or
+  parsed message content, and the prior prefix is fully rehashed before tail reuse.
 - Generated-memory project attribution uses conservative path/cwd evidence and the
   longest registered-project match. Conflicting references remain unmapped, and
   memory text never grants raw-session authorization.
