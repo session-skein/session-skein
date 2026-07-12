@@ -31,6 +31,8 @@ after its first published release.
 - Made deep-recall source budgets independent and non-destructive: truncated sources,
   missing Codex directories, and unavailable approved roots retain prior private rows
   and memory-to-project routing until an authoritative refresh is possible.
+- Stop recursive discovery at Git repository boundaries, matching Codex Brain's fast
+  scan behavior and avoiding expensive traversal inside network-hosted source trees.
 
 ## [0.5.0-alpha.6] - 2026-07-11
 

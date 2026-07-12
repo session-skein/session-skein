@@ -88,7 +88,8 @@ skein context refresh
 
 Recursion is opt-in. It never follows directory symlinks, recognizes normal Git
 repositories and worktree `.git` files, and prunes common dependency, build, cache,
-vendor, and virtual-environment directories. The default recursive depth is 16 and
+vendor, and virtual-environment directories. A discovered Git repository is a
+recursion boundary, so source trees are not needlessly crawled. The default recursive depth is 16 and
 the maximum is 64. An unavailable network root is reported without removing its
 cached projects, and the stored root can still be removed while unmounted.
 

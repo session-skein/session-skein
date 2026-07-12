@@ -253,7 +253,8 @@ impl Registry {
 
         let mut pending = VecDeque::from([(report.root.path.clone(), 0_u16)]);
         while let Some((directory, depth)) = pending.pop_front() {
-            if is_git_repository(&directory) {
+            let repository_boundary = is_git_repository(&directory);
+            if repository_boundary {
                 match self.add_discovered_project(&directory) {
                     Ok((project, inserted)) => {
                         if inserted {
@@ -271,6 +272,12 @@ impl Registry {
                 }
             }
 
+            // A discovered repository owns its internal tree. Stopping here avoids
+            // crawling every source directory on slow/network filesystems and
+            // matches the former Codex Brain discovery behavior.
+            if repository_boundary {
+                continue;
+            }
             if !report.root.recursive {
                 continue;
             }
@@ -511,6 +518,28 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![canonical(&first)?, canonical(&second)?]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn discovered_repository_is_a_recursion_boundary() -> Result<()> {
+        let (temp, registry) = isolated_registry()?;
+        let root = temp.path().join("workspace");
+        let repository = root.join("repository");
+        let nested = repository.join("vendor").join("nested-repository");
+        create_repository(&repository)?;
+        create_repository(&nested)?;
+        registry.add_scan_root(
+            &root,
+            ScanRootOptions {
+                recursive: true,
+                max_depth: None,
+            },
+        )?;
+
+        let report = registry.discover_scan_root(&root)?;
+        assert_eq!(report.discovered.len(), 1);
+        assert_eq!(report.discovered[0].path, canonical(&repository)?);
         Ok(())
     }
 
