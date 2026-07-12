@@ -115,9 +115,20 @@ Unavailable or file-cap-truncated sources retain the last complete rows and repo
 deferred status. One project Git error is included in the index report rather than
 silently discarded.
 
+`updated` and `unchanged` describe whether indexed content changed, not whether the
+source was checked. A successful authoritative unchanged Git, project-document, or
+enabled-context observation advances its durable refresh timestamp without rebuilding
+content or FTS. Failed, offline, unavailable, and truncated/deferred observations do
+not advance it. `skein freshness` evaluates the oldest covered row, preventing one
+recent project or document from masking older catalog data.
+
 Human output labels the selected scope and deferrals. JSON output adds `scope` and
 `deferred`; `refreshed` remains the CLI Git-report field and `reports` is retained for
-MCP compatibility.
+MCP compatibility. Every report also includes `startedAt`, `completedAt`, and
+`mayBeStale`; scoped runs and any deferred or failed source set `mayBeStale=true`.
+
+On an interactive human terminal, `index` writes deterministic stage changes to
+stderr. It never writes progress into JSON stdout, redirected stderr, or MCP stdio.
 
 Inspect current state with:
 
@@ -126,6 +137,7 @@ skein doctor
 skein project show /path/to/project
 skein context status
 skein session list
+skein freshness
 ```
 
 ## Machine-readable use

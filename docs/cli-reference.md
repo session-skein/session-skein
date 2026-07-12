@@ -16,6 +16,10 @@ skein worker watch 42 --jsonl      # event stream
 `--json` flags remain available. Streaming control and worker operations use
 newline-delimited JSON through `--jsonl`.
 
+Long foreground refreshes emit deterministic stage changes to stderr only when
+stderr is an interactive terminal and output is human-readable. JSON stdout remains
+one document; redirected/non-TTY commands and MCP stdio emit no progress text.
+
 Private prompts are read from standard input by `control codex`, `worker start`,
 `worker resume`, `worker steer`, `match`, and `conduct`. Command-line arguments and
 process listings therefore do not contain prompt text.
@@ -26,6 +30,7 @@ process listings therefore do not contain prompt text.
 skein
 ├── doctor
 ├── init
+├── freshness [--stale-after-hours HOURS]
 ├── update [VERSION] [--check] [--force] [--allow-downgrade]
 ├── project
 │   ├── add PATH [--name NAME]
@@ -98,6 +103,21 @@ and readable schema version. It opens no writable registry and performs no migra
 
 Creates private state or applies forward-only migrations. It does not register a
 project, index a repository, or contact Codex.
+
+### `freshness`
+
+Reads existing durable timestamps without scanning files, contacting Codex, or
+mutating state. Every source reports item count, newest and oldest observation,
+newest age and maximum age, and `empty`, `missing`, `fresh`, or `stale`. Git and
+project documents report missing coverage when a registered project has no
+observation. Staleness uses the oldest covered row, so one recent item cannot hide an
+older observation. The default stale boundary is 24 hours and is strict: an age equal
+to the boundary is fresh. `mayBeStale` is true for `missing` or `stale` overall state.
+
+Refresh status and freshness answer different questions: `Updated` means indexed
+content changed, while `Unchanged` means an authoritative check found the same
+content. Both successful observations advance `refreshedAt`; failed or deferred
+checks do not.
 
 ### `update`
 

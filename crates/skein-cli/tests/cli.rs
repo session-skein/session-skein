@@ -55,6 +55,64 @@ fn commands_are_human_readable_by_default_and_support_global_json_format()
 }
 
 #[test]
+fn freshness_is_structured_and_non_tty_progress_stays_quiet() -> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let data = temp.path().join("data");
+    let config = temp.path().join("config");
+    let project = temp.path().join("project");
+    std::fs::create_dir(&project)?;
+    std::fs::write(project.join("README.md"), "# Synthetic freshness\n")?;
+
+    assert!(skein(&data, &config).arg("init").output()?.status.success());
+    assert!(
+        skein(&data, &config)
+            .arg("project")
+            .arg("add")
+            .arg(&project)
+            .output()?
+            .status
+            .success()
+    );
+    let before = skein(&data, &config)
+        .args(["freshness", "--format", "json"])
+        .output()?;
+    let before: Value = serde_json::from_slice(&before.stdout)?;
+    assert_eq!(before["state"], "missing");
+    assert_eq!(before["mayBeStale"], true);
+
+    for format in ["human", "json"] {
+        let output = skein(&data, &config)
+            .arg("index")
+            .arg("--project")
+            .arg(&project)
+            .args(["--format", format])
+            .output()?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stderr.is_empty(), "non-TTY progress must stay quiet");
+        if format == "json" {
+            let report: Value = serde_json::from_slice(&output.stdout)?;
+            assert!(report["startedAt"].is_i64());
+            assert!(report["completedAt"].is_i64());
+            assert_eq!(
+                report["mayBeStale"], true,
+                "scoped global sources are deferred"
+            );
+        }
+    }
+    let after = skein(&data, &config)
+        .args(["freshness", "--stale-after-hours", "24", "--format", "json"])
+        .output()?;
+    let after: Value = serde_json::from_slice(&after.stdout)?;
+    assert_eq!(after["git"]["state"], "fresh");
+    assert_eq!(after["documents"]["state"], "fresh");
+    Ok(())
+}
+
+#[test]
 fn deep_recall_requires_explicit_cli_opt_in() -> Result<(), Box<dyn Error>> {
     let temp = tempfile::tempdir()?;
     let data = temp.path().join("data");

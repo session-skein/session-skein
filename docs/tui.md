@@ -31,6 +31,10 @@ Ordinary two-second catalog refreshes remain read-only SQLite access. Worker
 snapshots, interrupts, and conductor children also run away from the rendering loop,
 so a slow project disk does not directly block keyboard input.
 
+The footer reports the startup refresh outcome and source counts. For a durable,
+age-based snapshot before opening the TUI, run `skein freshness`; the TUI does not
+start a freshness daemon or inspect slow source files from its render loop.
+
 ## Keys
 
 | Key | Action |
