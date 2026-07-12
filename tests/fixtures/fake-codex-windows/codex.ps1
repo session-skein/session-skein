@@ -48,3 +48,5 @@ switch ($CommandArgs[1]) {
     }
     default { exit 2 }
 }
+
+exit 0
