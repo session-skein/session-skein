@@ -24,6 +24,8 @@ param(
     [switch]$ReplaceSkill,
     [switch]$Update,
     [switch]$Uninstall,
+    [switch]$Check,
+    [switch]$Json,
     [switch]$Help
 )
 
@@ -37,6 +39,10 @@ foreach ($entry in $PSBoundParameters.GetEnumerator()) { $OriginalParameters[$en
 $RepoUrl = if ($env:SKEIN_REPO_URL) { $env:SKEIN_REPO_URL } else { 'https://github.com/session-skein/session-skein.git' }
 $ReleaseBaseUrl = if ($env:SKEIN_RELEASE_BASE_URL) { $env:SKEIN_RELEASE_BASE_URL.TrimEnd('/') } else { 'https://github.com/session-skein/session-skein/releases/download' }
 $ReleaseChannelUrl = if ($env:SKEIN_RELEASE_CHANNEL_URL) { $env:SKEIN_RELEASE_CHANNEL_URL.TrimEnd('/') } else { 'https://raw.githubusercontent.com/session-skein/session-skein/main/release-channels' }
+if (($env:SKEIN_RELEASE_BASE_URL -or $env:SKEIN_RELEASE_CHANNEL_URL) -and
+    $env:SKEIN_ALLOW_RELEASE_OVERRIDE -ne '1') {
+    throw 'Release endpoint overrides require SKEIN_ALLOW_RELEASE_OVERRIDE=1 (testing only).'
+}
 $CodexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
 $LocalAppDataRoot = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { Join-Path $HOME 'AppData\Local' }
 $InstallStateDir = Join-Path $LocalAppDataRoot 'SessionSkein\install'
@@ -46,6 +52,7 @@ $McpRollbackPath = Join-Path $InstallStateDir 'codex-config.rollback'
 $McpJsonRollbackPath = Join-Path $InstallStateDir 'mcp.rollback.json'
 $ReceiptRollbackPath = Join-Path $InstallStateDir 'receipt.rollback.json'
 $BinaryRollbackPath = Join-Path $InstallStateDir 'binary.rollback.exe'
+$InstallerRollbackPath = Join-Path $InstallStateDir 'installer.rollback.ps1'
 $CodexConfigPath = Join-Path $CodexHome 'config.toml'
 $SkillSnapshotRoot = Join-Path $InstallStateDir 'skills'
 $ManagedSource = if ($env:SKEIN_INSTALL_SOURCE) { $env:SKEIN_INSTALL_SOURCE } else { Join-Path $LocalAppDataRoot 'SessionSkein\repo' }
@@ -75,6 +82,8 @@ Options:
   -ReplaceSkill      Back up and replace a conflicting skill path
   -Update            Update an explicit Git source checkout and reinstall
   -Uninstall         Remove only hash/target-matched installer-owned integration
+  -Check             Verify release availability without installing
+  -Json              Emit machine-readable check output
   -Help              Show this help
 '@
 }
@@ -191,6 +200,16 @@ function Remove-OwnedIntegration {
             New-Item -ItemType Directory -Path (Split-Path -Parent $receipt.binary) -Force | Out-Null
             Move-Item -LiteralPath $receipt.binaryBackup -Destination $receipt.binary
             Write-Host '→ Restored the previous destination binary'
+        }
+    }
+
+    if ($receipt.PSObject.Properties['installer'] -and $receipt.installer) {
+        if ((Test-Path -LiteralPath $receipt.installer) -and
+            (Get-FileSha ([string]$receipt.installer)) -eq $receipt.installerHash) {
+            Remove-Item -LiteralPath $receipt.installer -Force
+        } elseif (Test-Path -LiteralPath $receipt.installer) {
+            Write-Warning "Preserving modified installer snapshot $($receipt.installer)."
+            $preserved = $true
         }
     }
 
@@ -432,9 +451,29 @@ if ($SourceDir -and -not $NoSkill) {
         throw "Binary $ActualVersion and bundled skill/plugin $($plugin.version) do not match."
     }
 }
+if ($Check) {
+    $target = Get-ReleaseTarget
+    if ($Json) {
+        [ordered]@{ channel = $Channel; targetVersion = $ActualVersion; platform = $target; verified = $true } |
+            ConvertTo-Json -Compress | Write-Output
+    } else {
+        Write-Host "Verified Session Skein $ActualVersion for $target"
+    }
+    return
+}
 $IncomingHash = Get-FileSha $BinarySource
 
 # Preflight all collisions before changing state.
+$expectedInstallerSnapshot = Join-Path $InstallStateDir 'installer.ps1'
+if ($Previous -and $Previous.PSObject.Properties['installer'] -and $Previous.installer) {
+    if ([string]$Previous.installer -ne $expectedInstallerSnapshot) {
+        throw "Receipt installer path disagrees with $expectedInstallerSnapshot."
+    }
+    if (-not (Test-Path -LiteralPath $Previous.installer -PathType Leaf) -or
+        (Get-FileSha ([string]$Previous.installer)) -ne [string]$Previous.installerHash) {
+        throw "Installer snapshot ownership drift detected: $($Previous.installer)."
+    }
+}
 if ($Previous -and $Previous.binary -and $Previous.binary -ne $InstalledBinary) {
     throw "Receipt owns $($Previous.binary); uninstall before changing -BinDir."
 }
@@ -552,7 +591,7 @@ if (-not $NoSkill) {
         }
     }
 }
-Remove-Item -LiteralPath $ReceiptRollbackPath, $BinaryRollbackPath, $McpRollbackPath, $McpJsonRollbackPath -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $ReceiptRollbackPath, $BinaryRollbackPath, $InstallerRollbackPath, $McpRollbackPath, $McpJsonRollbackPath -Force -ErrorAction SilentlyContinue
 $HadReceipt = Test-Path -LiteralPath $ReceiptPath
 if ($HadReceipt) { Copy-Item -LiteralPath $ReceiptPath -Destination $ReceiptRollbackPath }
 
@@ -565,11 +604,47 @@ function Restore-BinaryAndReceipt {
             Move-Item -LiteralPath $BinaryBackup -Destination $InstalledBinary
         }
     }
+    if ($IncomingInstaller) {
+        Remove-Item -LiteralPath $InstallerSnapshot -Force -ErrorAction SilentlyContinue
+        if ($PreviousInstaller -and (Test-Path -LiteralPath $InstallerRollbackPath)) {
+            Move-Item -LiteralPath $InstallerRollbackPath -Destination $InstallerSnapshot -Force
+        }
+    }
     if ($HadReceipt -and (Test-Path -LiteralPath $ReceiptRollbackPath)) {
         Move-Item -LiteralPath $ReceiptRollbackPath -Destination $ReceiptPath -Force
     } else {
         Remove-Item -LiteralPath $ReceiptPath -Force -ErrorAction SilentlyContinue
     }
+}
+
+$PreviousInstaller = if ($Previous -and $Previous.PSObject.Properties['installer']) { [string]$Previous.installer } else { '' }
+$PreviousInstallerHash = if ($Previous -and $Previous.PSObject.Properties['installerHash']) { [string]$Previous.installerHash } else { '' }
+$InstallerOwned = $PreviousInstaller
+$InstallerOwnedHash = $PreviousInstallerHash
+$InstallerSnapshot = Join-Path $InstallStateDir 'installer.ps1'
+$IncomingInstaller = ''
+$installerSource = Join-Path $SourceDir 'install.ps1'
+if (Test-Path -LiteralPath $installerSource -PathType Leaf) {
+    $IncomingInstaller = Join-Path $InstallStateDir ('.installer.' + [Guid]::NewGuid() + '.ps1')
+    Copy-Item -LiteralPath $installerSource -Destination $IncomingInstaller
+    [void][scriptblock]::Create((Get-Content -LiteralPath $IncomingInstaller -Raw))
+    $incomingInstallerHash = Get-FileSha $IncomingInstaller
+    if ($PreviousInstaller) {
+        Copy-Item -LiteralPath $PreviousInstaller -Destination $InstallerRollbackPath
+    }
+    if ($env:SKEIN_TEST_FAIL_INSTALLER_SNAPSHOT -eq '1' -and $env:SKEIN_ALLOW_RELEASE_OVERRIDE -eq '1') {
+        Remove-Item -LiteralPath $IncomingInstaller -Force -ErrorAction SilentlyContinue
+        Restore-BinaryAndReceipt
+        throw 'Injected installer snapshot installation failure.'
+    }
+    try {
+        Move-Item -LiteralPath $IncomingInstaller -Destination $InstallerSnapshot -Force
+    } catch {
+        Restore-BinaryAndReceipt
+        throw 'Could not install the verified installer snapshot.'
+    }
+    $InstallerOwned = $InstallerSnapshot
+    $InstallerOwnedHash = $incomingInstallerHash
 }
 
 if ($BinaryAction -eq 'keep-owned') {
@@ -612,6 +687,8 @@ function Write-Receipt {
         pathAdded = $PathAdded
         source = $SourceReceipt
         sourceCommit = $SourceCommit
+        installer = $InstallerOwned
+        installerHash = $InstallerOwnedHash
         skill = $SkillTarget
         skillSource = $SkillSource
         skillBackup = $SkillBackup
@@ -629,6 +706,10 @@ try {
     Restore-BinaryAndReceipt
     throw 'Could not write the provisional installer receipt; the previous binary was restored.'
 }
+if ($env:SKEIN_TEST_FAIL_INSTALLER_RECEIPT -eq '1' -and $env:SKEIN_ALLOW_RELEASE_OVERRIDE -eq '1') {
+    Restore-BinaryAndReceipt
+    throw 'Injected installer snapshot receipt failure; the previous installation was restored.'
+}
 
 try {
     Invoke-Native $InstalledBinary @('init')
@@ -639,6 +720,16 @@ try {
 
 $skillSwitched = $false
 $oldSkillSource = ''
+function Restore-SkillSwitch {
+    if ($skillSwitched) {
+        (Get-Item -LiteralPath $desiredSkillTarget -Force).Delete()
+        if ($SkillAction -eq 'replace-owned' -and $oldSkillSource) {
+            New-Item -ItemType Junction -Path $desiredSkillTarget -Target $oldSkillSource -ErrorAction SilentlyContinue | Out-Null
+        } elseif ($SkillAction -eq 'backup-create' -and (Test-Path -LiteralPath $SkillBackup)) {
+            Move-Item -LiteralPath $SkillBackup -Destination $desiredSkillTarget -ErrorAction SilentlyContinue
+        }
+    }
+}
 try {
     if ($SkillAction -eq 'backup-create') {
         New-Item -ItemType Directory -Path (Split-Path -Parent $desiredSkillTarget) -Force | Out-Null
@@ -671,19 +762,10 @@ try {
         Write-Receipt
     }
 } catch {
-    if ($skillSwitched) {
-        (Get-Item -LiteralPath $desiredSkillTarget -Force).Delete()
-        if ($SkillAction -eq 'replace-owned' -and $oldSkillSource) {
-            New-Item -ItemType Junction -Path $desiredSkillTarget -Target $oldSkillSource -ErrorAction SilentlyContinue | Out-Null
-        } elseif ($SkillAction -eq 'backup-create' -and (Test-Path -LiteralPath $SkillBackup)) {
-            Move-Item -LiteralPath $SkillBackup -Destination $desiredSkillTarget -ErrorAction SilentlyContinue
-        }
-    }
+    Restore-SkillSwitch
     Restore-BinaryAndReceipt
     throw "Codex skill installation failed; the previous binary and receipt were restored. $($_.Exception.Message)"
 }
-Remove-Item -LiteralPath $BinaryRollbackPath, $ReceiptRollbackPath -Force -ErrorAction SilentlyContinue
-
 $userPathParts = @([Environment]::GetEnvironmentVariable('Path', 'User') -split ';' | Where-Object { $_ })
 if (-not ($userPathParts | Where-Object { $_.TrimEnd('\') -ieq $BinDir.TrimEnd('\') })) {
     [Environment]::SetEnvironmentVariable('Path', ((@($userPathParts) + $BinDir) -join ';'), 'User')
@@ -729,16 +811,27 @@ if ($McpAction -ne 'none') {
         if (-not $configuredMcp) { throw 'Codex did not return the configured MCP server.' }
     } catch {
         Restore-CodexConfig
+        Restore-SkillSwitch
+        Restore-BinaryAndReceipt
         Remove-Item -LiteralPath $McpRollbackPath, $McpJsonRollbackPath -Force -ErrorAction SilentlyContinue
-        throw "Codex MCP registration failed; the previous Codex configuration was restored. $($_.Exception.Message)"
+        throw "Codex MCP registration failed; the previous owned integration was restored. $($_.Exception.Message)"
     }
     $McpProfile = $Profile
     $McpHash = Get-TextSha $configuredMcp
     $McpSpecHash = $desiredMcpSpecHash
-    Write-Receipt
+    try {
+        Write-Receipt
+    } catch {
+        Restore-CodexConfig
+        Restore-SkillSwitch
+        Restore-BinaryAndReceipt
+        throw 'Could not record the MCP registration; the previous owned integration was restored.'
+    }
     Remove-Item -LiteralPath $McpRollbackPath, $McpJsonRollbackPath -Force -ErrorAction SilentlyContinue
     Write-Host "→ Registered the $Profile Session Skein MCP profile"
 }
+
+Remove-Item -LiteralPath $BinaryRollbackPath, $ReceiptRollbackPath, $InstallerRollbackPath, $McpRollbackPath, $McpJsonRollbackPath -Force -ErrorAction SilentlyContinue
 
 Write-Host "`n✓ Session Skein is installed."
 Invoke-Native $InstalledBinary @('--version')

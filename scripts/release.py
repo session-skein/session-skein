@@ -66,6 +66,8 @@ def package_files(binary: Path) -> list[tuple[Path, str, int]]:
         (binary, executable, 0o755),
         (ROOT / "README.md", "README.md", 0o644),
         (ROOT / "LICENSE", "LICENSE", 0o644),
+        (ROOT / "install.sh", "install.sh", 0o755),
+        (ROOT / "install.ps1", "install.ps1", 0o644),
     ]
     for path in sorted(PLUGIN.rglob("*")):
         if path.is_file():
@@ -164,7 +166,7 @@ def assemble(input_dir: Path, output: Path) -> None:
         target = manifest.get("target")
         if target not in REQUIRED_TARGETS or manifest.get("version") != version:
             raise SystemExit(f"invalid package identity: {archive}")
-        required = {"README.md", "LICENSE", "release-package.json", "plugin/.codex-plugin/plugin.json", "plugin/.mcp.json", "plugin/skills/session-skein/SKILL.md"}
+        required = {"README.md", "LICENSE", "install.sh", "install.ps1", "release-package.json", "plugin/.codex-plugin/plugin.json", "plugin/.mcp.json", "plugin/skills/session-skein/SKILL.md"}
         relative = {name.split("/", 1)[1] for name in names if "/" in name}
         missing = required - relative
         if missing:

@@ -48,6 +48,8 @@ exposes the audited conduct, steer, interrupt, and reconcile tools. See
 collision handling, verification, updates, plugin installation, and uninstall.
 The normal path downloads the native release archive, validates its published
 manifest and SHA-256 checksum, and installs the bundled skill without Git or Rust.
+After installing alpha.9 or newer, `skein update --check` checks the approved preview
+channel and `skein update` applies a receipt-owned update.
 
 ## Five-minute start
 

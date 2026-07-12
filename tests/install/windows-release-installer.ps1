@@ -48,12 +48,73 @@ try {
     $env:SKEIN_RELEASE_BASE_URL = "http://127.0.0.1:$Port/releases"
     $env:SKEIN_RELEASE_CHANNEL_URL = "http://127.0.0.1:$Port/channels"
     $env:SKEIN_ALLOW_INSECURE_TEST_DOWNLOADS = '1'
+    $env:SKEIN_ALLOW_RELEASE_OVERRIDE = '1'
     $BinDir = Join-Path $Case 'bin'
     & (Join-Path $RepoRoot 'install.ps1') -BinDir $BinDir -NoMcp | Out-Null
     if ((& (Join-Path $BinDir 'skein.exe') --version) -ne "skein $Version") { throw 'remote binary version mismatch' }
     $Receipt = Get-Content (Join-Path $Case 'SessionSkein\install\receipt.json') -Raw | ConvertFrom-Json
     if ($Receipt.source -ne "release:${Tag}:$Target") { throw 'release provenance missing from receipt' }
     if (-not (Test-Path (Join-Path $Case 'codex\skills\session-skein\SKILL.md'))) { throw 'release skill was not installed' }
+    if (-not (Test-Path (Join-Path $Case 'SessionSkein\install\installer.ps1'))) { throw 'updater installer snapshot missing' }
+
+    # A mutable receipt cannot impersonate an older running binary.
+    $ReceiptPath = Join-Path $Case 'SessionSkein\install\receipt.json'
+    $GoodReceipt = Get-Content $ReceiptPath -Raw
+    $Receipt.version = '0.5.0-alpha.8'
+    [System.IO.File]::WriteAllText($ReceiptPath, ($Receipt | ConvertTo-Json -Depth 4))
+    try {
+        & (Join-Path $BinDir 'skein.exe') update --check | Out-Null
+        throw 'modified receipt version unexpectedly passed'
+    } catch {
+        if ($_.Exception.Message -eq 'modified receipt version unexpectedly passed') { throw }
+    }
+    [System.IO.File]::WriteAllText($ReceiptPath, $GoodReceipt)
+    $Check = & (Join-Path $BinDir 'skein.exe') update --check --json | ConvertFrom-Json
+    if ($Check.status -ne 'current' -or $Check.currentVersion -ne $Version) { throw 'Windows same-version check was inaccurate' }
+
+    # Exercise the real parent-exit/file-lock handoff without falsifying versions.
+    $ReceiptPublishedAt = (Get-Item -LiteralPath $ReceiptPath).LastWriteTimeUtc
+    $HelperResult = Join-Path $Case 'SessionSkein\install\update-helper.result.json'
+    $Scheduled = & (Join-Path $BinDir 'skein.exe') update --force --json | ConvertFrom-Json
+    if ($Scheduled.status -ne 'scheduled' -or -not $Scheduled.scheduled) {
+        throw 'Windows forced reinstall was not scheduled through the parent-exit helper'
+    }
+    $Deadline = [DateTime]::UtcNow.AddSeconds(30)
+    do {
+        Start-Sleep -Milliseconds 250
+        $HelperDone = Test-Path -LiteralPath $HelperResult
+        $ReceiptRepublished = (Get-Item -LiteralPath $ReceiptPath).LastWriteTimeUtc -gt $ReceiptPublishedAt
+    } while ((-not $HelperDone -or -not $ReceiptRepublished) -and [DateTime]::UtcNow -lt $Deadline)
+    if (-not $HelperDone -or -not $ReceiptRepublished) {
+        throw 'Windows update helper did not complete and republish ownership before timeout'
+    }
+    $HelperStatus = Get-Content -LiteralPath $HelperResult -Raw | ConvertFrom-Json
+    if ($HelperStatus.status -ne 'completed') { throw "Windows update helper failed: $($HelperStatus.error)" }
+    $Receipt = Get-Content $ReceiptPath -Raw | ConvertFrom-Json
+    if ($Receipt.version -ne $Version) { throw 'Windows forced reinstall published the wrong receipt version' }
+    if ((& (Join-Path $BinDir 'skein.exe') --version) -ne "skein $Version") { throw 'Windows replaced executable is unhealthy' }
+    if ((Get-FileHash $Receipt.binary -Algorithm SHA256).Hash -ine $Receipt.binaryHash) { throw 'Windows binary receipt ownership hash mismatch' }
+    if ((Get-FileHash $Receipt.installer -Algorithm SHA256).Hash -ine $Receipt.installerHash) { throw 'Windows installer receipt ownership hash mismatch' }
+
+    $BeforeBinary = (Get-FileHash (Join-Path $BinDir 'skein.exe') -Algorithm SHA256).Hash
+    $BeforeInstaller = (Get-FileHash (Join-Path $Case 'SessionSkein\install\installer.ps1') -Algorithm SHA256).Hash
+    $BeforeReceipt = (Get-FileHash $ReceiptPath -Algorithm SHA256).Hash
+    $BeforeSkill = (Get-Item (Join-Path $Case 'codex\skills\session-skein') -Force).Target
+    foreach ($Failure in @('SKEIN_TEST_FAIL_INSTALLER_SNAPSHOT', 'SKEIN_TEST_FAIL_INSTALLER_RECEIPT')) {
+        [Environment]::SetEnvironmentVariable($Failure, '1', 'Process')
+        try {
+            & (Join-Path $RepoRoot 'install.ps1') -Version $Version -BinDir $BinDir -NoMcp | Out-Null
+            throw "$Failure unexpectedly succeeded"
+        } catch {
+            if ($_.Exception.Message -eq "$Failure unexpectedly succeeded") { throw }
+        } finally {
+            [Environment]::SetEnvironmentVariable($Failure, $null, 'Process')
+        }
+        if ((Get-FileHash (Join-Path $BinDir 'skein.exe') -Algorithm SHA256).Hash -ne $BeforeBinary) { throw 'snapshot rollback changed binary' }
+        if ((Get-FileHash (Join-Path $Case 'SessionSkein\install\installer.ps1') -Algorithm SHA256).Hash -ne $BeforeInstaller) { throw 'snapshot rollback changed installer' }
+        if ((Get-FileHash $ReceiptPath -Algorithm SHA256).Hash -ne $BeforeReceipt) { throw 'snapshot rollback changed receipt' }
+        if ((Get-Item (Join-Path $Case 'codex\skills\session-skein') -Force).Target -ne $BeforeSkill) { throw 'snapshot rollback changed skill' }
+    }
     & (Join-Path $RepoRoot 'install.ps1') -Version $Version -BinDir $BinDir -NoMcp | Out-Null
     & (Join-Path $RepoRoot 'install.ps1') -Uninstall | Out-Null
     if (Test-Path (Join-Path $BinDir 'skein.exe')) { throw 'release binary survived owned uninstall' }
@@ -77,5 +138,5 @@ try {
     if ($Server -and -not $Server.HasExited) { Stop-Process -Id $Server.Id -Force -ErrorAction SilentlyContinue }
     [Environment]::SetEnvironmentVariable('Path', $OriginalPath, 'User')
     Remove-Item -LiteralPath $Root -Recurse -Force -ErrorAction SilentlyContinue
-    Remove-Item Env:SKEIN_RELEASE_BASE_URL, Env:SKEIN_RELEASE_CHANNEL_URL, Env:SKEIN_ALLOW_INSECURE_TEST_DOWNLOADS -ErrorAction SilentlyContinue
+    Remove-Item Env:SKEIN_RELEASE_BASE_URL, Env:SKEIN_RELEASE_CHANNEL_URL, Env:SKEIN_ALLOW_INSECURE_TEST_DOWNLOADS, Env:SKEIN_ALLOW_RELEASE_OVERRIDE -ErrorAction SilentlyContinue
 }

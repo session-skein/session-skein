@@ -2,6 +2,7 @@ mod indexing;
 mod mcp;
 mod output;
 mod tui;
+mod update;
 mod worker_runtime;
 
 use std::io::Read;
@@ -46,6 +47,23 @@ enum Command {
     Doctor(OutputArgs),
     /// Initialize the private local state database.
     Init(OutputArgs),
+    /// Check for or install a verified release-owned update.
+    Update {
+        /// Exact target version; defaults to the approved preview channel.
+        version: Option<String>,
+        /// Verify and report without changing the installation.
+        #[arg(long)]
+        check: bool,
+        /// Reinstall an unchanged version intentionally.
+        #[arg(long)]
+        force: bool,
+        /// Permit an explicit downgrade after reviewing schema compatibility.
+        #[arg(long)]
+        allow_downgrade: bool,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Manage explicitly registered projects.
     Project {
         #[command(subcommand)]
@@ -656,6 +674,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let registry = Registry::open(&paths)?;
             let report = report(&paths, Some(registry.schema_version()?));
             print_value(&report, output.json)?;
+        }
+        Command::Update {
+            version,
+            check,
+            force,
+            allow_downgrade,
+            json,
+        } => {
+            update::run(update::UpdateOptions {
+                version,
+                check,
+                force,
+                allow_downgrade,
+                json: json || output::is_json(),
+            })?;
         }
         Command::Project { command } => {
             let registry = Registry::open(&paths)?;

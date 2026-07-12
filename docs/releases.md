@@ -49,7 +49,7 @@ GitHub also records build-provenance attestations for every published asset. Wit
 GitHub CLI installed, verify an asset against the canonical repository:
 
 ```console
-gh attestation verify session-skein-v0.5.0-alpha.8-x86_64-unknown-linux-gnu.tar.gz \
+gh attestation verify session-skein-v0.5.0-alpha.9-x86_64-unknown-linux-gnu.tar.gz \
   --repo session-skein/session-skein
 ```
 
@@ -83,9 +83,20 @@ package metadata, and bundled plugin version to agree.
 
 Use `--version` or `-Version` for an exact preview. The default repository and asset
 URLs are fixed to `session-skein/session-skein`. `SKEIN_RELEASE_BASE_URL` and
-`SKEIN_RELEASE_CHANNEL_URL` exist only for documented mirrors and hermetic tests;
-non-HTTPS URLs additionally require `SKEIN_ALLOW_INSECURE_TEST_DOWNLOADS=1` and must
-never be used for a normal installation.
+`SKEIN_RELEASE_CHANNEL_URL` exist only for hermetic tests and require the separate
+`SKEIN_ALLOW_RELEASE_OVERRIDE=1` gate. Non-HTTPS fixtures additionally require
+`SKEIN_ALLOW_INSECURE_TEST_DOWNLOADS=1`. None are supported for normal installation.
 
-Source builds remain explicit contributor/fallback paths. Session Skein does not yet
-implement a product update command or automatic background update.
+Release archives include matching Unix and PowerShell installers. Alpha.9 stores the
+appropriate verified installer as a hashed private snapshot, enabling the CLI-only
+`skein update` command to reuse the same trust and rollback contract. There is no
+background update, and update is deliberately absent from MCP.
+
+Because alpha.8 was immutable before this command existed, alpha.8 users run the
+binary-first installer once to reach alpha.9. Subsequent previews use `skein update`.
+The first honest cross-release product update is therefore alpha.9 to alpha.10 and
+will be exercised by that release's native CI. Alpha.9 CI exercises the same updater
+and installer mechanism honestly through forced same-version reinstall, including
+the native Windows parent-exit and locked-executable handoff; hermetic tests also
+cover release inspection, downgrade policy, drift refusal, and injected transactional
+rollback without falsifying a binary's current version.

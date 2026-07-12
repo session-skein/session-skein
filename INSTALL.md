@@ -60,7 +60,7 @@ re-fetches an installer after resolution. To pin the release yourself:
 
 ```console
 curl -fsSL https://raw.githubusercontent.com/session-skein/session-skein/main/install.sh | \
-  bash -s -- --version 0.5.0-alpha.8 --control
+  bash -s -- --version 0.5.0-alpha.9 --control
 ```
 
 Useful options:
@@ -95,6 +95,9 @@ the changed object and keeps the receipt for review.
 re-runs its refreshed installer. The
 active skill never points into that mutable checkout. A build, validation, or
 initialization failure leaves the prior content-addressed skill snapshot active.
+Binary-first updates stage and validate the incoming installer snapshot before any
+owned destination changes and retain the prior snapshot and receipt until the full
+installation transaction succeeds.
 
 `--no-skill` and `--no-mcp` mean “do not change this integration.” On a repeated
 installation they preserve previously owned receipt entries rather than stranding
@@ -110,7 +113,7 @@ Invoke-WebRequest https://raw.githubusercontent.com/session-skein/session-skein/
 ```
 
 Downloading to a file keeps parameters and errors explicit. `-Version
-0.5.0-alpha.8` pins a release; otherwise `-Channel preview` resolves the same approved
+0.5.0-alpha.9` pins a release; otherwise `-Channel preview` resolves the same approved
 preview pointer as Unix.
 
 PowerShell parameters mirror the Unix installer: `-Control`, `-CatalogOnly`,
@@ -218,9 +221,16 @@ For control-enabled MCP, append `--allow-control`. Copy or symlink
 
 ## Update and uninstall
 
-To reinstall or move to the currently approved preview, rerun the normal remote
-installer. Receipt ownership permits replacement only when the installed objects are
-still unchanged. There is no `skein update` command yet.
+Alpha.8 users must rerun the binary-first installer once because that published
+binary cannot contain the new command. From alpha.9 onward:
+
+```console
+skein update --check
+skein update
+```
+
+Product update accepts only unchanged release-owned receipts. Source contributors
+continue using the explicit source installer flow below.
 
 For an explicit source checkout:
 

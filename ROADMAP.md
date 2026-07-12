@@ -86,8 +86,8 @@ and a polished TUI only after behavior is observable and safe.
 - [ ] Sign and notarize macOS releases and Authenticode-sign Windows releases.
 - [x] Binary-first Unix and Windows installers with explicit preview-channel/version
   resolution, checksums, archive safety, bundled skills, and receipt-safe reinstall.
-- [ ] Add an explicit `skein update` flow after signed release selection and rollback
-  semantics are defined.
+- [x] Add a receipt-gated CLI-only `skein update` flow with check-only status,
+  downgrade/reinstall policy, verified installer snapshots, and Windows handoff.
 - [ ] Package-manager distribution after the public command/config surface stabilizes.
 
 Missing, outdated, or broken optional integrations must degrade to diagnostics and
