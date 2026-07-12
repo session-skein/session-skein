@@ -80,7 +80,7 @@ fn pages_site_reuses_canonical_markdown_and_deploys_only_from_main() {
     let stage = read(root.join("scripts/stage-pages.py"));
     assert!(stage.contains(".rglob(\"*.md\")"));
     assert!(stage.contains("canonical_source"));
-    let workflow = read(root.join(".github/workflows/pages.yml"));
+    let workflow = read(root.join(".github/workflows/pages.yml")).replace("\r\n", "\n");
     assert!(workflow.contains("pull_request:"));
     assert!(workflow.contains("github.event_name != 'pull_request'"));
     assert!(workflow.contains("github.ref == 'refs/heads/main'"));
