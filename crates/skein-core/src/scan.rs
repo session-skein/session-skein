@@ -431,7 +431,7 @@ fn normalize_absolute_path(path: &Path) -> Result<PathBuf> {
     Ok(normalized)
 }
 
-fn canonicalize_existing_ancestor(path: &Path) -> Result<PathBuf> {
+pub(crate) fn canonicalize_existing_ancestor(path: &Path) -> Result<PathBuf> {
     let normalized = normalize_absolute_path(path)?;
     if normalized.exists() {
         return fs::canonicalize(&normalized).map_err(|source| Error::Io {
@@ -477,6 +477,13 @@ mod tests {
         })
     }
 
+    fn canonical(path: &Path) -> Result<PathBuf> {
+        fs::canonicalize(path).map_err(|source| Error::Io {
+            path: path.to_path_buf(),
+            source,
+        })
+    }
+
     #[test]
     fn recursively_discovers_nested_repositories() -> Result<()> {
         let (temp, registry) = isolated_registry()?;
@@ -502,7 +509,7 @@ mod tests {
                 .iter()
                 .map(|project| project.path.clone())
                 .collect::<Vec<_>>(),
-            vec![first, second]
+            vec![canonical(&first)?, canonical(&second)?]
         );
         Ok(())
     }
@@ -534,7 +541,7 @@ mod tests {
 
         let report = registry.discover_scan_root(&root)?;
         assert_eq!(report.discovered.len(), 1);
-        assert_eq!(report.discovered[0].path, visible);
+        assert_eq!(report.discovered[0].path, canonical(&visible)?);
         assert!(report.skipped.iter().any(|skip| {
             skip.path.ends_with("node_modules") && skip.reason == DiscoverySkipReason::Excluded
         }));
@@ -558,7 +565,7 @@ mod tests {
 
         let report = registry.discover_scan_root(&root)?;
         assert_eq!(report.discovered.len(), 1);
-        assert_eq!(report.discovered[0].path, root);
+        assert_eq!(report.discovered[0].path, canonical(&root)?);
         Ok(())
     }
 

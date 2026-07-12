@@ -633,24 +633,34 @@ fn collect_session_documents(
             accounting.skipped_malformed_or_empty += 1;
             continue;
         };
-        let lexical_roots = approved_roots
+        let Some(normalized_cwd) = crate::scan::canonicalize_existing_ancestor(&recorded_cwd).ok()
+        else {
+            accounting.skipped_outside_roots += 1;
+            continue;
+        };
+        let matching_roots = approved_roots
             .iter()
-            .filter(|root| recorded_cwd.starts_with(root))
+            .filter_map(|root| {
+                crate::scan::canonicalize_existing_ancestor(root)
+                    .ok()
+                    .filter(|root| normalized_cwd.starts_with(root))
+                    .map(|normalized| (root, normalized))
+            })
             .collect::<Vec<_>>();
-        if lexical_roots.is_empty() {
+        if matching_roots.is_empty() {
             accounting.skipped_outside_roots += 1;
             continue;
         }
-        let Some(cwd) = canonical_existing_directory(&recorded_cwd) else {
+        let Some(cwd) = canonical_existing_directory(&normalized_cwd) else {
             accounting.unavailable = true;
             continue;
         };
-        let authorized = approved_roots
+        let authorized = matching_roots
             .iter()
-            .filter_map(|root| canonical_existing_directory(root))
+            .filter_map(|(_, root)| canonical_existing_directory(root))
             .any(|root| cwd.starts_with(root));
         if !authorized {
-            if lexical_roots.iter().any(|root| !root.is_dir()) {
+            if matching_roots.iter().any(|(root, _)| !root.is_dir()) {
                 accounting.unavailable = true;
             } else {
                 accounting.skipped_outside_roots += 1;
@@ -664,11 +674,8 @@ fn collect_session_documents(
         let source_path = relative_source_path(codex_home, &path)?;
         let project_id = projects
             .iter()
-            .filter_map(|project| {
-                canonical_existing_directory(&project.path)
-                    .filter(|path| cwd.starts_with(path))
-                    .map(|path| (project.id, path.components().count()))
-            })
+            .filter(|project| cwd.starts_with(&project.path))
+            .map(|project| (project.id, project.path.components().count()))
             .max_by_key(|(_, depth)| *depth)
             .map(|(id, _)| id);
         let title = parsed
@@ -929,6 +936,7 @@ fn memory_project_context(body: &str, projects: &[Project]) -> (Option<i64>, Opt
     let matches = body
         .lines()
         .filter_map(memory_metadata_path)
+        .filter_map(|path| crate::scan::canonicalize_existing_ancestor(&path).ok())
         .filter_map(|context_path| {
             projects
                 .iter()
@@ -1119,6 +1127,13 @@ mod tests {
         })
     }
 
+    fn canonical(path: &Path) -> Result<PathBuf> {
+        fs::canonicalize(path).map_err(|source| Error::Io {
+            path: path.to_path_buf(),
+            source,
+        })
+    }
+
     #[test]
     fn settings_default_off_and_disabling_then_refresh_removes_documents() -> Result<()> {
         let (_temp, mut registry, codex_home) = registry()?;
@@ -1231,7 +1246,10 @@ mod tests {
             let hits = registry.search_context_documents(marker, 10)?;
             assert_eq!(hits.len(), 1);
             assert_eq!(hits[0].project_id, Some(registered.id));
-            assert_eq!(hits[0].context_path.as_deref(), Some(project.as_path()));
+            assert_eq!(
+                hits[0].context_path.as_deref(),
+                Some(registered.path.as_path())
+            );
         }
         for marker in [
             "developer-secret-marker",
@@ -1490,7 +1508,10 @@ mod tests {
             let hits = registry.search_context_documents(marker, 10)?;
             assert_eq!(hits.len(), 1);
             assert_eq!(hits[0].project_id, Some(registered.id));
-            assert_eq!(hits[0].context_path.as_deref(), Some(project.as_path()));
+            assert_eq!(
+                hits[0].context_path.as_deref(),
+                Some(registered.path.as_path())
+            );
         }
         Ok(())
     }
@@ -1507,6 +1528,7 @@ mod tests {
         })?;
         let parent_project = registry.add_project(&parent, Some("Workspace"))?;
         let nested_project = registry.add_project(&nested, Some("Nested"))?;
+        let canonical_work = canonical(&work)?;
         write(
             &codex_home.join("memories/metadata.md"),
             format!(
@@ -1533,11 +1555,17 @@ mod tests {
         let metadata = registry.search_context_documents("metadata-route-marker", 10)?;
         assert_eq!(metadata.len(), 1);
         assert_eq!(metadata[0].project_id, Some(nested_project.id));
-        assert_eq!(metadata[0].context_path.as_deref(), Some(work.as_path()));
+        assert_eq!(
+            metadata[0].context_path.as_deref(),
+            Some(canonical_work.as_path())
+        );
         let rollout = registry.search_context_documents("rollout-route-marker", 10)?;
         assert_eq!(rollout.len(), 1);
         assert_eq!(rollout[0].project_id, Some(parent_project.id));
-        assert_eq!(rollout[0].context_path.as_deref(), Some(parent.as_path()));
+        assert_eq!(
+            rollout[0].context_path.as_deref(),
+            Some(parent_project.path.as_path())
+        );
         Ok(())
     }
 
