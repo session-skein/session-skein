@@ -76,16 +76,27 @@ try {
         throw 'Windows forced reinstall was not scheduled through the parent-exit helper'
     }
     $Deadline = [DateTime]::UtcNow.AddSeconds(30)
+    $HelperStatus = $null
     do {
         Start-Sleep -Milliseconds 250
-        $HelperDone = Test-Path -LiteralPath $HelperResult
+        if (Test-Path -LiteralPath $HelperResult) {
+            $HelperStatus = Get-Content -LiteralPath $HelperResult -Raw | ConvertFrom-Json
+        }
+        $HelperDone = $HelperStatus -and $HelperStatus.status -in @('completed', 'failed')
         $ReceiptRepublished = (Get-Item -LiteralPath $ReceiptPath).LastWriteTimeUtc -gt $ReceiptPublishedAt
-    } while ((-not $HelperDone -or -not $ReceiptRepublished) -and [DateTime]::UtcNow -lt $Deadline)
+    } while ($HelperStatus.status -ne 'failed' -and (-not $HelperDone -or -not $ReceiptRepublished) -and [DateTime]::UtcNow -lt $Deadline)
+    if ($HelperStatus.status -eq 'failed') { throw "Windows update helper failed: $($HelperStatus.error)" }
     if (-not $HelperDone -or -not $ReceiptRepublished) {
-        throw 'Windows update helper did not complete and republish ownership before timeout'
+        $HelperScript = Join-Path $Case 'SessionSkein\install\update-helper.ps1'
+        $HelperLog = Join-Path $Case 'SessionSkein\install\update-helper.log'
+        $ResultDiagnostic = if (Test-Path $HelperResult) { Get-Content $HelperResult -Raw } else { '<missing>' }
+        $LogDiagnostic = if (Test-Path $HelperLog) { Get-Content $HelperLog -Raw } else { '<missing>' }
+        $ScriptDiagnostic = if (Test-Path $HelperScript) { Get-Content $HelperScript -Raw } else { '<missing>' }
+        $ProcessDiagnostic = Get-CimInstance Win32_Process -Filter "Name = 'pwsh.exe'" -ErrorAction SilentlyContinue |
+            Select-Object ProcessId, ParentProcessId, CommandLine | ConvertTo-Json -Compress
+        throw "Windows update helper timeout. helperDone=$HelperDone receiptRepublished=$ReceiptRepublished result=$ResultDiagnostic log=$LogDiagnostic processes=$ProcessDiagnostic script=$ScriptDiagnostic"
     }
-    $HelperStatus = Get-Content -LiteralPath $HelperResult -Raw | ConvertFrom-Json
-    if ($HelperStatus.status -ne 'completed') { throw "Windows update helper failed: $($HelperStatus.error)" }
+    if ($HelperStatus.status -ne 'completed') { throw "Windows update helper returned unexpected status: $($HelperStatus.status)" }
     $Receipt = Get-Content $ReceiptPath -Raw | ConvertFrom-Json
     if ($Receipt.version -ne $Version) { throw 'Windows forced reinstall published the wrong receipt version' }
     if ((& (Join-Path $BinDir 'skein.exe') --version) -ne "skein $Version") { throw 'Windows replaced executable is unhealthy' }

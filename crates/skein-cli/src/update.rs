@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(windows)]
@@ -107,7 +109,13 @@ pub(crate) fn run(options: UpdateOptions) -> Result<(), Box<dyn std::error::Erro
     }
     let args = installer_args(&receipt, &target_version.to_string());
     #[cfg(windows)]
-    let scheduled = schedule_windows(&state, &receipt.installer, &args, &mcp_env, options.json)?;
+    let scheduled = schedule_windows(
+        &state,
+        &receipt.installer,
+        &receipt.installer_hash,
+        &args,
+        &mcp_env,
+    )?;
     #[cfg(not(windows))]
     let scheduled = {
         let mut command = Command::new(&receipt.installer);
@@ -467,36 +475,83 @@ fn catalog_flag() -> &'static str {
 fn schedule_windows(
     state: &Path,
     installer: &Path,
+    installer_hash: &str,
     args: &[String],
     env: &BTreeMap<String, String>,
-    quiet: bool,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let helper = state.join("update-helper.ps1");
     let result = state.join("update-helper.result.json");
+    let log = state.join("update-helper.log");
     let _ = fs::remove_file(&result);
+    let _ = fs::remove_file(&log);
     let quote = |value: &str| value.replace('\'', "''");
     let mut script = format!(
-        "$ErrorActionPreference='Stop'\n$result='{}'\ntry {{\nWait-Process -Id {}\n",
+        r#"$ErrorActionPreference='Stop'
+$result='{}'
+$log='{}'
+$installer='{}'
+$expectedHash='{}'
+$parentPid={}
+$phase='starting'
+function Publish([string]$status,[string]$errorText='') {{
+  $temporary="$result.$PID.tmp"
+  [ordered]@{{status=$status;phase=$phase;parentPid=$parentPid;helperPid=$PID;timestamp=[DateTime]::UtcNow.ToString('o');error=$errorText}} | ConvertTo-Json -Compress | Set-Content -LiteralPath $temporary -NoNewline -Encoding utf8
+  Move-Item -LiteralPath $temporary -Destination $result -Force
+}}
+function Log([string]$message) {{ Add-Content -LiteralPath $log -Value ("{{0:o}} {{1}}" -f [DateTime]::UtcNow,$message) -Encoding utf8 }}
+try {{
+Publish 'running'
+$phase='waiting-for-parent'
+Log "helper $PID locating parent $parentPid"
+$parent=Get-Process -Id $parentPid -ErrorAction SilentlyContinue
+if ($null -ne $parent) {{ Log "waiting for exact parent process $parentPid"; Wait-Process -InputObject $parent }} else {{ Log "parent $parentPid already exited" }}
+$phase='verifying-installer'
+$actualHash=(Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($actualHash -ne $expectedHash.ToLowerInvariant()) {{ throw "installer snapshot hash changed: $actualHash" }}
+"#,
         quote(&result.to_string_lossy()),
+        quote(&log.to_string_lossy()),
+        quote(&installer.to_string_lossy()),
+        quote(installer_hash),
         std::process::id(),
     );
     for (key, value) in env {
         script.push_str(&format!("$env:{}='{}'\n", key, quote(value)));
     }
-    script.push_str(&format!("& '{}'", quote(&installer.to_string_lossy())));
+    script.push_str(
+        "$phase='running-installer'\nLog \"executing verified installer snapshot\"\n& $installer",
+    );
     for arg in args {
         script.push_str(&format!(" '{}'", quote(arg)));
     }
-    script.push_str("\nif ($LASTEXITCODE -ne 0) { throw \"installer exited with $LASTEXITCODE\" }\n'{\"status\":\"completed\"}' | Set-Content -LiteralPath $result -NoNewline\n} catch {\n@{ status='failed'; error=$_.Exception.Message } | ConvertTo-Json -Compress | Set-Content -LiteralPath $result -NoNewline\nexit 1\n}\n");
+    script.push_str("\nif ($LASTEXITCODE -ne 0) { throw \"installer exited with $LASTEXITCODE\" }\n$phase='completed'\nLog 'installer completed successfully'\nPublish 'completed'\n} catch {\n$failure=$_.Exception.ToString()\nLog \"failed during $phase`: $failure\"\ntry { Publish 'failed' $failure } catch { Add-Content -LiteralPath $log -Value $_.Exception.ToString() -Encoding utf8 }\nexit 1\n}\n");
     fs::write(&helper, script)?;
+    let parser = Command::new("pwsh")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "[void][scriptblock]::Create((Get-Content -LiteralPath $env:SKEIN_HELPER_PARSE_PATH -Raw))",
+        ])
+        .env("SKEIN_HELPER_PARSE_PATH", &helper)
+        .stdin(Stdio::null())
+        .output()?;
+    if !parser.status.success() {
+        return Err(format!(
+            "generated Windows update helper failed PowerShell parsing: {}",
+            String::from_utf8_lossy(&parser.stderr).trim()
+        )
+        .into());
+    }
     let mut command = Command::new("pwsh");
     command
         .args(["-NoProfile", "-File"])
         .arg(helper)
-        .stdin(Stdio::null());
-    if quiet {
-        command.stdout(Stdio::null()).stderr(Stdio::null());
-    }
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP: the helper must outlive
+        // the updating executable and must not retain CI/pipeline console handles.
+        .creation_flags(0x0000_0008 | 0x0000_0200);
     command.spawn()?;
     Ok(true)
 }
