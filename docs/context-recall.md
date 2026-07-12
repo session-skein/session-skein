@@ -38,10 +38,24 @@ memory files may be attributed to one registered project using conservative path
 metadata. The longest canonical project match wins; conflicting multi-project
 references remain unmapped. Memory attribution never authorizes raw-session import.
 
-Each enabled source is rebuilt atomically with its FTS rows. Settings and approved
+Each enabled source is reconciled atomically with its FTS rows. Settings and approved
 roots are revalidated after the write lock is acquired. Disabling a source changes
 only its gate; the next `context refresh` or `index` atomically removes that source's
 previous documents.
+
+Raw-session JSONL reconciliation is incrementally parsed after the first full build.
+For each admitted file, Skein stores only bounded byte length beside the existing
+private whole-file fingerprint. An unchanged repeat fully rereads and hashes the file
+to prove equality, but reuses the parsed private document without JSONL processing.
+If a file grew and its entire prior prefix matches at a newline boundary, only the
+appended records are parsed. The complete bounded candidate set is still enumerated,
+so deletion is reconciled atomically.
+
+A missing legacy checkpoint, shrink, rewritten prefix, changed or unauthorized cwd,
+or non-newline append falls back to a full bounded parse. Truncated or unavailable
+discovery remains deferred. Reports expose `mode` (`full`, `incremental`, `unchanged`,
+`fallback_full`, `disabled`, or `deferred`) plus byte, record, reuse, fallback, and
+deletion counts. Checkpoints contain no transcript excerpts or parsed message text.
 
 Interactive `context refresh` reports its scan and completion stages on stderr.
 Progress is suppressed for JSON and non-TTY use. `skein freshness` reads the latest

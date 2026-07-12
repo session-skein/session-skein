@@ -21,6 +21,7 @@ pub use conductor::NewConductorRun;
 pub use context::ContextDocumentRefreshOptions;
 pub use context::ContextDocumentRefreshReport;
 pub use context::ContextDocumentSearchResult;
+pub use context::ContextRefreshMode;
 pub use context::ContextSourceKind;
 pub use context::ContextSourceRefreshReport;
 pub use context::ContextSourceRefreshStatus;

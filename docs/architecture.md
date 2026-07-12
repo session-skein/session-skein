@@ -113,6 +113,12 @@ may retain up to 512 KiB of identity text per registered project; public search
 projections expose only a 2 KiB snippet, title, project identity, and contributing
 relative paths.
 
+The defaults-off raw-session context adapter enumerates the complete bounded file set
+on every authoritative refresh. Schema-11 byte-length checkpoints permit verified
+unchanged reuse and append-tail parsing only after the entire prior prefix matches its
+stored fingerprint. Rewrite, shrink, missing checkpoint, or identity drift falls back
+to the full bounded parser; deletion remains an atomic source reconciliation.
+
 ## Codex adapter
 
 `skein-codex` is isolated from the core state model. It launches the locally installed

@@ -18,7 +18,7 @@ use crate::Result;
 use crate::SkeinPaths;
 use crate::git;
 
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 
 const CREATE_CONDUCTOR_SCHEMA: &str = "CREATE TABLE conductor_decisions (
     id INTEGER PRIMARY KEY,
@@ -655,6 +655,12 @@ impl Registry {
         if current <= 9 {
             transaction.execute_batch(crate::context::CREATE_CONTEXT_DOCUMENT_SCHEMA)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        } else if current == 10 {
+            transaction.execute_batch(
+                "ALTER TABLE context_documents ADD COLUMN source_bytes INTEGER NOT NULL DEFAULT 0
+                    CHECK(source_bytes >= 0 AND source_bytes <= 1048576);",
+            )?;
+            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         } else if current != SCHEMA_VERSION {
             return Err(Error::UnsupportedSchema {
                 found: current,
@@ -1201,6 +1207,77 @@ mod tests {
             registry
                 .search_context_documents("synthetic", 10)?
                 .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn migrates_schema_version_ten_with_safe_empty_incremental_checkpoints() -> Result<()> {
+        let temp = tempfile::tempdir().expect("temporary state");
+        let paths = SkeinPaths::new(temp.path().join("config"), temp.path().join("data"));
+        let registry = Registry::open(&paths)?;
+        registry.connection.execute_batch(
+            "INSERT INTO context_documents (
+                 source_kind, source_path, project_id, context_path, fingerprint,
+                 refreshed_at, title, body, imported_bytes, source_bytes
+             ) VALUES (
+                 'codex_session', 'sessions/synthetic.jsonl', NULL, '/synthetic/project',
+                 'fnv1a64:0123456789abcdef', 1234567890, 'Synthetic session',
+                 'private synthetic body', 22, 314
+             );
+             ALTER TABLE context_documents DROP COLUMN source_bytes;
+             PRAGMA user_version = 10;",
+        )?;
+        drop(registry);
+
+        let migrated = Registry::open(&paths)?;
+        assert_eq!(migrated.schema_version()?, SCHEMA_VERSION);
+        let migrated_row: (
+            String,
+            String,
+            Option<i64>,
+            String,
+            String,
+            i64,
+            String,
+            String,
+            i64,
+            i64,
+        ) = migrated.connection.query_row(
+            "SELECT source_kind, source_path, project_id, context_path, fingerprint,
+                        refreshed_at, title, body, imported_bytes, source_bytes
+                 FROM context_documents
+                 WHERE source_path = 'sessions/synthetic.jsonl'",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                ))
+            },
+        )?;
+        assert_eq!(
+            migrated_row,
+            (
+                "codex_session".to_owned(),
+                "sessions/synthetic.jsonl".to_owned(),
+                None,
+                "/synthetic/project".to_owned(),
+                "fnv1a64:0123456789abcdef".to_owned(),
+                1_234_567_890,
+                "Synthetic session".to_owned(),
+                "private synthetic body".to_owned(),
+                22,
+                0,
+            )
         );
         Ok(())
     }

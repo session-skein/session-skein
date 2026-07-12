@@ -90,3 +90,8 @@ treated as permanent checkpoints across Codex upgrades or long gaps.
 The default sends `useStateDbOnly: true`. `--repair-source-index` separately opts into
 Codex's rollout scan-and-repair path. Additive app-server fields are ignored, unknown
 source/status labels remain representable, and no raw JSONL fallback is attempted.
+
+This metadata catalog path deliberately continues to use bounded app-server pages.
+Opaque cursors are not persisted as incremental checkpoints because they cannot prove
+old-thread insertion or deletion across app-server restarts. Incremental parsing in
+this slice applies only to the separately opted-in raw-session context source.

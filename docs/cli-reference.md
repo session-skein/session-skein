@@ -161,6 +161,11 @@ permits names/previews previously imported with `--include-text`.
 Shows independent generated-memory and raw-session settings, document counts, source
 status, and last refresh information.
 
+`context refresh` and global `index` reports identify raw-session preparation as
+`full`, `incremental`, `unchanged`, `fallback_full`, `disabled`, or `deferred`, with
+`bytesRead`, `recordsConsidered`, `filesReused`, `filesIncremental`, `filesFull`,
+`fallbackFiles`, and `filesDeleted` accounting.
+
 ### `context memories enable|disable`
 
 Changes generated memory-summary recall. A refresh applies the new source set.

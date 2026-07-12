@@ -7,6 +7,9 @@ after its first published release.
 
 ### Added
 
+- Added schema-11 content-free byte checkpoints for verified unchanged reuse and
+  append-tail parsing of explicitly enabled raw-session context files, with safe full
+  fallback and structured work accounting.
 - Added the receipt-gated, CLI-only `skein update` workflow with check-only status,
   exact-version selection, downgrade/reinstall policy, and transactional delegation
   to the verified binary-first installer snapshot. Current-version decisions use the
