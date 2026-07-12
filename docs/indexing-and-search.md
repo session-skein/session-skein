@@ -39,12 +39,22 @@ skein scan-root remove /path/to/workspace
 skein index
 skein index --force
 skein index --working-tree
+skein index --project /path/to/repo
+skein index --scan-root /path/to/workspace
 ```
 
 The default path refreshes discovery, Git administrative metadata, project identity
 documents, enabled context sources, and bounded Codex session metadata. `--force`
 bypasses unchanged fingerprints. `--working-tree` additionally checks tracked-file
 dirty state; untracked files and submodules remain excluded.
+
+`--project` and `--scan-root` are mutually exclusive. Project scope validates one
+registered project and performs no discovery. Scan-root scope validates one configured
+root before traversal, discovers only that root, and refreshes only projects with
+durable provenance from it. Other roots and sibling projects are untouched. If the
+selected root is offline, cached project relationships are retained and the report
+contains an `offline` deferral. Scoped runs defer context and Codex session refreshes
+because those sources currently have global atomic replacement contracts.
 
 The Git adapter does not fetch or contact remotes.
 
@@ -104,6 +114,10 @@ Document and context refreshes stage new rows and replace a source atomically.
 Unavailable or file-cap-truncated sources retain the last complete rows and report a
 deferred status. One project Git error is included in the index report rather than
 silently discarded.
+
+Human output labels the selected scope and deferrals. JSON output adds `scope` and
+`deferred`; `refreshed` remains the CLI Git-report field and `reports` is retained for
+MCP compatibility.
 
 Inspect current state with:
 

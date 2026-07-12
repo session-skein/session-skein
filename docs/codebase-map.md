@@ -18,6 +18,8 @@ exact behavior.
 5. Compare the two presentation adapters:
    [`tui.rs`](../crates/skein-cli/src/tui.rs) and
    [`mcp.rs`](../crates/skein-cli/src/mcp.rs). Neither owns a second state machine.
+   [`indexing.rs`](../crates/skein-cli/src/indexing.rs) is the shared CLI/MCP index
+   orchestration and scope boundary.
 
 ## Crate dependency map
 

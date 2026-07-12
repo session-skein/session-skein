@@ -90,6 +90,12 @@ follows directory symlinks, prunes known dependency/build/cache directories, and
 continues after entry-level I/O errors. The root-to-project provenance table prevents
 frequent activity refreshes from needing another filesystem walk.
 
+CLI and MCP index entry points share one orchestration path. An optional exact-project
+scope performs no discovery; an optional exact-root scope uses durable root/project
+provenance and never walks another configured root. Selection is validated before I/O.
+Global atomic context and session sources are deferred rather than partially rebuilt
+during scoped runs.
+
 The Git metadata adapter observes registered projects. It stores
 branch, head object, latest commit timestamp and subject, and an optional tracked-file
 dirty result. A fingerprint of small Git administrative files lets the default path

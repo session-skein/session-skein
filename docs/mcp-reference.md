@@ -28,7 +28,7 @@ The server returns structured JSON inside MCP content. A fresh database may retu
 | `add_project` | write | `path` | optional name |
 | `add_scan_root` | write | `path` | recursive false; depth 16 |
 | `remove_scan_root` | write/destructive | `path` | projects retained |
-| `refresh_index` | write | none | working tree/force false |
+| `refresh_index` | write | none | optional mutually exclusive project/scan_root |
 | `refresh_activity` | open-world write | none | 7 days; no Git; 100 sessions |
 | `sync_codex_sessions` | open-world write | none | all pages; 100/page |
 | `conduct` | control | prompt, authority, UUID | session text false |
@@ -139,8 +139,14 @@ retains discovered projects.
 
 ### `refresh_index`
 
-Optional `working_tree` and `force`, both false. It performs the same coordinated
-refresh as CLI `index`.
+Optional `working_tree` and `force` default false. Optional string selectors `project`
+and `scan_root` are mutually exclusive. With neither selector it performs the same
+coordinated global refresh as CLI `index`. Project scope refreshes only that registered
+project and performs no discovery. Root scope traverses only that configured root and
+refreshes its provenance-linked projects. Unknown selectors fail before traversal.
+Offline roots retain cached project relationships and return a deferral. Scoped calls
+also report context and session synchronization as deferred because those are global
+atomic sources.
 
 ### `refresh_activity`
 

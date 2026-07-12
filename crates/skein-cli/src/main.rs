@@ -1,3 +1,4 @@
+mod indexing;
 mod mcp;
 mod output;
 mod tui;
@@ -525,6 +526,12 @@ enum ScanRootCommand {
 
 #[derive(Debug, Args)]
 struct IndexArgs {
+    /// Refresh exactly one registered project; no discovery is performed.
+    #[arg(long, value_name = "PATH", conflicts_with = "scan_root")]
+    project: Option<PathBuf>,
+    /// Discover and refresh exactly one configured scan root.
+    #[arg(long, value_name = "PATH", conflicts_with = "project")]
+    scan_root: Option<PathBuf>,
     /// Check tracked working-tree changes after discovery.
     #[arg(long)]
     working_tree: bool,
@@ -712,28 +719,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Command::Index(args) => {
-            let mut registry = Registry::open(&paths)?;
-            let discovery = registry.discover_all_scan_roots()?;
-            let refreshed = refresh_git_resilient(&registry, args.working_tree, args.force)?;
-            let documents = refresh_documents_resilient(&mut registry)?;
-            let context = registry.refresh_context_documents(
-                &codex_home(None)?,
-                skein_core::ContextDocumentRefreshOptions::default(),
-            )?;
-            let sessions = match sync_codex_catalog_default(&paths) {
-                Ok(report) => serde_json::json!({"ok": true, "report": report}),
-                Err(error) => serde_json::json!({"ok": false, "error": error.to_string()}),
+            let scope = match (args.project, args.scan_root) {
+                (Some(path), None) => indexing::IndexScope::Project(path),
+                (None, Some(path)) => indexing::IndexScope::ScanRoot(path),
+                (None, None) => indexing::IndexScope::All,
+                (Some(_), Some(_)) => unreachable!("clap rejects mutually exclusive selectors"),
             };
-            print_value(
-                &serde_json::json!({
-                    "discovery": discovery,
-                    "refreshed": refreshed,
-                    "documents": documents,
-                    "context": context,
-                    "sessions": sessions
-                }),
-                args.json,
-            )?;
+            let report = indexing::refresh_index(&paths, scope, args.working_tree, args.force)?;
+            print_value(&report, args.json)?;
         }
         Command::Search {
             query,

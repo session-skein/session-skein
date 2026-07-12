@@ -106,7 +106,9 @@ working:
   deliberately retains already discovered projects and their durable relationships.
 - `refresh_index` runs configured discovery before refreshing bounded Git metadata,
   private identity documents, content-free Codex session metadata, and any explicitly
-  enabled context sources, without fetching Git remotes.
+  enabled context sources, without fetching Git remotes. Its mutually exclusive
+  `project` and `scan_root` selectors narrow discovery and project refreshes exactly;
+  scoped calls defer global context and session sources and report that decision.
 - `refresh_activity` synchronizes content-free app-server session metadata updated
   inside its requested `since_days` window and can optionally refresh bounded Git
   metadata.

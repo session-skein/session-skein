@@ -13,6 +13,7 @@ and a polished TUI only after behavior is observable and safe.
 - [x] Explicit project registration and diagnostics.
 - [x] User-approved exact or optional recursive scan roots with bounded exclusions.
 - [x] Project metadata, Git state, and incremental refresh.
+- [x] Exact project and exact configured-root scoped index refresh.
 - [x] Import adapters with dry-run previews.
 
 ## Phase 2: session model and local recall
@@ -89,3 +90,10 @@ must not affect Codex discovery, control, routing, database startup, or the TUI.
 Non-goals for the first public releases include cloud synchronization, scanning any
 unapproved root, and storing API credentials in the state database. Recursive
 discovery is supported only for roots the user explicitly marks recursive.
+
+## Scoped-index follow-up backlog
+
+The first scoped-index slice deliberately excludes progress streaming, cancellation,
+ranking redesign, and deep-context UX changes. Potential follow-ups are scoped-source
+progress events, safe cancellation checkpoints, ranking work measured independently
+from traversal, and a separately consented partial deep-context replacement design.
