@@ -3,7 +3,7 @@ members = ["crates/skein-cli", "crates/skein-codex", "crates/skein-core"]
 resolver = "2"
 
 [workspace.package]
-version = "0.5.0-alpha.7"
+version = "0.5.0-alpha.8"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -20,8 +20,8 @@ ratatui = { version = "0.30.2", default-features = false, features = ["crossterm
 rmcp = { version = "1.8.0", default-features = false, features = ["server", "transport-async-rw"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
-skein-codex = { version = "0.5.0-alpha.7", path = "crates/skein-codex" }
-skein-core = { version = "0.5.0-alpha.7", path = "crates/skein-core" }
+skein-codex = { version = "0.5.0-alpha.8", path = "crates/skein-codex" }
+skein-core = { version = "0.5.0-alpha.8", path = "crates/skein-core" }
 tempfile = "3.27.0"
 thiserror = "2.0.18"
 tokio = { version = "1.48.0", features = ["io-std", "io-util", "macros", "process", "rt-multi-thread", "time"] }

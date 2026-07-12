@@ -18,6 +18,7 @@ open reference pages only when you need exact contracts.
 | Connect Codex through MCP | [MCP setup](mcp.md) |
 | Find an exact command or MCP tool | [CLI reference](cli-reference.md) / [MCP reference](mcp-reference.md) |
 | Back up, update, reset, or uninstall | [Maintenance](maintenance.md) |
+| Download or verify a preview release | [Preview releases](releases.md) |
 | Diagnose a failure or slow scan | [Troubleshooting](troubleshooting.md) |
 | Evaluate privacy and authority | [Privacy](privacy.md) |
 
@@ -57,6 +58,7 @@ open reference pages only when you need exact contracts.
 - [Glossary](concepts.md#glossary)
 - [Roadmap](../ROADMAP.md)
 - [Changelog](../CHANGELOG.md)
+- [Preview releases](releases.md)
 
 ## Operations and trust
 

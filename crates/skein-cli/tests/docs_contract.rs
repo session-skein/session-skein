@@ -54,6 +54,7 @@ fn handbook_has_required_entry_points() {
         "docs/state-and-configuration.md",
         "docs/maintenance.md",
         "docs/troubleshooting.md",
+        "docs/releases.md",
         "docs/privacy.md",
         "docs/architecture.md",
     ] {

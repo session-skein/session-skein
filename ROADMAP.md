@@ -81,7 +81,13 @@ and a polished TUI only after behavior is observable and safe.
 - [x] Organized handbook, guided codebase map, complete CLI/MCP references, and
   automated documentation drift checks.
 - [x] Codex marketplace manifest that bundles the workflow skill and MCP declaration.
-- [ ] Signed/notarized cross-platform release binaries with reproducible provenance.
+- [x] Unsigned preview archives for Linux x86_64, macOS x86_64/arm64, and Windows
+  x86_64 with deterministic packaging, checksums, manifests, and GitHub provenance.
+- [ ] Sign and notarize macOS releases and Authenticode-sign Windows releases.
+- [ ] Make installers binary-first only after the signed asset/install trust contract
+  is designed; do not silently replace the source-first path.
+- [ ] Add an explicit `skein update` flow after signed release selection and rollback
+  semantics are defined.
 - [ ] Package-manager distribution after the public command/config surface stabilizes.
 
 Missing, outdated, or broken optional integrations must degrade to diagnostics and

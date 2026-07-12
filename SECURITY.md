@@ -8,5 +8,14 @@ Please report suspected vulnerabilities privately through GitHub's security advi
 feature once the canonical repository is published. Do not include real transcripts,
 credentials, private repository paths, or other personal data in a public issue.
 
-Only the latest released version will receive security fixes during the pre-1.0
-period. The project will publish a supported-version table with its first release.
+Only the latest released version receives security fixes during the pre-1.0 period.
+
+| Version | Supported |
+| --- | --- |
+| `0.5.0-alpha.8` | Yes |
+| Earlier previews | No |
+
+Preview release assets include SHA-256 checksums and GitHub artifact attestations,
+but the executables are not code-signed. macOS builds are not notarized and Windows
+builds do not carry an Authenticode signature. Verify provenance and checksums before
+execution. Platform signing and notarization remain planned work.

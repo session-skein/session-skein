@@ -1,0 +1,145 @@
+name: Preview release
+
+on:
+  pull_request:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate release identity
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.identity.outputs.version }}
+      publish: ${{ steps.identity.outputs.publish }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - id: identity
+        name: Require coherent version and exact release tag
+        run: python scripts/release.py check-ref --ref "$GITHUB_REF" --event "$GITHUB_EVENT_NAME" --github-output "$GITHUB_OUTPUT"
+
+  build:
+    name: Package ${{ matrix.target }}
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            binary: target/release/skein
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            binary: target/release/skein
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            binary: target/release/skein
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            binary: target/release/skein.exe
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: release-${{ matrix.target }}
+      - name: Verify native target
+        shell: bash
+        run: 'rustc -vV | grep -F "host: ${{ matrix.target }}"'
+      - name: Build complete locked workspace
+        run: cargo build --workspace --release --locked
+      - name: Verify packaged executable version
+        shell: bash
+        run: '"${{ matrix.binary }}" --version | grep -Fx "skein ${{ needs.validate.outputs.version }}"'
+      - name: Create deterministic package
+        run: python scripts/release.py package --binary "${{ matrix.binary }}" --target "${{ matrix.target }}" --output release-package
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: package-${{ matrix.target }}
+          path: release-package/session-skein-*
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  assemble:
+    name: Validate complete release asset set
+    needs: [validate, build]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: package-*
+          path: package-input
+      - name: Assemble manifest and checksums
+        run: python scripts/release.py assemble --input package-input --output release-assets
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: release-assets
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  publish:
+    name: Attest and publish draft release
+    if: needs.validate.outputs.publish == 'true'
+    needs: [validate, assemble]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: release-assets
+          path: release-assets
+      - name: Revalidate exact tag after protected build fan-in
+        run: python scripts/release.py check-ref --ref "$GITHUB_REF" --event "$GITHUB_EVENT_NAME"
+      - name: Attest release assets
+        uses: actions/attest-build-provenance@78e6cbd37d0ac1a40113c04f2037dacf1ea3f12e # v4.1.0
+        with:
+          subject-path: release-assets/*
+      - name: Prepare preview release notes
+        run: |
+          cat > release-notes.md <<'EOF'
+          Session Skein preview release. These binaries are unsigned and not notarized.
+
+          Verify downloads with `SHA256SUMS` and GitHub artifact attestations. See the bundled README and repository release documentation for installation and platform limitations.
+          EOF
+      - name: Create draft, upload every asset, then publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            test "$(gh release view "$TAG" --json isDraft --jq .isDraft)" = true || {
+              echo "refusing to overwrite published release $TAG" >&2
+              exit 1
+            }
+          else
+            gh release create "$TAG" --verify-tag --draft --prerelease --title "Session Skein $TAG" --notes-file release-notes.md
+          fi
+          gh release upload "$TAG" release-assets/* --clobber
+          gh release edit "$TAG" --draft=false --prerelease --latest=false
