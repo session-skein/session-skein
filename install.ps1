@@ -623,8 +623,8 @@ $InstallerOwned = $PreviousInstaller
 $InstallerOwnedHash = $PreviousInstallerHash
 $InstallerSnapshot = Join-Path $InstallStateDir 'installer.ps1'
 $IncomingInstaller = ''
-$installerSource = Join-Path $SourceDir 'install.ps1'
-if (Test-Path -LiteralPath $installerSource -PathType Leaf) {
+$installerSource = if ($SourceDir) { Join-Path $SourceDir 'install.ps1' } else { '' }
+if ($installerSource -and (Test-Path -LiteralPath $installerSource -PathType Leaf)) {
     $IncomingInstaller = Join-Path $InstallStateDir ('.installer.' + [Guid]::NewGuid() + '.ps1')
     Copy-Item -LiteralPath $installerSource -Destination $IncomingInstaller
     [void][scriptblock]::Create((Get-Content -LiteralPath $IncomingInstaller -Raw))
