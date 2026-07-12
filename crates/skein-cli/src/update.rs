@@ -494,7 +494,7 @@ fn schedule_windows(
     let _ = fs::remove_file(&log);
     let _ = fs::remove_file(&bootstrap_stdout);
     let _ = fs::remove_file(&bootstrap_stderr);
-    let quote = |value: &str| value.replace('\'', "''");
+    let installer_args = render_windows_installer_args(args)?;
     let mut script = format!(
         r#"$ErrorActionPreference='Stop'
 $result='{}'
@@ -519,21 +519,18 @@ $phase='verifying-installer'
 $actualHash=(Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
 if ($actualHash -ne $expectedHash.ToLowerInvariant()) {{ throw "installer snapshot hash changed: $actualHash" }}
 "#,
-        quote(&result.to_string_lossy()),
-        quote(&log.to_string_lossy()),
-        quote(&installer.to_string_lossy()),
-        quote(installer_hash),
+        ps_quote(&result.to_string_lossy()),
+        ps_quote(&log.to_string_lossy()),
+        ps_quote(&installer.to_string_lossy()),
+        ps_quote(installer_hash),
         std::process::id(),
     );
     for (key, value) in env {
-        script.push_str(&format!("$env:{}='{}'\n", key, quote(value)));
+        script.push_str(&format!("$env:{}='{}'\n", key, ps_quote(value)));
     }
-    script.push_str(
-        "$phase='running-installer'\nLog \"executing verified installer snapshot\"\n& $installer",
-    );
-    for arg in args {
-        script.push_str(&format!(" '{}'", quote(arg)));
-    }
+    script.push_str("$phase='running-installer'\nLog \"executing verified installer snapshot\"\n");
+    script.push_str(&installer_args);
+    script.push_str("& $installer @installerArgs");
     script.push_str("\nif ($LASTEXITCODE -ne 0) { throw \"installer exited with $LASTEXITCODE\" }\n$phase='completed'\nLog 'installer completed successfully'\nPublish 'completed'\n} catch {\n$failure=$_.Exception.ToString()\nLog \"failed during $phase`: $failure\"\ntry { Publish 'failed' $failure } catch { Add-Content -LiteralPath $log -Value $_.Exception.ToString() -Encoding utf8 }\nexit 1\n}\n");
     fs::write(&helper, script)?;
     let parser = Command::new("pwsh")
@@ -609,6 +606,69 @@ if ($actualHash -ne $expectedHash.ToLowerInvariant()) {{ throw "installer snapsh
     }
 }
 
+#[cfg(any(windows, test))]
+fn ps_quote(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
+#[cfg(any(windows, test))]
+fn render_windows_installer_args(args: &[String]) -> Result<String, Box<dyn std::error::Error>> {
+    let mut values = BTreeMap::new();
+    let mut switches = BTreeMap::new();
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        match flag {
+            "-Version" | "-BinDir" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| format!("Windows installer argument {flag} requires a value"))?;
+                if value.starts_with('-') {
+                    return Err(format!(
+                        "Windows installer argument {flag} requires a value, not another flag"
+                    )
+                    .into());
+                }
+                if values.insert(flag, value.as_str()).is_some() {
+                    return Err(format!("duplicate Windows installer argument: {flag}").into());
+                }
+                index += 2;
+            }
+            "-NoSkill" | "-NoMcp" | "-Control" | "-CatalogOnly" => {
+                if switches.insert(flag, true).is_some() {
+                    return Err(format!("duplicate Windows installer switch: {flag}").into());
+                }
+                index += 1;
+            }
+            _ => return Err(format!("unsupported Windows installer argument: {flag}").into()),
+        }
+    }
+    for required in ["-Version", "-BinDir"] {
+        if !values.contains_key(required) {
+            return Err(format!("missing required Windows installer argument: {required}").into());
+        }
+    }
+    if switches.contains_key("-Control") && switches.contains_key("-CatalogOnly") {
+        return Err("Windows installer profile switches are mutually exclusive".into());
+    }
+    let mut rendered = String::from("$installerArgs=@{\n");
+    for (flag, name) in [("-Version", "Version"), ("-BinDir", "BinDir")] {
+        rendered.push_str(&format!("  {name}='{}'\n", ps_quote(values[flag])));
+    }
+    for (flag, name) in [
+        ("-NoSkill", "NoSkill"),
+        ("-NoMcp", "NoMcp"),
+        ("-Control", "Control"),
+        ("-CatalogOnly", "CatalogOnly"),
+    ] {
+        if switches.contains_key(flag) {
+            rendered.push_str(&format!("  {name}=$true\n"));
+        }
+    }
+    rendered.push_str("}\n");
+    Ok(rendered)
+}
+
 #[cfg(windows)]
 fn helper_start_error(
     reason: &str,
@@ -629,4 +689,67 @@ fn helper_start_error(
         stderr.trim()
     )
     .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_windows_installer_args;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn windows_installer_arguments_render_as_typed_splat_without_reparsing() {
+        let rendered = render_windows_installer_args(&args(&[
+            "-Version",
+            "0.5.0-alpha.9",
+            "-BinDir",
+            "C:\\Program Files\\Session Skein",
+            "-NoSkill",
+            "-Control",
+        ]))
+        .expect("closed argument set should render");
+        assert!(rendered.starts_with("$installerArgs=@{\n"));
+        assert!(rendered.contains("Version='0.5.0-alpha.9'"));
+        assert!(rendered.contains("BinDir='C:\\Program Files\\Session Skein'"));
+        assert!(rendered.contains("NoSkill=$true"));
+        assert!(rendered.contains("Control=$true"));
+        assert!(!rendered.contains("'-BinDir'"));
+    }
+
+    #[test]
+    fn windows_installer_arguments_escape_values_and_reject_invalid_shapes() {
+        let rendered = render_windows_installer_args(&args(&[
+            "-Version",
+            "0.5.0-alpha.9",
+            "-BinDir",
+            "C:\\O'Brien",
+            "-NoMcp",
+        ]))
+        .expect("quoted path should render");
+        assert!(rendered.contains("BinDir='C:\\O''Brien'"));
+
+        for invalid in [
+            args(&["-Version", "0.5.0-alpha.9", "-BinDir"]),
+            args(&["-Version", "0.5.0-alpha.9", "-BinDir", "-NoMcp"]),
+            args(&[
+                "-Version",
+                "0.5.0-alpha.9",
+                "-BinDir",
+                "C:\\bin",
+                "-Unknown",
+            ]),
+            args(&[
+                "-Version",
+                "0.5.0-alpha.9",
+                "-BinDir",
+                "C:\\bin",
+                "-Control",
+                "-CatalogOnly",
+            ]),
+        ] {
+            assert!(render_windows_installer_args(&invalid).is_err());
+        }
+    }
 }
