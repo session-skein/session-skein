@@ -13,6 +13,10 @@ codex mcp get session-skein --json
 If the repository is present, follow its root `INSTALL.md`. Use an absolute installed
 binary in direct MCP configuration.
 
+`skein update --check --json` is read-only. Run mutating `skein update` only when the
+user asks to update an unchanged release-owned installation. It is intentionally not
+an MCP tool; source installations use the documented source-installer flow.
+
 ## Setup and index
 
 ```console

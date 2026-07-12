@@ -26,6 +26,7 @@ process listings therefore do not contain prompt text.
 skein
 ├── doctor
 ├── init
+├── update [VERSION] [--check] [--force] [--allow-downgrade]
 ├── project
 │   ├── add PATH [--name NAME]
 │   ├── show PATH
@@ -97,6 +98,17 @@ and readable schema version. It opens no writable registry and performs no migra
 
 Creates private state or applies forward-only migrations. It does not register a
 project, index a repository, or contact Codex.
+
+### `update`
+
+`update [VERSION]` is CLI-only and operates only on an unchanged, receipt-owned
+binary release installation. Without `VERSION` it resolves the approved preview
+channel. `--check` verifies release metadata and reports availability without
+mutation; `--json` returns structured status. Same-version reinstall requires
+`--force`. Downgrades are refused unless `--allow-downgrade` is supplied after schema
+compatibility review. The compiled binary version, not the mutable receipt version,
+is used for comparisons and reporting; disagreement is refused. Source/manual
+installs are directed to the source installer.
 
 ### `project add|show|refresh|list`
 

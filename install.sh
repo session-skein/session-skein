@@ -12,6 +12,9 @@ ORIGINAL_ARGS=("$@")
 REPO_URL="${SKEIN_REPO_URL:-https://github.com/session-skein/session-skein.git}"
 RELEASE_BASE_URL="${SKEIN_RELEASE_BASE_URL:-https://github.com/session-skein/session-skein/releases/download}"
 RELEASE_CHANNEL_URL="${SKEIN_RELEASE_CHANNEL_URL:-https://raw.githubusercontent.com/session-skein/session-skein/main/release-channels}"
+[ -z "${SKEIN_RELEASE_BASE_URL:-}${SKEIN_RELEASE_CHANNEL_URL:-}" ] || \
+  [ "${SKEIN_ALLOW_RELEASE_OVERRIDE:-0}" = "1" ] || \
+  { printf 'error: release endpoint overrides require SKEIN_ALLOW_RELEASE_OVERRIDE=1 (testing only)\n' >&2; exit 1; }
 PROFILE="catalog"
 PROFILE_FLAGS=0
 BINARY_SOURCE=""
@@ -24,6 +27,8 @@ REPLACE_MCP=0
 REPLACE_SKILL=0
 UPDATE=0
 UNINSTALL=0
+CHECK_ONLY=0
+JSON_OUTPUT=0
 RELEASE_VERSION=""
 RELEASE_CHANNEL="preview"
 RESOLVED_FROM_CHANNEL=0
@@ -60,12 +65,14 @@ Options:
   --replace-skill    Back up and replace a conflicting skill path
   --update           Update an explicit Git source checkout and reinstall
   --uninstall        Remove only hash/target-matched installer-owned integration
+  --check            Verify release availability without installing
+  --json             Emit machine-readable check output
   -h, --help         Show this help
 
 Environment:
   SKEIN_REPO_URL       Override the Git clone URL
-  SKEIN_RELEASE_BASE_URL    Override the release asset base (testing/mirror only)
-  SKEIN_RELEASE_CHANNEL_URL Override the channel-file base (testing/mirror only)
+  SKEIN_RELEASE_BASE_URL    Override the release asset base (testing only)
+  SKEIN_RELEASE_CHANNEL_URL Override the channel-file base (testing only)
   SKEIN_INSTALL_SOURCE Override the managed checkout path
   SKEIN_BIN_DIR        Override the default binary directory
   CODEX_HOME           Override the Codex home (default: ~/.codex)
@@ -126,6 +133,8 @@ while [ "$#" -gt 0 ]; do
     --replace-skill) REPLACE_SKILL=1 ;;
     --update) UPDATE=1 ;;
     --uninstall) UNINSTALL=1 ;;
+    --check) CHECK_ONLY=1 ;;
+    --json) JSON_OUTPUT=1 ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown option: $1 (run --help)" ;;
   esac
@@ -149,6 +158,7 @@ MCP_ROLLBACK="$INSTALL_STATE_DIR/codex-config.rollback"
 MCP_JSON_ROLLBACK="$INSTALL_STATE_DIR/mcp.rollback.json"
 RECEIPT_ROLLBACK="$INSTALL_STATE_DIR/receipt.rollback"
 BINARY_ROLLBACK="$INSTALL_STATE_DIR/binary.rollback"
+INSTALLER_ROLLBACK="$INSTALL_STATE_DIR/installer.rollback"
 CODEX_CONFIG_FILE="$CODEX_HOME_DIR/config.toml"
 SKILL_SNAPSHOT_ROOT="$INSTALL_STATE_DIR/skills"
 MANAGED_SOURCE="${SKEIN_INSTALL_SOURCE:-${XDG_DATA_HOME:-$HOME/.local/share}/session-skein/repo}"
@@ -158,6 +168,7 @@ SOURCE_COMMIT=""
 SOURCE_RECEIPT=""
 PLUGIN_DIR=""
 INSTALLED_BINARY="$BIN_DIR/skein"
+INSTALLER_SNAPSHOT="$INSTALL_STATE_DIR/installer.sh"
 
 receipt_value() {
   key="$1"
@@ -275,6 +286,17 @@ uninstall_owned() {
     fi
   fi
 
+  owned_installer="$(receipt_value installer)"
+  owned_installer_hash="$(receipt_value installer_hash)"
+  if [ -n "$owned_installer" ]; then
+    if [ -f "$owned_installer" ] && [ "$(sha256_file "$owned_installer")" = "$owned_installer_hash" ]; then
+      rm -f "$owned_installer"
+    elif [ -e "$owned_installer" ]; then
+      printf '• Preserving modified installer snapshot %s.\n' "$owned_installer" >&2
+      preserved=1
+    fi
+  fi
+
   if [ "$preserved" -eq 0 ]; then
     rm -f "$RECEIPT"
     printf '\n✓ Session Skein integration removed.\n'
@@ -301,6 +323,8 @@ PREVIOUS_SKILL_BACKUP="$(receipt_value skill_backup)"
 PREVIOUS_MCP_PROFILE="$(receipt_value mcp_profile)"
 PREVIOUS_MCP_HASH="$(receipt_value mcp_hash)"
 PREVIOUS_MCP_SPEC_HASH="$(receipt_value mcp_spec_hash)"
+PREVIOUS_INSTALLER="$(receipt_value installer)"
+PREVIOUS_INSTALLER_HASH="$(receipt_value installer_hash)"
 
 resolve_source() {
   if [ -n "$SOURCE_OVERRIDE" ]; then
@@ -501,7 +525,26 @@ if [ -n "$SOURCE_DIR" ] && [ "$NO_SKILL" -eq 0 ]; then
   [ "$SKILL_VERSION" = "$ACTUAL_VERSION" ] || \
     die "binary $ACTUAL_VERSION and bundled skill/plugin $SKILL_VERSION do not match"
 fi
+[ -z "$RELEASE_VERSION" ] || [ "$ACTUAL_VERSION" = "$RELEASE_VERSION" ] || \
+  die "candidate binary reports $ACTUAL_VERSION, expected $RELEASE_VERSION"
+if [ "$CHECK_ONLY" -eq 1 ]; then
+  if [ "$JSON_OUTPUT" -eq 1 ]; then
+    printf '{"channel":"%s","targetVersion":"%s","platform":"%s","verified":true}\n' \
+      "$RELEASE_CHANNEL" "$ACTUAL_VERSION" "$(detect_release_target)"
+  else
+    printf 'verified Session Skein %s for %s\n' "$ACTUAL_VERSION" "$(detect_release_target)"
+  fi
+  exit 0
+fi
 INCOMING_HASH="$(sha256_file "$BINARY_SOURCE")"
+
+if [ -n "$PREVIOUS_INSTALLER" ]; then
+  [ "$PREVIOUS_INSTALLER" = "$INSTALLER_SNAPSHOT" ] || \
+    die "receipt installer path disagrees with $INSTALLER_SNAPSHOT"
+  [ -f "$PREVIOUS_INSTALLER" ] && \
+    [ "$(sha256_file "$PREVIOUS_INSTALLER")" = "$PREVIOUS_INSTALLER_HASH" ] || \
+    die "installer snapshot ownership drift detected: $PREVIOUS_INSTALLER"
+fi
 
 # Preflight every collision before changing the binary, state, skill, or MCP config.
 [ -z "$PREVIOUS_BINARY" ] || [ "$PREVIOUS_BINARY" = "$INSTALLED_BINARY" ] || \
@@ -619,7 +662,7 @@ if [ "$NO_SKILL" -eq 0 ]; then
     fi
   fi
 fi
-rm -f "$RECEIPT_ROLLBACK" "$BINARY_ROLLBACK" "$MCP_ROLLBACK" "$MCP_JSON_ROLLBACK"
+rm -f "$RECEIPT_ROLLBACK" "$BINARY_ROLLBACK" "$INSTALLER_ROLLBACK" "$MCP_ROLLBACK" "$MCP_JSON_ROLLBACK"
 HAD_RECEIPT=0
 if [ -f "$RECEIPT" ]; then
   cp "$RECEIPT" "$RECEIPT_ROLLBACK"
@@ -635,12 +678,44 @@ restore_binary_and_receipt() {
       mv "$BINARY_BACKUP" "$INSTALLED_BINARY"
     fi
   fi
+  if [ -n "${INCOMING_INSTALLER:-}" ]; then
+    rm -f "$INSTALLER_SNAPSHOT"
+    if [ -n "$PREVIOUS_INSTALLER" ] && [ -f "$INSTALLER_ROLLBACK" ]; then
+      mv -f "$INSTALLER_ROLLBACK" "$INSTALLER_SNAPSHOT"
+    fi
+  fi
   if [ "$HAD_RECEIPT" -eq 1 ] && [ -f "$RECEIPT_ROLLBACK" ]; then
     mv -f "$RECEIPT_ROLLBACK" "$RECEIPT"
   else
     rm -f "$RECEIPT"
   fi
 }
+
+INSTALLER_OWNED="$PREVIOUS_INSTALLER"
+INSTALLER_OWNED_HASH="$PREVIOUS_INSTALLER_HASH"
+INCOMING_INSTALLER=""
+if [ -f "$SOURCE_DIR/install.sh" ]; then
+  INCOMING_INSTALLER="$INSTALL_STATE_DIR/.installer.$$"
+  cp "$SOURCE_DIR/install.sh" "$INCOMING_INSTALLER"
+  chmod 0755 "$INCOMING_INSTALLER"
+  bash -n "$INCOMING_INSTALLER" || die "incoming installer snapshot failed syntax validation"
+  INCOMING_INSTALLER_HASH="$(sha256_file "$INCOMING_INSTALLER")"
+  if [ -n "$PREVIOUS_INSTALLER" ]; then
+    cp "$PREVIOUS_INSTALLER" "$INSTALLER_ROLLBACK"
+  fi
+  if [ "${SKEIN_TEST_FAIL_INSTALLER_SNAPSHOT:-0}" = "1" ] && \
+     [ "${SKEIN_ALLOW_RELEASE_OVERRIDE:-0}" = "1" ]; then
+    rm -f "$INCOMING_INSTALLER"
+    restore_binary_and_receipt
+    die "injected installer snapshot installation failure"
+  fi
+  if ! mv -f "$INCOMING_INSTALLER" "$INSTALLER_SNAPSHOT"; then
+    restore_binary_and_receipt
+    die "could not install the verified installer snapshot"
+  fi
+  INSTALLER_OWNED="$INSTALLER_SNAPSHOT"
+  INSTALLER_OWNED_HASH="$INCOMING_INSTALLER_HASH"
+fi
 
 if [ "$BINARY_ACTION" = "keep-owned" ]; then
   INSTALLED_HASH="$CURRENT_BINARY_HASH"
@@ -672,6 +747,8 @@ binary_hash=$INSTALLED_HASH
 binary_backup=$BINARY_BACKUP
 source=${SOURCE_RECEIPT:-$SOURCE_DIR}
 source_commit=$SOURCE_COMMIT
+installer=$INSTALLER_OWNED
+installer_hash=$INSTALLER_OWNED_HASH
 skill=$SKILL_TARGET
 skill_source=$SKILL_SOURCE
 skill_backup=$SKILL_BACKUP
@@ -685,6 +762,11 @@ EOF
 if ! write_receipt; then
   restore_binary_and_receipt
   die "could not write the provisional installer receipt; the previous binary was restored"
+fi
+if [ "${SKEIN_TEST_FAIL_INSTALLER_RECEIPT:-0}" = "1" ] && \
+   [ "${SKEIN_ALLOW_RELEASE_OVERRIDE:-0}" = "1" ]; then
+  restore_binary_and_receipt
+  die "injected installer snapshot receipt failure; the previous installation was restored"
 fi
 if ! "$INSTALLED_BINARY" init >/dev/null; then
   restore_binary_and_receipt
@@ -749,8 +831,6 @@ if [ "$SKILL_ACTION" != "none" ]; then
     fail_skill_install "could not record the installed skill"
   fi
 fi
-rm -f "$BINARY_ROLLBACK" "$RECEIPT_ROLLBACK"
-
 if [ "$MCP_ACTION" != "none" ]; then
   MCP_CONFIG_EXISTED=0
   if [ -f "$CODEX_CONFIG_FILE" ]; then
@@ -783,20 +863,31 @@ if [ "$MCP_ACTION" != "none" ]; then
   [ "$PROFILE" = "catalog" ] || MCP_ARGS+=(--allow-control)
   if ! NO_COLOR=1 FORCE_COLOR=0 codex "${MCP_ARGS[@]}" >/dev/null; then
     restore_codex_config
-    die "Codex MCP registration failed; the previous Codex configuration was restored"
+    rollback_skill_switch
+    restore_binary_and_receipt
+    die "Codex MCP registration failed; the previous owned integration was restored"
   fi
   CONFIGURED_MCP="$(codex_mcp_json)"
   if [ -z "$CONFIGURED_MCP" ]; then
     restore_codex_config
-    die "Codex could not verify the MCP registration; the previous Codex configuration was restored"
+    rollback_skill_switch
+    restore_binary_and_receipt
+    die "Codex could not verify the MCP registration; the previous owned integration was restored"
   fi
   MCP_PROFILE="$PROFILE"
   MCP_HASH="$(printf '%s' "$CONFIGURED_MCP" | sha256_text)"
   MCP_SPEC_HASH="$DESIRED_MCP_SPEC_HASH"
-  write_receipt
+  if ! write_receipt; then
+    restore_codex_config
+    rollback_skill_switch
+    restore_binary_and_receipt
+    die "could not record the MCP registration; the previous owned integration was restored"
+  fi
   rm -f "$MCP_ROLLBACK" "$MCP_JSON_ROLLBACK"
   note "Registered the $PROFILE Session Skein MCP profile"
 fi
+
+rm -f "$BINARY_ROLLBACK" "$RECEIPT_ROLLBACK" "$INSTALLER_ROLLBACK" "$MCP_ROLLBACK" "$MCP_JSON_ROLLBACK"
 
 printf '\n✓ Session Skein is installed.\n'
 "$INSTALLED_BINARY" --version

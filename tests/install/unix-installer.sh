@@ -181,6 +181,8 @@ if run_install "$mcp_failure" env FAKE_CODEX_FAIL_ADD=after \
   exit 1
 fi
 test "$(hash_file "$mcp_failure/codex/config.toml")" = "$original_mcp_hash"
+test ! -e "$mcp_failure/bin/skein"
+test ! -e "$mcp_failure/state/session-skein/install/receipt"
 
 mcp_verify_failure="$ROOT/mcp-verify-failure"
 if run_install "$mcp_verify_failure" env FAKE_CODEX_FAIL_VERIFY=1 \
@@ -190,6 +192,8 @@ if run_install "$mcp_verify_failure" env FAKE_CODEX_FAIL_VERIFY=1 \
   exit 1
 fi
 test ! -e "$mcp_verify_failure/codex/config.toml"
+test ! -e "$mcp_verify_failure/bin/skein"
+test ! -e "$mcp_verify_failure/state/session-skein/install/receipt"
 
 # Uninstall retains MCP ownership when Codex cannot answer authoritatively.
 unqueryable="$ROOT/unqueryable-mcp"

@@ -4,6 +4,8 @@ umask 077
 
 BINARY="${1:?usage: unix-release-installer.sh PATH_TO_SKEIN}"
 REPO_ROOT="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)"
+FAKE_BIN="$REPO_ROOT/tests/fixtures/fake-codex"
+ORIGINAL_PATH="$PATH"
 VERSION="$($BINARY --version | awk '{print $2}')"
 case "$(uname -s):$(uname -m)" in
   Linux:x86_64) TARGET="x86_64-unknown-linux-gnu" ;;
@@ -54,8 +56,10 @@ run_remote() {
   HOME="$case_root/home" XDG_STATE_HOME="$case_root/state" \
     SKEIN_DATA_DIR="$case_root/data" SKEIN_CONFIG_DIR="$case_root/config" \
     CODEX_HOME="$case_root/codex" SKEIN_BIN_DIR="$case_root/bin" \
+    FAKE_CODEX_STATE="$case_root/codex/config.toml" PATH="$FAKE_BIN:$ORIGINAL_PATH" \
     SKEIN_RELEASE_BASE_URL="file://$RELEASE_ROOT" \
     SKEIN_RELEASE_CHANNEL_URL="file://$CHANNEL_ROOT" \
+    SKEIN_ALLOW_RELEASE_OVERRIDE=1 \
     SKEIN_ALLOW_INSECURE_TEST_DOWNLOADS=1 \
     "$REPO_ROOT/install.sh" "$@"
 }
@@ -63,10 +67,107 @@ run_remote() {
 # Default preview mode installs from the channel without Git or Rust, then safely
 # reinstalls and uninstalls through the existing receipt ownership path.
 clean="$ROOT/clean"
-run_remote "$clean" --no-mcp >/dev/null
+run_remote "$clean" --control >/dev/null
 test "$("$clean/bin/skein" --version)" = "skein $VERSION"
 grep -Fxq "source=release:$TAG:$TARGET" "$clean/state/session-skein/install/receipt"
 test -f "$clean/codex/skills/session-skein/SKILL.md"
+test -x "$clean/state/session-skein/install/installer.sh"
+
+# Receipt versions are ownership metadata, not authority over the compiled binary.
+receipt="$clean/state/session-skein/install/receipt"
+cp "$receipt" "$ROOT/receipt-good"
+sed -i.bak "s/^version=.*/version=0.5.0-alpha.8/" "$receipt"
+rm -f "$receipt.bak"
+update_env=(
+  HOME="$clean/home" XDG_STATE_HOME="$clean/state"
+  SKEIN_DATA_DIR="$clean/data" SKEIN_CONFIG_DIR="$clean/config" CODEX_HOME="$clean/codex"
+  FAKE_CODEX_STATE="$clean/codex/config.toml" PATH="$FAKE_BIN:$ORIGINAL_PATH"
+  SKEIN_RELEASE_BASE_URL="file://$RELEASE_ROOT" SKEIN_RELEASE_CHANNEL_URL="file://$CHANNEL_ROOT"
+  SKEIN_ALLOW_RELEASE_OVERRIDE=1 SKEIN_ALLOW_INSECURE_TEST_DOWNLOADS=1
+)
+if env "${update_env[@]}" "$clean/bin/skein" update --check >/dev/null 2>&1; then
+  echo 'modified receipt version unexpectedly passed update preflight' >&2
+  exit 1
+fi
+cp "$ROOT/receipt-good" "$receipt"
+check_json="$(env "${update_env[@]}" "$clean/bin/skein" update --check --json)"
+printf '%s' "$check_json" | grep -Fq '"status": "current"'
+if env "${update_env[@]}" "$clean/bin/skein" update >/dev/null 2>&1; then
+  echo 'same-version update unexpectedly succeeded without --force' >&2
+  exit 1
+fi
+forced_json="$(env "${update_env[@]}" "$clean/bin/skein" update --force --json)"
+printf '%s' "$forced_json" | grep -Fq '"status": "updated"'
+printf '%s' "$forced_json" | grep -Fq '"scheduled": false'
+test "$("$clean/bin/skein" --version)" = "skein $VERSION"
+grep -Fxq "version=$VERSION" "$receipt"
+grep -Fxq "binary_hash=$(sha_file "$clean/bin/skein")" "$receipt"
+
+# Snapshot staging and receipt publication are in the same rollback transaction.
+before_binary="$(sha_file "$clean/bin/skein")"
+before_installer="$(sha_file "$clean/state/session-skein/install/installer.sh")"
+before_receipt="$(sha_file "$receipt")"
+before_skill="$(readlink "$clean/codex/skills/session-skein")"
+before_mcp="$(sha_file "$clean/codex/config.toml")"
+for failure in SKEIN_TEST_FAIL_INSTALLER_SNAPSHOT SKEIN_TEST_FAIL_INSTALLER_RECEIPT; do
+  if env "${update_env[@]}" "$failure=1" "$REPO_ROOT/install.sh" --version "$VERSION" --control >/dev/null 2>&1; then
+    echo "$failure unexpectedly succeeded" >&2
+    exit 1
+  fi
+  test "$(sha_file "$clean/bin/skein")" = "$before_binary"
+  test "$(sha_file "$clean/state/session-skein/install/installer.sh")" = "$before_installer"
+  test "$(sha_file "$receipt")" = "$before_receipt"
+  test "$(readlink "$clean/codex/skills/session-skein")" = "$before_skill"
+  test "$(sha_file "$clean/codex/config.toml")" = "$before_mcp"
+done
+
+# Receipt/source and installer ownership drift are refused before release mutation.
+installer_snapshot="$clean/state/session-skein/install/installer.sh"
+cp "$installer_snapshot" "$ROOT/installer-good"
+printf '\n# drift\n' >> "$installer_snapshot"
+if env "${update_env[@]}" "$clean/bin/skein" update --check >/dev/null 2>&1; then
+  echo 'installer ownership drift unexpectedly passed' >&2
+  exit 1
+fi
+cp "$ROOT/installer-good" "$installer_snapshot"
+sed -i.bak 's/^source=.*/source=\/synthetic\/source-checkout/' "$receipt"
+rm -f "$receipt.bak"
+if env "${update_env[@]}" "$clean/bin/skein" update --check >/dev/null 2>&1; then
+  echo 'source installation unexpectedly passed product update preflight' >&2
+  exit 1
+fi
+sed -i.bak "s|^source=.*|source=release:$TAG:$TARGET|" "$receipt"
+rm -f "$receipt.bak"
+
+# A verified lower target is rejected unless downgrade authority is explicit.
+cat > "$installer_snapshot" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' '{"targetVersion":"0.5.0-alpha.8","verified":true}'
+EOF
+chmod 0755 "$installer_snapshot"
+snapshot_hash="$(sha_file "$installer_snapshot")"
+sed -i.bak "s/^installer_hash=.*/installer_hash=$snapshot_hash/" "$receipt"
+rm -f "$receipt.bak"
+if env "${update_env[@]}" "$clean/bin/skein" update --check >/dev/null 2>&1; then
+  echo 'downgrade unexpectedly passed without authority' >&2
+  exit 1
+fi
+cat > "$installer_snapshot" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' '{"targetVersion":"0.5.0-alpha.9","verified":false}'
+EOF
+chmod 0755 "$installer_snapshot"
+snapshot_hash="$(sha_file "$installer_snapshot")"
+sed -i.bak "s/^installer_hash=.*/installer_hash=$snapshot_hash/" "$receipt"
+rm -f "$receipt.bak"
+if env "${update_env[@]}" "$clean/bin/skein" update --check >/dev/null 2>&1; then
+  echo 'unverified inspect_target JSON unexpectedly passed' >&2
+  exit 1
+fi
+cp "$ROOT/installer-good" "$installer_snapshot"
+snapshot_hash="$(sha_file "$installer_snapshot")"
+sed -i.bak "s/^installer_hash=.*/installer_hash=$snapshot_hash/" "$receipt"
+rm -f "$receipt.bak"
 run_remote "$clean" --version "$VERSION" --no-mcp >/dev/null
 run_remote "$clean" --uninstall >/dev/null
 test ! -e "$clean/bin/skein"
@@ -137,7 +238,14 @@ cat > "$fakebin/uname" <<'EOF'
 case "${1:-}" in -s) echo FreeBSD ;; -m) echo riscv64 ;; *) echo FreeBSD ;; esac
 EOF
 chmod 0755 "$fakebin/uname"
-if PATH="$fakebin:$PATH" run_remote "$ROOT/unsupported" --version "$VERSION" --no-skill --no-mcp >"$ROOT/unsupported.out" 2>&1; then
+unsupported="$ROOT/unsupported"
+if env HOME="$unsupported/home" XDG_STATE_HOME="$unsupported/state" \
+  SKEIN_DATA_DIR="$unsupported/data" SKEIN_CONFIG_DIR="$unsupported/config" \
+  CODEX_HOME="$unsupported/codex" SKEIN_BIN_DIR="$unsupported/bin" \
+  SKEIN_RELEASE_BASE_URL="file://$RELEASE_ROOT" SKEIN_RELEASE_CHANNEL_URL="file://$CHANNEL_ROOT" \
+  SKEIN_ALLOW_RELEASE_OVERRIDE=1 SKEIN_ALLOW_INSECURE_TEST_DOWNLOADS=1 \
+  PATH="$fakebin:$FAKE_BIN:$ORIGINAL_PATH" "$REPO_ROOT/install.sh" \
+  --version "$VERSION" --no-skill --no-mcp >"$ROOT/unsupported.out" 2>&1; then
   echo 'unsupported platform unexpectedly installed' >&2
   exit 1
 fi

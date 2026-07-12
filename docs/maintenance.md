@@ -4,9 +4,20 @@ This page covers updates, backups, restore, reset, plugin refresh, and uninstall
 
 ## Update
 
-There is no `skein update` command yet. To reinstall or move to the approved preview,
-rerun the normal binary-first installer; unchanged installer-owned objects are
-replaced through the receipt rollback path.
+For an unchanged binary-first installation from alpha.9 onward:
+
+```console
+skein update --check
+skein update
+skein update 0.5.0-alpha.9 --force
+```
+
+The check is non-mutating. The running binary's compiled package version is the
+current-version authority; a different receipt version is ownership drift and is
+refused. Updates preserve the receipt-owned binary path, skill,
+MCP profile/environment, backups, and private data. Manual, source, drifted,
+downgrade, and same-version cases fail closed unless explicitly authorized. Alpha.8
+needs one final installer rerun to acquire the command and updater snapshot.
 
 The legacy `--update` / `-Update` flags are only for explicit source checkouts. From
 a managed or fresh checkout on Linux/macOS:
@@ -21,11 +32,11 @@ On Windows:
 ./install.ps1 -Update -Control
 ```
 
-The installer stages and verifies the new executable before replacing the
-installer-owned path, copies a content-addressed skill snapshot, and preserves the
-database. The active skill link switches only after `init` applies its transactional
-forward migration successfully. A failed refreshed installer cannot change the live
-skill through the mutable Git checkout.
+The installer stages and verifies the new executable and installer snapshot before
+mutation. It retains the prior binary, installer snapshot, receipt, skill target, and
+MCP configuration until the replacement receipt is durable. A failure restores the
+previous owned integration. The database is preserved, and the active skill link
+switches only after `init` applies its transactional forward migration successfully.
 
 If installed manually:
 

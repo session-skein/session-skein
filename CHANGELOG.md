@@ -3,7 +3,17 @@
 All notable changes will be documented here. The project follows Semantic Versioning
 after its first published release.
 
-## [0.5.0-alpha.8] - Unreleased
+## [0.5.0-alpha.9] - Unreleased
+
+### Added
+
+- Added the receipt-gated, CLI-only `skein update` workflow with check-only status,
+  exact-version selection, downgrade/reinstall policy, and transactional delegation
+  to the verified binary-first installer snapshot. Current-version decisions use the
+  compiled binary version, and installer snapshot replacement participates in
+  rollback with the binary, skill, MCP registration, and receipt.
+
+## [0.5.0-alpha.8] - 2026-07-12
 
 ### Added
 
