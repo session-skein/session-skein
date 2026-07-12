@@ -134,6 +134,10 @@ impl Registry {
         if let Some((stored, title, source_paths, indexed_bytes)) = existing
             && stored == fingerprint
         {
+            self.connection.execute(
+                "UPDATE project_documents SET refreshed_at = ?1 WHERE project_id = ?2",
+                params![unix_timestamp(), project.id],
+            )?;
             return Ok(ProjectDocumentRefreshReport {
                 project_id: project.id,
                 project_path: project.path,
@@ -726,9 +730,19 @@ mod tests {
         write(&project.join("README.md"), b"# First\nold-copper-token")?;
         registry.add_project(&project, None)?;
         let first = registry.refresh_project_documents(&project)?;
+        registry.connection.execute(
+            "UPDATE project_documents SET refreshed_at = 1 WHERE project_id = ?1",
+            [first.project_id],
+        )?;
         let unchanged = registry.refresh_project_documents(&project)?;
         assert_eq!(first.status, ProjectDocumentRefreshStatus::Updated);
         assert_eq!(unchanged.status, ProjectDocumentRefreshStatus::Unchanged);
+        let observed: i64 = registry.connection.query_row(
+            "SELECT refreshed_at FROM project_documents WHERE project_id = ?1",
+            [first.project_id],
+            |row| row.get(0),
+        )?;
+        assert!(observed > 1);
 
         write(
             &project.join("README.md"),

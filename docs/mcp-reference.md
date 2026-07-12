@@ -99,6 +99,11 @@ is deterministic metadata prose plus coverage.
 
 ### `get_activity_status`
 
+Returns catalog counts, latest durable activity timestamps, and structured
+`catalogFreshness` using the fixed 24-hour default boundary. Source staleness uses the
+oldest covered observation; newest timestamps remain available for diagnostics. MCP
+refreshes never emit CLI progress because protocol stdout remains JSON-RPC only.
+
 Takes `{}` and returns counts and latest redaction-safe activity timestamps.
 
 ## Context policy tools

@@ -43,6 +43,16 @@ roots are revalidated after the write lock is acquired. Disabling a source chang
 only its gate; the next `context refresh` or `index` atomically removes that source's
 previous documents.
 
+Interactive `context refresh` reports its scan and completion stages on stderr.
+Progress is suppressed for JSON and non-TTY use. `skein freshness` reads the latest
+durable context observation without opening source directories; an empty context
+source is expected while both privacy gates remain disabled.
+
+For an enabled source, `unchanged` means the complete bounded source was observed and
+its fingerprints matched; all retained rows receive the new observation timestamp
+without an FTS rebuild. Deferred unavailable or truncated sources retain both their
+content and prior timestamps. Freshness uses the oldest row in the source.
+
 A refresh that cannot authoritatively observe an enabled source—for example, because
 its directory or an approved network root is unavailable—retains that source's prior
 rows and reports `deferred_unavailable`. A source that exceeds its file cap likewise

@@ -1,6 +1,7 @@
 mod indexing;
 mod mcp;
 mod output;
+mod progress;
 mod tui;
 mod update;
 mod worker_runtime;
@@ -47,6 +48,15 @@ enum Command {
     Doctor(OutputArgs),
     /// Initialize the private local state database.
     Init(OutputArgs),
+    /// Show read-only freshness of durable Git, document, session, and context observations.
+    Freshness {
+        /// Label observations older than this many hours as stale.
+        #[arg(long, default_value_t = 24, value_parser = clap::value_parser!(u32).range(0..=87_600))]
+        stale_after_hours: u32,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Check for or install a verified release-owned update.
     Update {
         /// Exact target version; defaults to the approved preview channel.
@@ -647,6 +657,7 @@ struct CodexSyncReport {
     source_threads_selected: usize,
     page_count: u32,
     complete: bool,
+    observed_at: i64,
 }
 
 #[derive(Serialize)]
@@ -674,6 +685,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let registry = Registry::open(&paths)?;
             let report = report(&paths, Some(registry.schema_version()?));
             print_value(&report, output.json)?;
+        }
+        Command::Freshness {
+            stale_after_hours,
+            json,
+        } => {
+            let registry = Registry::open_read_only(&paths)?;
+            let stale_after = i64::from(stale_after_hours).saturating_mul(60 * 60);
+            print_value(
+                &registry.catalog_freshness(unix_timestamp(), stale_after)?,
+                json,
+            )?;
         }
         Command::Update {
             version,
@@ -758,7 +780,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 (None, None) => indexing::IndexScope::All,
                 (Some(_), Some(_)) => unreachable!("clap rejects mutually exclusive selectors"),
             };
-            let report = indexing::refresh_index(&paths, scope, args.working_tree, args.force)?;
+            let progress = progress::Progress::cli(args.json);
+            let report = indexing::refresh_index_with_progress(
+                &paths,
+                scope,
+                args.working_tree,
+                args.force,
+                |stage| progress.stage(stage),
+            )?;
             print_value(&report, args.json)?;
         }
         Command::Search {
@@ -809,6 +838,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 max_files,
                 json,
             } => {
+                let progress = progress::Progress::cli(json);
+                progress.stage("scanning enabled context sources");
                 let mut registry = Registry::open(&paths)?;
                 let report = registry.refresh_context_documents(
                     &codex_home(override_home)?,
@@ -816,6 +847,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         max_files: usize::try_from(max_files)?,
                     },
                 )?;
+                progress.stage("context refresh complete");
                 print_value(&report, json)?;
             }
             ContextCommand::Search { query, limit, json } => {
@@ -1732,7 +1764,10 @@ fn emit_control_event(
 fn sync_codex(paths: &SkeinPaths, args: CodexSyncArgs) -> Result<(), Box<dyn std::error::Error>> {
     let json = args.json;
     let include_text = args.include_text;
+    let progress = progress::Progress::cli(json);
+    progress.stage("requesting bounded Codex thread metadata");
     let report = sync_codex_catalog(paths, &args)?;
+    progress.stage("Codex session catalog committed");
     if include_text && !json && !output::is_json() {
         eprintln!(
             "warning: storing Codex thread names and first-message previews in private local state"
@@ -1815,6 +1850,7 @@ fn sync_codex_catalog(
         source_threads_selected,
         page_count,
         complete,
+        observed_at: unix_timestamp(),
     })
 }
 

@@ -3,6 +3,7 @@
 mod conductor;
 mod context;
 mod control;
+mod freshness;
 mod git;
 mod insight;
 mod paths;
@@ -37,6 +38,10 @@ pub use control::NewControlRun;
 pub use control::ReconciliationObservation;
 pub use control::ReconciliationPlan;
 pub use control::SteerPlan;
+pub use freshness::CatalogFreshness;
+pub use freshness::DEFAULT_STALE_AFTER_SECONDS;
+pub use freshness::FreshnessState;
+pub use freshness::SourceFreshness;
 pub use git::GitMetadata;
 pub use insight::DayProjectActivity;
 pub use insight::DaySummary;

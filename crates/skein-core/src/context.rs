@@ -511,6 +511,10 @@ fn replace_context_source(
         })
         .collect::<Vec<_>>();
     if existing == requested {
+        transaction.execute(
+            "UPDATE context_documents SET refreshed_at = ?1 WHERE source_kind = ?2",
+            params![unix_timestamp(), source_kind.as_str()],
+        )?;
         return Ok(ContextSourceRefreshStatus::Unchanged);
     }
 
@@ -1176,12 +1180,22 @@ mod tests {
         );
         assert!(hits[0].snippet.len() <= MAX_CONTEXT_SNIPPET_BYTES);
 
+        registry.connection.execute(
+            "UPDATE context_documents SET refreshed_at = 1 WHERE source_kind = 'codex_memory'",
+            [],
+        )?;
         let unchanged = registry
             .refresh_context_documents(&codex_home, ContextDocumentRefreshOptions::default())?;
         assert_eq!(
             unchanged.memories.status,
             ContextSourceRefreshStatus::Unchanged
         );
+        let observed: i64 = registry.connection.query_row(
+            "SELECT refreshed_at FROM context_documents WHERE source_kind = 'codex_memory'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert!(observed > 1);
         registry.set_recall_settings(RecallSettings::default())?;
         let removed = registry
             .refresh_context_documents(&codex_home, ContextDocumentRefreshOptions::default())?;
@@ -1373,6 +1387,10 @@ mod tests {
             &codex_home,
             ContextDocumentRefreshOptions { max_files: 1 },
         )?;
+        registry.connection.execute(
+            "UPDATE context_documents SET refreshed_at = 1 WHERE source_kind = 'codex_memory'",
+            [],
+        )?;
 
         std::thread::sleep(std::time::Duration::from_millis(10));
         write(&memories.join("new.md"), b"new-memory-marker")?;
@@ -1384,6 +1402,12 @@ mod tests {
             truncated.memories.status,
             ContextSourceRefreshStatus::DeferredTruncated
         );
+        let after_truncated: i64 = registry.connection.query_row(
+            "SELECT refreshed_at FROM context_documents WHERE source_kind = 'codex_memory'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(after_truncated, 1);
         assert_eq!(
             registry
                 .search_context_documents("retained-memory-marker", 10)?
@@ -1410,6 +1434,12 @@ mod tests {
             unavailable.memories.status,
             ContextSourceRefreshStatus::DeferredUnavailable
         );
+        let after_unavailable: i64 = registry.connection.query_row(
+            "SELECT refreshed_at FROM context_documents WHERE source_kind = 'codex_memory'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(after_unavailable, 1);
         assert_eq!(
             registry
                 .search_context_documents("retained-memory-marker", 10)?

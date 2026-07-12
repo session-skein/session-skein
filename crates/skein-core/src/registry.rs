@@ -467,9 +467,15 @@ impl Registry {
             && !force
             && self.metadata_fingerprint(project.id)?.as_deref() == Some(&new_fingerprint)
         {
+            self.connection.execute(
+                "UPDATE project_metadata SET refreshed_at = ?1 WHERE project_id = ?2",
+                params![unix_timestamp(), project.id],
+            )?;
             return Ok(RefreshReport {
                 status: RefreshStatus::Unchanged,
-                project,
+                project: self
+                    .project_by_path(&canonical_path)?
+                    .ok_or_else(|| Error::ProjectNotRegistered(canonical_path.clone()))?,
             });
         }
 
@@ -1375,8 +1381,18 @@ mod tests {
         assert!(first.project.git.is_none());
         assert!(first.project.metadata_refreshed_at.is_some());
 
+        registry.connection.execute(
+            "UPDATE project_metadata SET refreshed_at = 1 WHERE project_id = ?1",
+            [first.project.id],
+        )?;
         let second = registry.refresh_project(&project_dir, false, false)?;
         assert_eq!(second.status, RefreshStatus::Unchanged);
+        assert!(
+            second
+                .project
+                .metadata_refreshed_at
+                .is_some_and(|value| value > 1)
+        );
         Ok(())
     }
 

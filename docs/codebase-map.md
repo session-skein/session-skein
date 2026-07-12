@@ -60,6 +60,7 @@ domain model. The binary crate composes them.
 | [`registry.rs`](../crates/skein-core/src/registry.rs) | SQLite open modes, schema migrations, projects, Git snapshots | Every durable feature |
 | [`scan.rs`](../crates/skein-core/src/scan.rs) | Scan-root policy, recursive discovery, exclusions, provenance | Project registry and `index` |
 | [`git.rs`](../crates/skein-core/src/git.rs) | Bounded Git fingerprint and metadata observation | Project cards, activity, routing |
+| [`freshness.rs`](../crates/skein-core/src/freshness.rs) | Read-only age and coverage projection over existing observations | CLI freshness and MCP activity status |
 | [`recall.rs`](../crates/skein-core/src/recall.rs) | Bounded project identity documents and FTS | Search and project matching |
 | [`context.rs`](../crates/skein-core/src/context.rs) | Defaults-off memory/session snippets and FTS | Explicit deep-context search |
 | [`session.rs`](../crates/skein-core/src/session.rs) | Source-neutral thread metadata and project binding | Recovery, routing, summaries |

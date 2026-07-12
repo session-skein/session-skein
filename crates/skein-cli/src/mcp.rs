@@ -846,6 +846,9 @@ fn get_activity_status(paths: &SkeinPaths) -> Result<Value, String> {
     let projects = registry.list_projects().map_err(error_string)?;
     let sessions = registry.list_session_metadata().map_err(error_string)?;
     let runs = registry.list_control_runs().map_err(error_string)?;
+    let freshness = registry
+        .catalog_freshness(unix_timestamp(), skein_core::DEFAULT_STALE_AFTER_SECONDS)
+        .map_err(error_string)?;
     Ok(json!({
         "ok": true,
         "projects": projects.len(),
@@ -853,6 +856,7 @@ fn get_activity_status(paths: &SkeinPaths) -> Result<Value, String> {
         "runs": runs.len(),
         "latestSessionObservedAt": sessions.iter().map(|item| item.last_seen_at).max(),
         "latestRunUpdatedAt": runs.iter().map(|item| item.updated_at).max(),
+        "catalogFreshness": freshness,
         "rawTranscriptsRead": false
     }))
 }

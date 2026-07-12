@@ -37,6 +37,14 @@ missing or failed Codex process cannot partially update or migrate the database.
 An `unchanged` count means the source metadata was unchanged; Session Skein still
 refreshes the private `last_seen_at` observation timestamp. Older overlapping pages
 cannot replace metadata already observed with a newer Codex `updatedAt` value.
+The result includes `observedAt`, recorded after the atomic import commit. Interactive
+human CLI use shows request and committed stages on stderr; JSON and redirected or
+non-TTY use remain silent outside the result document.
+
+Freshness is conservative across durable session rows: it uses the oldest
+`lastSeenAt`, not the newest. A bounded partial page refreshes only rows it observes,
+so older unseen rows remain stale. A complete all-pages observation refreshes every
+returned durable thread while preserving the existing source-newness conflict rules.
 
 ## Stored metadata
 
