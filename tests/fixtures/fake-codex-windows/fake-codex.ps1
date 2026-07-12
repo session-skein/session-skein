@@ -1,9 +1,5 @@
-param(
-    [Parameter(ValueFromRemainingArguments = $true)]
-    [string[]]$CommandArgs
-)
-
 $ErrorActionPreference = 'Stop'
+$CommandArgs = @($args)
 $state = $env:FAKE_CODEX_STATE
 if (-not $state) { throw 'FAKE_CODEX_STATE is required' }
 if ($CommandArgs.Count -lt 2 -or $CommandArgs[0] -ne 'mcp') { exit 2 }
