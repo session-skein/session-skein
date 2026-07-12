@@ -227,7 +227,8 @@ try {
     if ((Get-FileHash $env:FAKE_CODEX_STATE -Algorithm SHA256).Hash -ne $originalMcpHash) {
         throw 'previous MCP config was not restored after add failure'
     }
-    Invoke-Installer @('-Uninstall') | Out-Null
+    if (Test-Path (Join-Path $mcpFailure 'bin\skein.exe')) { throw 'fresh binary survived MCP add rollback' }
+    if (Test-Path (Join-Path $mcpFailure 'SessionSkein\install\receipt.json')) { throw 'fresh receipt survived MCP add rollback' }
 
     $mcpVerifyFailure = Join-Path $Root 'mcp-verify-failure'
     Set-CaseEnvironment $mcpVerifyFailure
@@ -241,7 +242,8 @@ try {
         Remove-Item Env:FAKE_CODEX_FAIL_VERIFY -ErrorAction SilentlyContinue
     }
     if (Test-Path $env:FAKE_CODEX_STATE) { throw 'fresh MCP config was not rolled back after verification failure' }
-    Invoke-Installer @('-Uninstall') | Out-Null
+    if (Test-Path (Join-Path $mcpVerifyFailure 'bin\skein.exe')) { throw 'fresh binary survived MCP verification rollback' }
+    if (Test-Path (Join-Path $mcpVerifyFailure 'SessionSkein\install\receipt.json')) { throw 'fresh receipt survived MCP verification rollback' }
 
     # Uninstall keeps ownership when Codex cannot answer authoritatively.
     $unqueryable = Join-Path $Root 'unqueryable-mcp'
