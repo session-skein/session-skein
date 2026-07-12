@@ -15,6 +15,22 @@ Synchronize one bounded page only after inspecting that shape:
 skein session sync codex --limit 50 --json
 ```
 
+For the normal “import everything currently cataloged by Codex” workflow, follow
+opaque cursors automatically with explicit hard bounds:
+
+```console
+skein session sync codex --all-pages --limit 100 \
+  --max-pages 100 --max-threads 10000
+```
+
+All pages use one initialized app-server connection. Repeated cursors, a later-page
+protocol failure, or an invalid bound fails the operation before any partial public
+result is imported.
+
+Use `--since-days N` to import only threads whose source `updatedAt` falls inside a
+recent window. The app-server page remains bounded and newest-first; this is a real
+metadata filter, not a claim that raw transcript activity was inspected.
+
 The synchronization performs the same documented app-server handshake and newest-
 first `thread/list` request as preview, then commits the complete page atomically. A
 missing or failed Codex process cannot partially update or migrate the database.

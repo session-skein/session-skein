@@ -16,10 +16,19 @@ API key, or a second model subscription.
 - **Global conductor composer** sends one private prompt through the same fail-closed
   `conduct` command used by scripts.
 
-The catalog refreshes in a background thread using read-only SQLite access. Worker
+The interface uses Ratatui and Crossterm directly. Its visual roadmap follows the
+same ideas as Charm without requiring Go: component-local state, adaptive themes,
+Markdown-rich detail views, reusable inputs/lists/spinners, and restrained transitions.
+Candidate Rust-native additions include `tui-markdown` or `ratatui-markdown` for
+Glamour-like rendering and `tachyonfx` for effects; usability and low input latency
+take priority over animation.
+
+On startup, a separate background thread discovers configured roots and refreshes
+bounded Git/project-document sources; this may take time on a network disk but never
+blocks keyboard input or rendering. Its completion status appears in the footer.
+Ordinary two-second catalog refreshes remain read-only SQLite access. Worker
 snapshots, interrupts, and conductor children also run away from the rendering loop,
-so a slow project disk does not directly block keyboard input. The TUI never scans a
-project root during refresh.
+so a slow project disk does not directly block keyboard input.
 
 ## Keys
 

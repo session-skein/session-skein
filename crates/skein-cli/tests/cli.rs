@@ -1,4 +1,6 @@
 use std::error::Error;
+use std::io::BufRead;
+use std::io::BufReader;
 use std::io::Write;
 use std::path::Path;
 use std::process::Command;
@@ -31,6 +33,184 @@ fn doctor_does_not_create_state() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn commands_are_human_readable_by_default_and_support_global_json_format()
+-> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let data = temp.path().join("data");
+    let config = temp.path().join("config");
+
+    let human = skein(&data, &config).arg("doctor").output()?;
+    assert!(human.status.success());
+    let human = String::from_utf8(human.stdout)?;
+    assert!(human.contains("database exists: no"));
+    assert!(!human.trim_start().starts_with('{'));
+
+    let json_output = skein(&data, &config)
+        .args(["doctor", "--format", "json"])
+        .output()?;
+    assert!(json_output.status.success());
+    let value: Value = serde_json::from_slice(&json_output.stdout)?;
+    assert_eq!(value["database_exists"], false);
+    Ok(())
+}
+
+#[test]
+fn deep_recall_requires_explicit_cli_opt_in() -> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let data = temp.path().join("data");
+    let config = temp.path().join("config");
+    let codex_home = temp.path().join("codex-home");
+    std::fs::create_dir_all(codex_home.join("memories"))?;
+
+    assert!(skein(&data, &config).arg("init").output()?.status.success());
+    let initial = skein(&data, &config)
+        .args(["context", "status", "--format", "json"])
+        .output()?;
+    let initial: Value = serde_json::from_slice(&initial.stdout)?;
+    assert_eq!(initial["includeCodexMemories"], false);
+    assert_eq!(initial["includeCodexSessions"], false);
+
+    let enabled = skein(&data, &config)
+        .args(["context", "memories", "enable", "--format", "json"])
+        .output()?;
+    assert!(enabled.status.success());
+    let enabled: Value = serde_json::from_slice(&enabled.stdout)?;
+    assert_eq!(enabled["includeCodexMemories"], true);
+
+    std::fs::write(
+        codex_home.join("memories/summary.md"),
+        "# Synthetic memory\n\nDeep recall marker.\n",
+    )?;
+    let refreshed = skein(&data, &config)
+        .args(["context", "refresh", "--codex-home"])
+        .arg(&codex_home)
+        .args(["--format", "json"])
+        .output()?;
+    assert!(
+        refreshed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&refreshed.stderr)
+    );
+    let refreshed: Value = serde_json::from_slice(&refreshed.stdout)?;
+    assert_eq!(refreshed["memories"]["documents"], 1);
+
+    let searched = skein(&data, &config)
+        .args(["context", "search", "recall", "marker", "--format", "json"])
+        .output()?;
+    let searched: Value = serde_json::from_slice(&searched.stdout)?;
+    assert_eq!(searched[0]["sourceKind"], "codex_memory");
+    assert!(
+        searched[0]["snippet"]
+            .as_str()
+            .is_some_and(|snippet| snippet.contains("[recall]"))
+    );
+    Ok(())
+}
+
+#[test]
+fn recursively_indexes_an_approved_root_and_removes_it_after_disconnect()
+-> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let data = temp.path().join("data");
+    let config = temp.path().join("config");
+    let root = temp.path().join("slow-workspace");
+    let repository = root.join("group").join("nested-repository");
+    std::fs::create_dir_all(&repository)?;
+    assert!(
+        std::process::Command::new("git")
+            .arg("init")
+            .arg(&repository)
+            .output()?
+            .status
+            .success()
+    );
+    std::fs::write(
+        repository.join("README.md"),
+        "# Nested Aurora\n\nRecursive identity marker for recall.\n",
+    )?;
+    assert!(
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repository)
+            .args(["add", "README.md"])
+            .output()?
+            .status
+            .success()
+    );
+
+    let added = skein(&data, &config)
+        .args(["scan-root", "add"])
+        .arg(&root)
+        .args(["--recursive", "--max-depth", "4", "--format", "json"])
+        .output()?;
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    let added: Value = serde_json::from_slice(&added.stdout)?;
+    assert_eq!(added["root"]["recursive"], true);
+    assert_eq!(added["root"]["max_depth"], 4);
+    assert_eq!(added["discovery"]["newly_registered"], 1);
+    assert_eq!(
+        added["discovery"]["discovered"][0]["path"],
+        repository.to_string_lossy().as_ref()
+    );
+
+    let indexed = skein(&data, &config)
+        .args(["index", "--format", "json"])
+        .output()?;
+    assert!(indexed.status.success());
+    let indexed: Value = serde_json::from_slice(&indexed.stdout)?;
+    assert_eq!(indexed["discovery"][0]["already_registered"], 1);
+    assert!(
+        indexed["documents"][0]["indexedBytes"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0
+    );
+    assert!(indexed["sessions"]["ok"].is_boolean());
+
+    let searched = skein(&data, &config)
+        .args(["search", "aurora", "identity", "--format", "json"])
+        .output()?;
+    assert!(searched.status.success());
+    let searched: Value = serde_json::from_slice(&searched.stdout)?;
+    assert_eq!(searched["documents"][0]["title"], "Nested Aurora");
+    assert!(
+        searched["documents"][0]["snippet"]
+            .as_str()
+            .is_some_and(|snippet| snippet.contains("[identity]"))
+    );
+
+    std::fs::rename(&root, temp.path().join("disconnected-workspace"))?;
+    let offline_index = skein(&data, &config)
+        .args(["index", "--format", "json"])
+        .output()?;
+    assert!(
+        offline_index.status.success(),
+        "{}",
+        String::from_utf8_lossy(&offline_index.stderr)
+    );
+    let offline_index: Value = serde_json::from_slice(&offline_index.stdout)?;
+    assert_eq!(offline_index["refreshed"][0]["ok"], false);
+    assert_eq!(offline_index["documents"][0]["ok"], false);
+    let removed = skein(&data, &config)
+        .args(["scan-root", "remove"])
+        .arg(&root)
+        .args(["--format", "json"])
+        .output()?;
+    assert!(
+        removed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    let removed: Value = serde_json::from_slice(&removed.stdout)?;
+    assert_eq!(removed["path"], root.to_string_lossy().as_ref());
+    Ok(())
+}
+
+#[test]
 fn tui_rejects_non_interactive_stdio_without_creating_state() -> Result<(), Box<dyn Error>> {
     let temp = tempfile::tempdir()?;
     let data = temp.path().join("data");
@@ -42,6 +222,360 @@ fn tui_rejects_non_interactive_stdio_without_creating_state() -> Result<(), Box<
     assert!(!data.exists());
     assert!(!config.exists());
     Ok(())
+}
+
+#[test]
+fn mcp_stdio_lists_legacy_tools_and_calls_read_and_write_paths() -> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let data = temp.path().join("data");
+    let config = temp.path().join("config");
+    let first = temp.path().join("first-project");
+    let second = temp.path().join("second-project");
+    std::fs::create_dir(&first)?;
+    std::fs::create_dir(&second)?;
+    assert!(
+        std::process::Command::new("git")
+            .arg("init")
+            .arg(&second)
+            .output()?
+            .status
+            .success()
+    );
+    assert!(
+        skein(&data, &config)
+            .arg("project")
+            .arg("add")
+            .arg(&first)
+            .args(["--name", "Synthetic Recall", "--json"])
+            .output()?
+            .status
+            .success()
+    );
+
+    let mut child = skein(&data, &config)
+        .arg("mcp")
+        .arg("--allow-control")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdin = child.stdin.take().expect("MCP stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("MCP stdout"));
+
+    let initialized = mcp_request(
+        &mut stdin,
+        &mut stdout,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "synthetic-test", "version": "1.0"}
+            }
+        }),
+    )?;
+    assert_eq!(initialized["id"], 1);
+    assert!(
+        initialized["result"]["instructions"]
+            .as_str()
+            .is_some_and(|value| value.contains("search_projects"))
+    );
+    writeln!(
+        stdin,
+        "{}",
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"})
+    )?;
+    stdin.flush()?;
+
+    let listed = mcp_request(
+        &mut stdin,
+        &mut stdout,
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
+    )?;
+    let names = listed["result"]["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect::<Vec<_>>();
+    for name in [
+        "search_projects",
+        "get_project",
+        "suggest_codex_command",
+        "add_scan_root",
+        "conduct",
+        "steer_run",
+        "interrupt_run",
+        "reconcile_run",
+    ] {
+        assert!(names.contains(&name));
+    }
+
+    let searched = mcp_request(
+        &mut stdin,
+        &mut stdout,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "search_projects",
+                "arguments": {"query": "Synthetic Recall", "limit": 5}
+            }
+        }),
+    )?;
+    assert_eq!(searched["result"]["isError"], false);
+    assert_eq!(
+        searched["result"]["structuredContent"]["report"]["candidates"][0]["project"]["name"],
+        "Synthetic Recall"
+    );
+
+    let added = mcp_request(
+        &mut stdin,
+        &mut stdout,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "add_scan_root",
+                "arguments": {"path": second, "recursive": false}
+            }
+        }),
+    )?;
+    assert_eq!(added["result"]["isError"], false);
+    assert_eq!(
+        added["result"]["structuredContent"]["root"]["recursive"],
+        false
+    );
+
+    let enabled_private_index = mcp_request(
+        &mut stdin,
+        &mut stdout,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {
+                "name": "set_codex_session_indexing",
+                "arguments": {"enabled": true}
+            }
+        }),
+    )?;
+    assert_eq!(enabled_private_index["result"]["isError"], false);
+    assert_eq!(
+        enabled_private_index["result"]["structuredContent"]["settings"]["includeCodexSessions"],
+        true
+    );
+
+    let removed = mcp_request(
+        &mut stdin,
+        &mut stdout,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": {
+                "name": "remove_scan_root",
+                "arguments": {"path": second}
+            }
+        }),
+    )?;
+    assert_eq!(removed["result"]["isError"], false);
+    assert_eq!(removed["result"]["structuredContent"]["removed"], true);
+
+    drop(stdin);
+    drop(stdout);
+    assert!(child.wait()?.success());
+
+    let roots = skein(&data, &config)
+        .args(["scan-root", "list", "--json"])
+        .output()?;
+    let roots: Value = serde_json::from_slice(&roots.stdout)?;
+    assert_eq!(roots.as_array().map(Vec::len), Some(0));
+    let projects = skein(&data, &config)
+        .args(["project", "list", "--json"])
+        .output()?;
+    let projects: Value = serde_json::from_slice(&projects.stdout)?;
+    assert_eq!(projects.as_array().map(Vec::len), Some(2));
+    Ok(())
+}
+
+#[test]
+fn mcp_first_search_initializes_state_and_returns_complete_setup_guidance()
+-> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let data = temp.path().join("data");
+    let config = temp.path().join("config");
+    let mut child = skein(&data, &config)
+        .arg("mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdin = child.stdin.take().expect("MCP stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("MCP stdout"));
+    mcp_request(
+        &mut stdin,
+        &mut stdout,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "first-use-test", "version": "1.0"}
+            }
+        }),
+    )?;
+    writeln!(
+        stdin,
+        "{}",
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"})
+    )?;
+    stdin.flush()?;
+
+    let searched = mcp_request(
+        &mut stdin,
+        &mut stdout,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "search_projects",
+                "arguments": {"query": "anything"}
+            }
+        }),
+    )?;
+    let result = &searched["result"]["structuredContent"];
+    assert_eq!(result["setupRequired"], true);
+    assert_eq!(result["setup_required"], true);
+    assert!(
+        result["setupHint"]
+            .as_str()
+            .is_some_and(|hint| hint.contains("add_scan_root") && hint.contains("refresh_index"))
+    );
+    assert!(data.join("skein.sqlite3").is_file());
+    drop(stdin);
+    assert!(child.wait()?.success());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn mcp_stdio_runs_session_sync_through_a_fake_codex_child() -> Result<(), Box<dyn Error>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir()?;
+    let data = temp.path().join("data");
+    let config = temp.path().join("config");
+    let script = temp.path().join("fake-codex-mcp-sync");
+    std::fs::write(
+        &script,
+        r#"#!/bin/sh
+set -eu
+read -r _
+printf '%s\n' '{"id":1,"result":{"userAgent":"synthetic"}}'
+read -r _
+read -r _
+printf '%s\n' '{"id":2,"result":{"data":[],"nextCursor":null}}'
+"#,
+    )?;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))?;
+
+    let mut child = skein(&data, &config)
+        .env("SKEIN_CODEX_BIN", &script)
+        .arg("mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdin = child.stdin.take().expect("MCP stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("MCP stdout"));
+    let initialized = mcp_request(
+        &mut stdin,
+        &mut stdout,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "synthetic-test", "version": "1.0"}
+            }
+        }),
+    )?;
+    assert_eq!(initialized["id"], 1);
+    writeln!(
+        stdin,
+        "{}",
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"})
+    )?;
+    stdin.flush()?;
+
+    let synced = mcp_request(
+        &mut stdin,
+        &mut stdout,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "sync_codex_sessions",
+                "arguments": {"limit": 1}
+            }
+        }),
+    )?;
+    assert_eq!(synced["result"]["isError"], false);
+    assert_eq!(synced["result"]["structuredContent"]["observed"], 0);
+
+    let refreshed = mcp_request(
+        &mut stdin,
+        &mut stdout,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "refresh_activity",
+                "arguments": {"since_days": 7, "session_limit": 1}
+            }
+        }),
+    )?;
+    assert_eq!(refreshed["result"]["isError"], false);
+    assert_eq!(
+        refreshed["result"]["structuredContent"]["sessions"]["sinceDays"],
+        7
+    );
+    assert_eq!(
+        refreshed["result"]["structuredContent"]["coverage"],
+        "bounded_app_server_metadata_updated_within_requested_window"
+    );
+
+    drop(stdin);
+    drop(stdout);
+    assert!(child.wait()?.success());
+    Ok(())
+}
+
+fn mcp_request(
+    stdin: &mut impl Write,
+    stdout: &mut impl BufRead,
+    request: Value,
+) -> Result<Value, Box<dyn Error>> {
+    writeln!(stdin, "{request}")?;
+    stdin.flush()?;
+    let mut line = String::new();
+    stdout.read_line(&mut line)?;
+    if line.is_empty() {
+        return Err("MCP server closed stdout before responding".into());
+    }
+    Ok(serde_json::from_str(&line)?)
 }
 
 #[test]

@@ -1,3 +1,5 @@
+mod mcp;
+mod output;
 mod tui;
 mod worker_runtime;
 
@@ -14,9 +16,11 @@ use clap::Subcommand;
 use serde::Serialize;
 use skein_codex::ControlClient;
 use skein_codex::ControlEvent;
+use skein_codex::DiscoveryBounds;
 use skein_codex::DiscoveryOptions;
 use skein_core::NewControlRun;
 use skein_core::Registry;
+use skein_core::ScanRootOptions;
 use skein_core::SessionImportReport;
 use skein_core::SessionObservation;
 use skein_core::SkeinPaths;
@@ -28,6 +32,9 @@ const MAX_MATCH_QUERY_BYTES: usize = 64 * 1024;
 #[derive(Debug, Parser)]
 #[command(name = "skein", version, about)]
 struct Cli {
+    /// Select human-readable or machine-readable command output.
+    #[arg(long, global = true, value_enum, default_value_t = output::OutputFormat::Human)]
+    format: output::OutputFormat,
     #[command(subcommand)]
     command: Command,
 }
@@ -42,6 +49,33 @@ enum Command {
     Project {
         #[command(subcommand)]
         command: ProjectCommand,
+    },
+    /// Manage user-approved roots for optional repository discovery.
+    ScanRoot {
+        #[command(subcommand)]
+        command: ScanRootCommand,
+    },
+    /// Discover repositories and refresh Git, project-document, and enabled context indexes.
+    Index(IndexArgs),
+    /// Search project metadata, identity documents, and opted-in bounded context.
+    Search {
+        /// Search terms.
+        #[arg(required = true, num_args = 1..)]
+        query: Vec<String>,
+        /// Maximum projects and document hits.
+        #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u32).range(1..=50))]
+        limit: u32,
+        /// Permit explicitly imported session names/previews in metadata scoring.
+        #[arg(long)]
+        include_session_text: bool,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Configure and search optional local Codex memory/session recall.
+    Context {
+        #[command(subcommand)]
+        command: ContextCommand,
     },
     /// Preview data from external agent adapters without persisting it.
     Import {
@@ -67,6 +101,8 @@ enum Command {
     Conduct(ConductArgs),
     /// Open the standalone keyboard-first project/session conductor interface.
     Tui,
+    /// Serve Session Skein tools to Codex over MCP stdio.
+    Mcp(McpArgs),
     /// Rank registered projects and linked sessions without dispatching work.
     Match {
         /// Allow explicitly imported session names/previews to influence local scoring.
@@ -106,6 +142,13 @@ struct ConductArgs {
     /// Emit route, worker, redacted events, and terminal state as JSONL; implies follow.
     #[arg(long, conflicts_with = "json")]
     jsonl: bool,
+}
+
+#[derive(Debug, Args)]
+struct McpArgs {
+    /// Expose tools that can start, steer, interrupt, or reconcile Codex workers.
+    #[arg(long)]
+    allow_control: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -297,7 +340,7 @@ enum SessionCommand {
 
 #[derive(Debug, Subcommand)]
 enum SessionSyncCommand {
-    /// Synchronize one bounded Codex thread-list page.
+    /// Synchronize a bounded Codex thread catalog, optionally following all pages.
     Codex(CodexSyncArgs),
 }
 
@@ -309,12 +352,24 @@ struct CodexSyncArgs {
     /// Opaque next-page cursor returned during the current scan.
     #[arg(long)]
     cursor: Option<String>,
+    /// Follow Codex cursors until complete or the configured bounds are reached.
+    #[arg(long)]
+    all_pages: bool,
+    /// Maximum pages when --all-pages is enabled.
+    #[arg(long, default_value_t = 100, requires = "all_pages", value_parser = clap::value_parser!(u32).range(1..=100))]
+    max_pages: u32,
+    /// Maximum total threads when --all-pages is enabled.
+    #[arg(long, default_value_t = 10_000, requires = "all_pages", value_parser = clap::value_parser!(u32).range(1..=10_000))]
+    max_threads: u32,
     /// Store thread titles and first-message previews in private local state.
     #[arg(long)]
     include_text: bool,
     /// Allow Codex to scan JSONL rollouts to repair its state index.
     #[arg(long)]
     repair_source_index: bool,
+    /// Import only source threads updated within this many days.
+    #[arg(long, value_parser = clap::value_parser!(u16).range(0..=3650))]
+    since_days: Option<u16>,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -440,6 +495,91 @@ enum ProjectCommand {
     List(OutputArgs),
 }
 
+#[derive(Debug, Subcommand)]
+enum ScanRootCommand {
+    /// Add a root and immediately discover repositories beneath it.
+    Add {
+        /// Existing directory approved for discovery.
+        path: PathBuf,
+        /// Recursively discover nested Git repositories.
+        #[arg(long)]
+        recursive: bool,
+        /// Maximum recursive directory depth (0 through 64; default 16).
+        #[arg(long, requires = "recursive")]
+        max_depth: Option<u16>,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List configured discovery roots and their policies.
+    List(OutputArgs),
+    /// Remove a discovery root without deleting its discovered projects.
+    Remove {
+        /// Stored root path; the directory need not still be mounted.
+        path: PathBuf,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Args)]
+struct IndexArgs {
+    /// Check tracked working-tree changes after discovery.
+    #[arg(long)]
+    working_tree: bool,
+    /// Ignore stored Git fingerprints after discovery.
+    #[arg(long)]
+    force: bool,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum ContextToggle {
+    Enable,
+    Disable,
+}
+
+#[derive(Debug, Subcommand)]
+enum ContextCommand {
+    /// Show explicit memory/session recall settings.
+    Status(OutputArgs),
+    /// Enable or disable generated Codex memory-summary recall.
+    Memories {
+        state: ContextToggle,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Enable or disable raw Codex session-message recall beneath approved roots.
+    Sessions {
+        state: ContextToggle,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Atomically rebuild enabled context sources.
+    Refresh {
+        /// Override CODEX_HOME for this refresh.
+        #[arg(long)]
+        codex_home: Option<PathBuf>,
+        /// Maximum source files considered across enabled sources.
+        #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(u32).range(1..=10_000))]
+        max_files: u32,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Search opted-in private context documents with bounded snippets.
+    Search {
+        #[arg(required = true, num_args = 1..)]
+        query: Vec<String>,
+        #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u32).range(1..=100))]
+        limit: u32,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 #[derive(Debug, Args)]
 #[command(group(ArgGroup::new("scope").required(true).args(["path", "all"])))]
 struct RefreshArgs {
@@ -477,6 +617,11 @@ struct CodexSyncReport {
     next_cursor: Option<String>,
     repaired_source_index: bool,
     text_imported: bool,
+    since_days: Option<u16>,
+    window_start_at: Option<i64>,
+    source_threads_selected: usize,
+    page_count: u32,
+    complete: bool,
 }
 
 #[derive(Serialize)]
@@ -495,6 +640,7 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    output::set_format(cli.format);
     let paths = SkeinPaths::discover()?;
 
     match cli.command {
@@ -517,7 +663,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 ProjectCommand::Refresh(args) => {
                     if args.all {
-                        let reports = registry.refresh_all(args.working_tree, args.force)?;
+                        let reports =
+                            refresh_git_resilient(&registry, args.working_tree, args.force)?;
                         print_value(&reports, args.json)?;
                     } else if let Some(path) = args.path {
                         let report =
@@ -531,6 +678,129 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        Command::ScanRoot { command } => {
+            let mut registry = Registry::open(&paths)?;
+            match command {
+                ScanRootCommand::Add {
+                    path,
+                    recursive,
+                    max_depth,
+                    json,
+                } => {
+                    let root = registry.add_scan_root(
+                        &path,
+                        ScanRootOptions {
+                            recursive,
+                            max_depth,
+                        },
+                    )?;
+                    let discovery = registry.discover_scan_root(&root.path)?;
+                    print_value(
+                        &serde_json::json!({
+                            "root": root,
+                            "discovery": discovery
+                        }),
+                        json,
+                    )?;
+                }
+                ScanRootCommand::List(output) => {
+                    print_value(&registry.list_scan_roots()?, output.json)?;
+                }
+                ScanRootCommand::Remove { path, json } => {
+                    print_value(&registry.remove_scan_root(&path)?, json)?;
+                }
+            }
+        }
+        Command::Index(args) => {
+            let mut registry = Registry::open(&paths)?;
+            let discovery = registry.discover_all_scan_roots()?;
+            let refreshed = refresh_git_resilient(&registry, args.working_tree, args.force)?;
+            let documents = refresh_documents_resilient(&mut registry)?;
+            let context = registry.refresh_context_documents(
+                &codex_home(None)?,
+                skein_core::ContextDocumentRefreshOptions::default(),
+            )?;
+            let sessions = match sync_codex_catalog_default(&paths) {
+                Ok(report) => serde_json::json!({"ok": true, "report": report}),
+                Err(error) => serde_json::json!({"ok": false, "error": error.to_string()}),
+            };
+            print_value(
+                &serde_json::json!({
+                    "discovery": discovery,
+                    "refreshed": refreshed,
+                    "documents": documents,
+                    "context": context,
+                    "sessions": sessions
+                }),
+                args.json,
+            )?;
+        }
+        Command::Search {
+            query,
+            limit,
+            include_session_text,
+            json,
+        } => {
+            let query = query.join(" ");
+            let limit = usize::try_from(limit)?;
+            let registry = Registry::open_read_only(&paths)?;
+            let metadata = registry.match_metadata(&skein_core::MatchOptions {
+                query: &query,
+                include_text: include_session_text,
+                limit,
+                now: unix_timestamp(),
+            })?;
+            let documents = registry.search_project_documents(&query, limit)?;
+            let context = registry.search_context_documents(&query, limit)?;
+            print_value(
+                &serde_json::json!({
+                    "metadata": metadata,
+                    "documents": documents,
+                    "context": context
+                }),
+                json,
+            )?;
+        }
+        Command::Context { command } => match command {
+            ContextCommand::Status(output) => {
+                let registry = Registry::open(&paths)?;
+                print_value(&registry.get_recall_settings()?, output.json)?;
+            }
+            ContextCommand::Memories { state, json } => {
+                let registry = Registry::open(&paths)?;
+                let mut settings = registry.get_recall_settings()?;
+                settings.include_codex_memories = matches!(state, ContextToggle::Enable);
+                print_value(&registry.set_recall_settings(settings)?, json)?;
+            }
+            ContextCommand::Sessions { state, json } => {
+                let registry = Registry::open(&paths)?;
+                let mut settings = registry.get_recall_settings()?;
+                settings.include_codex_sessions = matches!(state, ContextToggle::Enable);
+                print_value(&registry.set_recall_settings(settings)?, json)?;
+            }
+            ContextCommand::Refresh {
+                codex_home: override_home,
+                max_files,
+                json,
+            } => {
+                let mut registry = Registry::open(&paths)?;
+                let report = registry.refresh_context_documents(
+                    &codex_home(override_home)?,
+                    skein_core::ContextDocumentRefreshOptions {
+                        max_files: usize::try_from(max_files)?,
+                    },
+                )?;
+                print_value(&report, json)?;
+            }
+            ContextCommand::Search { query, limit, json } => {
+                let registry = Registry::open_read_only(&paths)?;
+                print_value(
+                    &registry
+                        .search_context_documents(&query.join(" "), usize::try_from(limit)?)?,
+                    json,
+                )?;
+            }
+        },
         Command::Import { command } => match command {
             ImportCommand::Codex { command } => match command {
                 CodexImportCommand::Preview(args) => {
@@ -672,6 +942,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         },
         Command::Conduct(args) => conduct(&paths, args)?,
         Command::Tui => tui::run(paths)?,
+        Command::Mcp(args) => mcp::run(paths, args.allow_control)?,
         Command::Match {
             include_text,
             limit,
@@ -698,7 +969,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             match command {
                 SummaryCommand::Projects { json } => {
                     let cards = registry.project_cards()?;
-                    if json {
+                    if json || output::is_json() {
                         print_value(&cards, true)?;
                     } else {
                         for card in cards {
@@ -708,7 +979,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 SummaryCommand::Project { path, json } => {
                     let card = registry.project_card(&path)?;
-                    if json {
+                    if json || output::is_json() {
                         print_value(&card, true)?;
                     } else {
                         println!("{}", card.narrative);
@@ -717,7 +988,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 SummaryCommand::Day { date, json } => {
                     let (date, timezone, start_at, end_at) = local_day_bounds(date.as_deref())?;
                     let summary = registry.day_summary(&date, &timezone, start_at, end_at)?;
-                    if json {
+                    if json || output::is_json() {
                         print_value(&summary, true)?;
                     } else {
                         println!("{}", summary.narrative);
@@ -910,7 +1181,7 @@ fn conduct(paths: &SkeinPaths, args: ConductArgs) -> Result<(), Box<dyn std::err
                         "snapshot": snapshot
                     }))?
                 );
-            } else if args.json {
+            } else if args.json || output::is_json() {
                 print_value(
                     &serde_json::json!({
                         "requestId": request_id,
@@ -997,7 +1268,7 @@ fn print_conductor_status(
                 "dispatched": false
             }))?
         );
-    } else if json {
+    } else if json || output::is_json() {
         print_value(
             &serde_json::json!({
                 "requestId": decision.request_id,
@@ -1037,7 +1308,7 @@ fn print_conductor_launch_failure(
     });
     if jsonl {
         println!("{}", serde_json::to_string(&value)?);
-    } else if json {
+    } else if json || output::is_json() {
         print_value(&value, true)?;
     } else {
         println!(
@@ -1093,9 +1364,9 @@ fn worker_launch(
         )
         .into());
     }
-    if json && follow {
+    if (json || output::is_json()) && follow {
         return Err(skein_core::Error::InvalidControlRequest(
-            "use --jsonl, not --json, when --follow is enabled".to_owned(),
+            "use --jsonl, not JSON output, when --follow is enabled".to_owned(),
         )
         .into());
     }
@@ -1118,7 +1389,7 @@ fn worker_launch(
                 "snapshot": snapshot
             }))?
         );
-    } else if json {
+    } else if json || output::is_json() {
         print_value(&snapshot, true)?;
     } else {
         println!("started reconnectable run {}", plan.run_id);
@@ -1181,7 +1452,7 @@ fn print_match_report(
     report: &skein_core::MatchReport,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if json {
+    if json || output::is_json() {
         return print_value(report, true);
     }
     let Some(recommendation) = &report.recommendation else {
@@ -1433,20 +1704,59 @@ fn emit_control_event(
 }
 
 fn sync_codex(paths: &SkeinPaths, args: CodexSyncArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let page = skein_codex::discover(&DiscoveryOptions {
-        limit: args.limit,
-        cursor: args.cursor,
-        use_state_db_only: !args.repair_source_index,
-        include_text: args.include_text,
-    })?;
-    if args.include_text && !args.json {
+    let json = args.json;
+    let include_text = args.include_text;
+    let report = sync_codex_catalog(paths, &args)?;
+    if include_text && !json && !output::is_json() {
         eprintln!(
             "warning: storing Codex thread names and first-message previews in private local state"
         );
     }
-    let observations = page
-        .threads
+    print_value(&report, json)
+}
+
+fn sync_codex_catalog(
+    paths: &SkeinPaths,
+    args: &CodexSyncArgs,
+) -> Result<CodexSyncReport, Box<dyn std::error::Error>> {
+    let options = DiscoveryOptions {
+        limit: args.limit,
+        cursor: args.cursor.clone(),
+        use_state_db_only: !args.repair_source_index,
+        include_text: args.include_text,
+    };
+    let (threads, next_cursor, repaired_source_index, page_count, complete) = if args.all_pages {
+        let result = skein_codex::discover_all(
+            &options,
+            &DiscoveryBounds {
+                max_pages: args.max_pages,
+                max_threads: usize::try_from(args.max_threads)?,
+            },
+        )?;
+        (
+            result.threads,
+            result.next_cursor,
+            result.repaired_source_index,
+            result.page_count,
+            result.complete,
+        )
+    } else {
+        let page = skein_codex::discover(&options)?;
+        let complete = page.next_cursor.is_none();
+        (
+            page.threads,
+            page.next_cursor,
+            page.repaired_source_index,
+            1,
+            complete,
+        )
+    };
+    let window_start_at = args
+        .since_days
+        .map(|days| unix_timestamp().saturating_sub(i64::from(days).saturating_mul(24 * 60 * 60)));
+    let observations = threads
         .into_iter()
+        .filter(|thread| window_start_at.is_none_or(|start| thread.updated_at >= start))
         .map(|thread| SessionObservation {
             source_kind: "codex".to_owned(),
             source_thread_id: thread.id,
@@ -1466,17 +1776,89 @@ fn sync_codex(paths: &SkeinPaths, args: CodexSyncArgs) -> Result<(), Box<dyn std
             text_imported: !thread.text_redacted,
         })
         .collect::<Vec<_>>();
+    let source_threads_selected = observations.len();
     let mut registry = Registry::open(paths)?;
     let import = registry.import_sessions(&observations)?;
-    print_value(
-        &CodexSyncReport {
-            import,
-            next_cursor: page.next_cursor,
-            repaired_source_index: page.repaired_source_index,
-            text_imported: args.include_text,
+    Ok(CodexSyncReport {
+        import,
+        next_cursor,
+        repaired_source_index,
+        text_imported: args.include_text,
+        since_days: args.since_days,
+        window_start_at,
+        source_threads_selected,
+        page_count,
+        complete,
+    })
+}
+
+pub(crate) fn sync_codex_catalog_default(
+    paths: &SkeinPaths,
+) -> Result<CodexSyncReport, Box<dyn std::error::Error>> {
+    sync_codex_catalog(
+        paths,
+        &CodexSyncArgs {
+            limit: 100,
+            cursor: None,
+            all_pages: true,
+            max_pages: 100,
+            max_threads: 10_000,
+            include_text: false,
+            repair_source_index: false,
+            since_days: None,
+            json: false,
         },
-        args.json,
     )
+}
+
+pub(crate) fn refresh_git_resilient(
+    registry: &Registry,
+    working_tree: bool,
+    force: bool,
+) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+    let projects = registry.list_projects()?;
+    Ok(projects
+        .into_iter()
+        .map(
+            |project| match registry.refresh_project(&project.path, working_tree, force) {
+                Ok(report) => value_with_ok(report),
+                Err(error) => serde_json::json!({
+                    "ok": false,
+                    "projectPath": project.path,
+                    "error": error.to_string()
+                }),
+            },
+        )
+        .collect())
+}
+
+pub(crate) fn refresh_documents_resilient(
+    registry: &mut Registry,
+) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+    let projects = registry.list_projects()?;
+    Ok(projects
+        .into_iter()
+        .map(
+            |project| match registry.refresh_project_documents(&project.path) {
+                Ok(report) => value_with_ok(report),
+                Err(error) => serde_json::json!({
+                    "ok": false,
+                    "projectPath": project.path,
+                    "error": error.to_string()
+                }),
+            },
+        )
+        .collect())
+}
+
+fn value_with_ok(value: impl Serialize) -> serde_json::Value {
+    let mut value = serde_json::to_value(value).unwrap_or_else(|error| {
+        serde_json::json!({"error": format!("could not serialize refresh report: {error}")})
+    });
+    if let Some(object) = value.as_object_mut() {
+        object.insert("ok".to_owned(), serde_json::Value::Bool(true));
+    }
+    value
 }
 
 fn session_view(mut session: skein_core::Session, include_text: bool) -> SessionView {
@@ -1501,6 +1883,20 @@ fn doctor(paths: &SkeinPaths, json: bool) -> Result<(), Box<dyn std::error::Erro
     print_value(&report(paths, schema_version), json)
 }
 
+pub(crate) fn codex_home(
+    override_home: Option<PathBuf>,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    if let Some(path) = override_home {
+        return Ok(path);
+    }
+    if let Some(path) = std::env::var_os("CODEX_HOME") {
+        return Ok(PathBuf::from(path));
+    }
+    directories::BaseDirs::new()
+        .map(|base| base.home_dir().join(".codex"))
+        .ok_or_else(|| "could not determine CODEX_HOME".into())
+}
+
 fn report(paths: &SkeinPaths, schema_version: Option<i64>) -> DoctorReport {
     DoctorReport {
         version: env!("CARGO_PKG_VERSION"),
@@ -1513,12 +1909,7 @@ fn report(paths: &SkeinPaths, schema_version: Option<i64>) -> DoctorReport {
 }
 
 fn print_value<T: Serialize>(value: &T, json: bool) -> Result<(), Box<dyn std::error::Error>> {
-    if json {
-        println!("{}", serde_json::to_string_pretty(value)?);
-    } else {
-        println!("{}", serde_json::to_string(value)?);
-    }
-    Ok(())
+    output::print(value, json)
 }
 
 #[cfg(test)]

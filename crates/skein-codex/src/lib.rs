@@ -1,5 +1,6 @@
 //! Codex app-server discovery and explicit control for Session Skein.
 
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::io::BufRead;
 use std::io::BufReader;
@@ -28,6 +29,10 @@ const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTROL_RESUME_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const MAX_DEFERRED_MESSAGES: usize = 1_024;
+/// Maximum pages accepted by one complete discovery operation.
+pub const MAX_DISCOVERY_PAGES: u32 = 100;
+/// Maximum threads accepted by one complete discovery operation.
+pub const MAX_DISCOVERY_THREADS: usize = 10_000;
 
 /// Errors produced by the Codex discovery adapter.
 #[derive(Debug, thiserror::Error)]
@@ -663,8 +668,66 @@ pub struct DiscoveryPage {
     pub repaired_source_index: bool,
 }
 
+/// Bounds for a multi-page Codex discovery operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiscoveryBounds {
+    /// Maximum `thread/list` pages requested on one app-server connection.
+    pub max_pages: u32,
+    /// Maximum total threads returned by the operation.
+    pub max_threads: usize,
+}
+
+impl Default for DiscoveryBounds {
+    fn default() -> Self {
+        Self {
+            max_pages: 100,
+            max_threads: MAX_DISCOVERY_THREADS,
+        }
+    }
+}
+
+/// All successfully collected pages from one bounded Codex discovery operation.
+///
+/// This value is returned only after every requested page has decoded successfully;
+/// protocol failures never expose a partial result.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoveryResult {
+    /// Candidate threads in Codex's page and sort order.
+    pub threads: Vec<ThreadPreview>,
+    /// Number of successfully decoded pages.
+    pub page_count: u32,
+    /// Number of threads in `threads`.
+    pub thread_count: usize,
+    /// True when Codex reported no subsequent cursor.
+    pub complete: bool,
+    /// Cursor at which bounded discovery stopped, when incomplete.
+    pub next_cursor: Option<String>,
+    /// Whether Codex was allowed to scan JSONL rollouts to repair its state index.
+    pub repaired_source_index: bool,
+}
+
 /// Spawn the installed Codex app-server and make one read-only discovery request.
 pub fn discover(options: &DiscoveryOptions) -> Result<DiscoveryPage> {
+    discover_with(|reader, writer| exchange(reader, writer, options))
+}
+
+/// Spawn one Codex app-server and follow opaque `thread/list` cursors within bounds.
+///
+/// Names and previews retain the same explicit `include_text` privacy behavior as
+/// [`discover`]. The operation never parses rollout files and returns no partial
+/// public value if a later page fails or Codex repeats a cursor.
+pub fn discover_all(
+    options: &DiscoveryOptions,
+    bounds: &DiscoveryBounds,
+) -> Result<DiscoveryResult> {
+    validate_discovery_bounds(options, bounds)?;
+    discover_with(|reader, writer| exchange_all(reader, writer, options, bounds))
+}
+
+fn discover_with<T>(
+    operation: impl FnOnce(BufReader<std::process::ChildStdout>, &mut ChildStdin) -> Result<T>,
+) -> Result<T> {
     let command = std::env::var_os("SKEIN_CODEX_BIN").unwrap_or_else(|| "codex".into());
     let mut child = Command::new(command)
         .args(["app-server", "--listen", "stdio://"])
@@ -698,7 +761,7 @@ pub fn discover(options: &DiscoveryOptions) -> Result<DiscoveryPage> {
         });
     }
 
-    let result = exchange(BufReader::new(stdout), &mut stdin, options);
+    let result = operation(BufReader::new(stdout), &mut stdin);
     cancelled.store(true, Ordering::Release);
     if let Ok(mut child) = child.lock() {
         let _ = child.kill();
@@ -712,13 +775,107 @@ pub fn discover(options: &DiscoveryOptions) -> Result<DiscoveryPage> {
     result
 }
 
+fn validate_discovery_bounds(options: &DiscoveryOptions, bounds: &DiscoveryBounds) -> Result<()> {
+    if options.limit == 0 {
+        return Err(Error::Protocol(
+            "Codex discovery page limit must be greater than zero".to_owned(),
+        ));
+    }
+    if bounds.max_pages == 0 || bounds.max_pages > MAX_DISCOVERY_PAGES {
+        return Err(Error::Protocol(format!(
+            "Codex discovery max_pages must be between 1 and {MAX_DISCOVERY_PAGES}"
+        )));
+    }
+    if bounds.max_threads == 0 || bounds.max_threads > MAX_DISCOVERY_THREADS {
+        return Err(Error::Protocol(format!(
+            "Codex discovery max_threads must be between 1 and {MAX_DISCOVERY_THREADS}"
+        )));
+    }
+    Ok(())
+}
+
 fn exchange<R: BufRead, W: Write>(
     mut reader: R,
     mut writer: W,
     options: &DiscoveryOptions,
 ) -> Result<DiscoveryPage> {
+    initialize(&mut reader, &mut writer)?;
+    request_page(&mut reader, &mut writer, options, 2)
+}
+
+fn exchange_all<R: BufRead, W: Write>(
+    mut reader: R,
+    mut writer: W,
+    options: &DiscoveryOptions,
+    bounds: &DiscoveryBounds,
+) -> Result<DiscoveryResult> {
+    validate_discovery_bounds(options, bounds)?;
+    initialize(&mut reader, &mut writer)?;
+
+    let mut threads = Vec::new();
+    let mut cursor = options.cursor.clone();
+    let mut seen_cursors = HashSet::new();
+    if let Some(cursor) = &cursor {
+        seen_cursors.insert(cursor.clone());
+    }
+    let mut page_count = 0_u32;
+
+    while page_count < bounds.max_pages && threads.len() < bounds.max_threads {
+        let remaining = bounds.max_threads - threads.len();
+        let page_limit = u32::try_from(remaining)
+            .unwrap_or(u32::MAX)
+            .min(options.limit);
+        let page_options = DiscoveryOptions {
+            limit: page_limit,
+            cursor: cursor.clone(),
+            use_state_db_only: options.use_state_db_only,
+            include_text: options.include_text,
+        };
+        let page = request_page(
+            &mut reader,
+            &mut writer,
+            &page_options,
+            i64::from(page_count) + 2,
+        )?;
+        if page.threads.len() > page_limit as usize {
+            return Err(Error::Protocol(format!(
+                "Codex returned {} threads for a page limited to {page_limit}",
+                page.threads.len()
+            )));
+        }
+        threads.extend(page.threads);
+        page_count += 1;
+        cursor = page.next_cursor;
+        let Some(next_cursor) = &cursor else {
+            return Ok(DiscoveryResult {
+                thread_count: threads.len(),
+                threads,
+                page_count,
+                complete: true,
+                next_cursor: None,
+                repaired_source_index: !options.use_state_db_only,
+            });
+        };
+        if !seen_cursors.insert(next_cursor.clone()) {
+            return Err(Error::Protocol(
+                "Codex repeated a discovery cursor".to_owned(),
+            ));
+        }
+    }
+
+    Ok(DiscoveryResult {
+        thread_count: threads.len(),
+        threads,
+        page_count,
+        complete: false,
+        next_cursor: cursor,
+        repaired_source_index: !options.use_state_db_only,
+    })
+}
+
+fn initialize(reader: &mut impl BufRead, writer: &mut impl Write) -> Result<()> {
     write_message(
-        &mut writer,
+        writer,
         &json!({
             "method": "initialize",
             "id": 1,
@@ -731,15 +888,24 @@ fn exchange<R: BufRead, W: Write>(
             }
         }),
     )?;
-    let initialized = read_response(&mut reader, 1)?;
+    let initialized = read_response(reader, 1)?;
     response_result(initialized)?;
 
-    write_message(&mut writer, &json!({"method": "initialized", "params": {}}))?;
+    write_message(writer, &json!({"method": "initialized", "params": {}}))?;
+    Ok(())
+}
+
+fn request_page(
+    reader: &mut impl BufRead,
+    writer: &mut impl Write,
+    options: &DiscoveryOptions,
+    request_id: i64,
+) -> Result<DiscoveryPage> {
     write_message(
-        &mut writer,
+        writer,
         &json!({
             "method": "thread/list",
-            "id": 2,
+            "id": request_id,
             "params": {
                 "limit": options.limit,
                 "cursor": options.cursor,
@@ -749,7 +915,7 @@ fn exchange<R: BufRead, W: Write>(
             }
         }),
     )?;
-    let response = response_result(read_response(&mut reader, 2)?)?;
+    let response = response_result(read_response(reader, request_id)?)?;
     parse_page(response, options)
 }
 
@@ -1060,6 +1226,34 @@ mod tests {
     const INITIALIZED: &str = r#"{"id":1,"result":{"userAgent":"synthetic"}}"#;
     const THREADS: &str = r#"{"id":2,"result":{"data":[{"id":"01900000-0000-7000-8000-000000000001","sessionId":"01900000-0000-7000-8000-000000000000","cwd":"/synthetic/project","createdAt":10,"updatedAt":20,"source":"cli","status":{"type":"notLoaded"},"modelProvider":"openai","cliVersion":"1.2.3","parentThreadId":null,"forkedFromId":null,"ephemeral":false,"name":"Synthetic title","preview":"Synthetic prompt","turns":[]}],"nextCursor":"opaque"}}"#;
 
+    fn thread(thread_id: &str) -> Value {
+        json!({
+            "id": thread_id,
+            "sessionId": format!("session-{thread_id}"),
+            "cwd": "/synthetic/project",
+            "createdAt": 10,
+            "updatedAt": 20,
+            "source": "cli",
+            "status": {"type": "notLoaded"},
+            "modelProvider": "openai",
+            "cliVersion": "1.2.3",
+            "parentThreadId": null,
+            "forkedFromId": null,
+            "ephemeral": false,
+            "name": "Synthetic title",
+            "preview": "Synthetic prompt",
+            "turns": []
+        })
+    }
+
+    fn page(id: i64, threads: Vec<Value>, next_cursor: Option<&str>) -> String {
+        json!({
+            "id": id,
+            "result": {"data": threads, "nextCursor": next_cursor}
+        })
+        .to_string()
+    }
+
     #[test]
     fn exchanges_handshake_and_redacts_text_by_default() -> Result<()> {
         let input = format!("{INITIALIZED}\n{THREADS}\n");
@@ -1099,6 +1293,155 @@ mod tests {
         assert_eq!(page.threads[0].preview.as_deref(), Some("Synthetic prompt"));
         assert!(!page.threads[0].text_redacted);
         Ok(())
+    }
+
+    #[test]
+    fn follows_two_pages_on_one_initialized_connection() -> Result<()> {
+        let input = format!(
+            "{INITIALIZED}\n{}\n{}\n",
+            page(2, vec![thread("thread-1")], Some("cursor-2")),
+            page(3, vec![thread("thread-2")], None)
+        );
+        let mut output = Vec::new();
+        let result = exchange_all(
+            Cursor::new(input),
+            &mut output,
+            &DiscoveryOptions::default(),
+            &DiscoveryBounds::default(),
+        )?;
+
+        assert_eq!(result.page_count, 2);
+        assert_eq!(result.thread_count, 2);
+        assert!(result.complete);
+        assert_eq!(result.next_cursor, None);
+        assert!(result.threads.iter().all(|thread| thread.text_redacted));
+
+        let messages = String::from_utf8(output)
+            .map_err(|error| Error::Protocol(error.to_string()))?
+            .lines()
+            .map(serde_json::from_str::<Value>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message["method"] == "initialize")
+                .count(),
+            1
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message["method"] == "thread/list")
+                .count(),
+            2
+        );
+        assert_eq!(messages[3]["params"]["cursor"], "cursor-2");
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_repeated_cursors_without_returning_partial_results() {
+        let input = format!(
+            "{INITIALIZED}\n{}\n{}\n",
+            page(2, vec![thread("thread-1")], Some("repeated")),
+            page(3, vec![thread("thread-2")], Some("repeated"))
+        );
+        let result = exchange_all(
+            Cursor::new(input),
+            Vec::new(),
+            &DiscoveryOptions::default(),
+            &DiscoveryBounds::default(),
+        );
+        assert!(matches!(
+            result,
+            Err(Error::Protocol(message)) if message == "Codex repeated a discovery cursor"
+        ));
+    }
+
+    #[test]
+    fn page_and_thread_caps_return_an_explicit_continuation() -> Result<()> {
+        let page_limited_input = format!(
+            "{INITIALIZED}\n{}\n",
+            page(2, vec![thread("thread-1")], Some("cursor-2"))
+        );
+        let page_limited = exchange_all(
+            Cursor::new(page_limited_input),
+            Vec::new(),
+            &DiscoveryOptions::default(),
+            &DiscoveryBounds {
+                max_pages: 1,
+                max_threads: 10,
+            },
+        )?;
+        assert_eq!(page_limited.page_count, 1);
+        assert!(!page_limited.complete);
+        assert_eq!(page_limited.next_cursor.as_deref(), Some("cursor-2"));
+
+        let thread_limited_input = format!(
+            "{INITIALIZED}\n{}\n",
+            page(
+                2,
+                vec![thread("thread-1"), thread("thread-2")],
+                Some("cursor-3")
+            )
+        );
+        let thread_limited = exchange_all(
+            Cursor::new(thread_limited_input),
+            Vec::new(),
+            &DiscoveryOptions {
+                limit: 50,
+                ..DiscoveryOptions::default()
+            },
+            &DiscoveryBounds {
+                max_pages: 10,
+                max_threads: 2,
+            },
+        )?;
+        assert_eq!(thread_limited.thread_count, 2);
+        assert!(!thread_limited.complete);
+        assert_eq!(thread_limited.next_cursor.as_deref(), Some("cursor-3"));
+        Ok(())
+    }
+
+    #[test]
+    fn validates_absolute_pagination_caps() {
+        for bounds in [
+            DiscoveryBounds {
+                max_pages: MAX_DISCOVERY_PAGES + 1,
+                max_threads: 1,
+            },
+            DiscoveryBounds {
+                max_pages: 1,
+                max_threads: MAX_DISCOVERY_THREADS + 1,
+            },
+        ] {
+            assert!(matches!(
+                validate_discovery_bounds(&DiscoveryOptions::default(), &bounds),
+                Err(Error::Protocol(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn later_page_failure_has_no_partial_public_result() {
+        let input = format!(
+            "{INITIALIZED}\n{}\n{}\n",
+            page(2, vec![thread("thread-1")], Some("cursor-2")),
+            json!({
+                "id": 3,
+                "error": {"code": -32000, "message": "synthetic page failure"}
+            })
+        );
+        let result = exchange_all(
+            Cursor::new(input),
+            Vec::new(),
+            &DiscoveryOptions::default(),
+            &DiscoveryBounds::default(),
+        );
+        assert!(matches!(
+            result,
+            Err(Error::Server { code: -32000, message }) if message == "synthetic page failure"
+        ));
     }
 
     #[test]

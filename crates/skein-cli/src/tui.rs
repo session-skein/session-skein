@@ -33,6 +33,7 @@ use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::text::Span;
 use ratatui::widgets::Block;
+use ratatui::widgets::BorderType;
 use ratatui::widgets::Borders;
 use ratatui::widgets::List;
 use ratatui::widgets::ListItem;
@@ -58,6 +59,10 @@ const MAX_COMPOSER_BYTES: usize = 64 * 1024;
 const MAX_LIVE_EVENTS: usize = 80;
 const MAX_CHILD_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_CHILD_DIAGNOSTIC_BYTES: usize = 64 * 1024;
+const ACCENT: Color = Color::Rgb(92, 207, 230);
+const ACCENT_SOFT: Color = Color::Rgb(78, 154, 166);
+const PANEL_FOCUS: Color = Color::Rgb(36, 48, 61);
+const MUTED: Color = Color::Rgb(128, 138, 148);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Focus {
@@ -160,6 +165,7 @@ struct App {
     dispatching: bool,
     catalog_request: SyncSender<()>,
     catalog_rx: Receiver<Option<CatalogSnapshot>>,
+    source_refresh_rx: Receiver<String>,
     refresh_pending: bool,
     live_select: SyncSender<Option<i64>>,
     live_rx: Receiver<LiveUpdate>,
@@ -176,6 +182,7 @@ impl App {
     fn new(paths: SkeinPaths) -> Result<Self, Box<dyn std::error::Error>> {
         let initial = load_catalog(&paths)?;
         let (catalog_request, catalog_rx) = spawn_catalog_loader(paths.clone());
+        let source_refresh_rx = spawn_source_refresh(paths.clone(), catalog_request.clone());
         let (live_select, live_rx) = spawn_live_poller(paths.clone());
         let mut app = Self {
             paths,
@@ -190,13 +197,14 @@ impl App {
             focus: Focus::Projects,
             composer: String::new(),
             full_access_armed: false,
-            status: "Ready. Tab moves focus; F2 arms one full-access dispatch.".to_owned(),
+            status: "Ready. Refreshing configured sources in the background.".to_owned(),
             should_quit: false,
             quit_after_dispatch: false,
             dispatch_rx: None,
             dispatching: false,
             catalog_request,
             catalog_rx,
+            source_refresh_rx,
             refresh_pending: false,
             live_select,
             live_rx,
@@ -216,6 +224,7 @@ impl App {
         while !self.should_quit {
             self.request_periodic_refresh();
             self.poll_catalog();
+            self.poll_source_refresh();
             self.poll_dispatch();
             self.poll_interrupt();
             self.flush_live_selection();
@@ -230,6 +239,13 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    fn poll_source_refresh(&mut self) {
+        if let Ok(status) = self.source_refresh_rx.try_recv() {
+            self.status = status;
+            let _ = self.catalog_request.try_send(());
+        }
     }
 
     fn apply_catalog(&mut self, snapshot: CatalogSnapshot) {
@@ -833,17 +849,36 @@ impl App {
             .count();
         let line = Line::from(vec![
             Span::styled(
-                " SESSION SKEIN ",
+                " ≋ SESSION SKEIN ",
                 Style::default()
                     .fg(Color::Black)
-                    .bg(Color::Cyan)
+                    .bg(ACCENT)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(format!(
-                "  {} projects  •  {} sessions  •  {active} open/recovery runs",
-                self.projects.len(),
-                self.sessions.len()
-            )),
+            Span::styled(
+                format!("  {} projects", self.projects.len()),
+                Style::default().fg(Color::White),
+            ),
+            Span::styled(
+                format!("  •  {} sessions", self.sessions.len()),
+                Style::default().fg(MUTED),
+            ),
+            Span::styled(
+                format!("  •  {active} open/recovery"),
+                Style::default().fg(if active == 0 { MUTED } else { Color::Yellow }),
+            ),
+            Span::styled(
+                if self.dispatching {
+                    "  ◐ working"
+                } else {
+                    "  ● ready"
+                },
+                Style::default().fg(if self.dispatching {
+                    Color::Yellow
+                } else {
+                    Color::Green
+                }),
+            ),
         ]);
         frame.render_widget(
             Paragraph::new(line).block(Block::default().borders(Borders::BOTTOM)),
@@ -870,8 +905,8 @@ impl App {
             .collect::<Vec<_>>();
         let title = focus_title(" Projects ", self.focus == Focus::Projects);
         let list = List::new(items)
-            .block(Block::default().title(title).borders(Borders::ALL))
-            .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
+            .block(panel(title, self.focus == Focus::Projects))
+            .highlight_style(Style::default().bg(PANEL_FOCUS).fg(Color::White))
             .highlight_symbol("▸ ");
         let mut state = ListState::default()
             .with_selected((!self.projects.is_empty()).then_some(self.selected_project));
@@ -904,12 +939,11 @@ impl App {
             .get(self.selected_project)
             .map_or_else(|| " Work ".to_owned(), |card| format!(" {} ", card.title));
         let list = List::new(items)
-            .block(
-                Block::default()
-                    .title(focus_title(&title, self.focus == Focus::Work))
-                    .borders(Borders::ALL),
-            )
-            .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
+            .block(panel(
+                focus_title(&title, self.focus == Focus::Work),
+                self.focus == Focus::Work,
+            ))
+            .highlight_style(Style::default().bg(PANEL_FOCUS).fg(Color::White))
             .highlight_symbol("▸ ");
         let len = self.work_len();
         let mut state = ListState::default().with_selected((len > 0).then_some(self.selected_work));
@@ -979,7 +1013,7 @@ impl App {
         } else {
             " Activity / live redacted events "
         };
-        let block = Block::default().title(activity_title).borders(Borders::ALL);
+        let block = panel(Line::from(activity_title), false);
         let inner = block.inner(activity_area);
         let mut paragraph = Paragraph::new(lines).block(block);
         if !self.live_events.is_empty() && inner.height > 0 {
@@ -1004,8 +1038,9 @@ impl App {
         let block = Block::default()
             .title(title)
             .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
             .border_style(if self.focus == Focus::Composer {
-                Style::default().fg(Color::Cyan)
+                Style::default().fg(ACCENT)
             } else {
                 Style::default()
             });
@@ -1038,10 +1073,7 @@ impl App {
         } else {
             status
         };
-        frame.render_widget(
-            Paragraph::new(text).style(Style::default().fg(Color::Gray)),
-            area,
-        );
+        frame.render_widget(Paragraph::new(text).style(Style::default().fg(MUTED)), area);
     }
 }
 
@@ -1073,6 +1105,73 @@ fn spawn_catalog_loader(paths: SkeinPaths) -> (SyncSender<()>, Receiver<Option<C
         }
     });
     (request_tx, result_rx)
+}
+
+fn spawn_source_refresh(paths: SkeinPaths, catalog_request: SyncSender<()>) -> Receiver<String> {
+    let (status_tx, status_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let status = match Registry::open(&paths) {
+            Ok(mut registry) => {
+                let discovery = registry.discover_all_scan_roots();
+                let git = crate::refresh_git_resilient(&registry, false, false);
+                let documents = crate::refresh_documents_resilient(&mut registry);
+                let context = crate::codex_home(None)
+                    .map_err(|error| error.to_string())
+                    .and_then(|home| {
+                        registry
+                            .refresh_context_documents(
+                                &home,
+                                skein_core::ContextDocumentRefreshOptions::default(),
+                            )
+                            .map_err(|error| error.to_string())
+                    });
+                let sessions =
+                    crate::sync_codex_catalog_default(&paths).map_err(|error| error.to_string());
+                match (discovery, git, documents, context, sessions) {
+                    (Ok(discovery), Ok(git), Ok(documents), Ok(context), Ok(sessions)) => {
+                        let repositories = discovery
+                            .iter()
+                            .map(|report| report.discovered.len())
+                            .sum::<usize>();
+                        let errors = discovery
+                            .iter()
+                            .map(|report| report.errors.len())
+                            .sum::<usize>();
+                        let git_errors = git.iter().filter(|report| report["ok"] == false).count();
+                        let document_errors = documents
+                            .iter()
+                            .filter(|report| report["ok"] == false)
+                            .count();
+                        format!(
+                            "Sources refreshed: {repositories} discovered • {} Git ({} unavailable) • {} documents ({} unavailable) • {} context • {} sessions • {errors} scan errors",
+                            git.len().saturating_sub(git_errors),
+                            git_errors,
+                            documents.len().saturating_sub(document_errors),
+                            document_errors,
+                            context.memories.documents + context.sessions.documents,
+                            sessions.source_threads_selected
+                        )
+                    }
+                    (discovery, git, documents, context, sessions) => format!(
+                        "Source refresh incomplete: discovery={} Git={} documents={} context={} sessions={}",
+                        result_label(&discovery),
+                        result_label(&git),
+                        result_label(&documents),
+                        result_label(&context),
+                        result_label(&sessions)
+                    ),
+                }
+            }
+            Err(error) => format!("Source refresh unavailable: {error}"),
+        };
+        let _ = status_tx.send(status);
+        let _ = catalog_request.try_send(());
+    });
+    status_rx
+}
+
+fn result_label<T, E>(result: &Result<T, E>) -> &'static str {
+    if result.is_ok() { "ok" } else { "failed" }
 }
 
 fn spawn_live_poller(paths: SkeinPaths) -> (SyncSender<Option<i64>>, Receiver<LiveUpdate>) {
@@ -1259,13 +1358,19 @@ fn focus_title<'a>(title: &'a str, focused: bool) -> Line<'a> {
     if focused {
         Line::styled(
             title,
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         )
     } else {
         Line::from(title)
     }
+}
+
+fn panel<'a>(title: Line<'a>, focused: bool) -> Block<'a> {
+    Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(if focused { ACCENT } else { ACCENT_SOFT }))
 }
 
 fn short_id(value: &str) -> String {
@@ -1299,6 +1404,7 @@ mod tests {
     fn empty_app() -> App {
         let (catalog_request, _catalog_requests) = mpsc::sync_channel(1);
         let (_catalog_results, catalog_rx) = mpsc::sync_channel(1);
+        let (_source_status, source_refresh_rx) = mpsc::channel();
         let (live_select, _live_selections) = mpsc::sync_channel(1);
         let (_live_updates, live_rx) = mpsc::sync_channel(1);
         App {
@@ -1321,6 +1427,7 @@ mod tests {
             dispatching: false,
             catalog_request,
             catalog_rx,
+            source_refresh_rx,
             refresh_pending: false,
             live_select,
             live_rx,
