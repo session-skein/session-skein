@@ -62,12 +62,8 @@ try {
     $GoodReceipt = Get-Content $ReceiptPath -Raw
     $Receipt.version = '0.5.0-alpha.8'
     [System.IO.File]::WriteAllText($ReceiptPath, ($Receipt | ConvertTo-Json -Depth 4))
-    try {
-        & (Join-Path $BinDir 'skein.exe') update --check | Out-Null
-        throw 'modified receipt version unexpectedly passed'
-    } catch {
-        if ($_.Exception.Message -eq 'modified receipt version unexpectedly passed') { throw }
-    }
+    & (Join-Path $BinDir 'skein.exe') update --check 2>$null | Out-Null
+    if ($LASTEXITCODE -eq 0) { throw 'modified receipt version unexpectedly passed' }
     [System.IO.File]::WriteAllText($ReceiptPath, $GoodReceipt)
     $Check = & (Join-Path $BinDir 'skein.exe') update --check --json | ConvertFrom-Json
     if ($Check.status -ne 'current' -or $Check.currentVersion -ne $Version) { throw 'Windows same-version check was inaccurate' }
