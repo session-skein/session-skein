@@ -3,7 +3,36 @@
 All notable changes will be documented here. The project follows Semantic Versioning
 after its first published release.
 
-## [0.5.0-alpha.6] - Unreleased standalone conductor TUI
+## [0.5.0-alpha.7] - Unreleased Codex MCP server
+
+- Added an on-demand stdio MCP server with server instructions, JSON Schema tools,
+  structured results, and read/write/destructive/open-world annotations.
+- Preserved Codex Brain project-recall and activity tool names while mapping roots to
+  explicit projects and keeping sensitive memory/session ingestion opt-in.
+- Exposed content-free project/session/run views plus audited conductor, steer,
+  interrupt, and reconciliation operations to Codex CLI.
+- Added separately persisted exact or opt-in recursive scan roots, bounded discovery,
+  worktree recognition, provenance, unplugged-root diagnostics, and schema 8 migration.
+- Made command output human-readable by default with global `--format json` support;
+  retained legacy `--json` and streaming `--jsonl` compatibility.
+- Added complete bounded Codex session pagination on one app-server connection, with
+  repeated-cursor detection and no partial import after later-page failure.
+- Added schema-9 private FTS5 recall for bounded project identity files (Git-tracked
+  when available, fixed bounded fallback otherwise), fingerprinted refresh, bounded
+  snippets, CLI search, and MCP document matches.
+- Added schema-10 opt-in Codex memory and approved-root session-message recall with
+  atomic rebuilds, private FTS, strict source/text/file bounds, and safe defaults.
+- Unified repository discovery, resilient per-project refresh, context recall, and
+  complete content-free Codex session synchronization behind `skein index` and TUI
+  startup; unavailable network projects no longer abort the remaining refresh.
+- Added fresh-install MCP initialization and setup guidance, caller-owned control
+  request IDs, explicit per-query deep-context disclosure, and privacy documentation
+  for admitted text.
+- Made deep-recall source budgets independent and non-destructive: truncated sources,
+  missing Codex directories, and unavailable approved roots retain prior private rows
+  and memory-to-project routing until an authoritative refresh is possible.
+
+## [0.5.0-alpha.6] - 2026-07-11
 
 - Added a keyboard-first terminal interface with a project library, project-scoped
   session/run navigation, deterministic daily cards, and one global conductor input.

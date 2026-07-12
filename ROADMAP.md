@@ -11,15 +11,22 @@ and a polished TUI only after behavior is observable and safe.
 - [x] Clean Rust workspace and public repository hygiene.
 - [x] Private, versioned SQLite state.
 - [x] Explicit project registration and diagnostics.
+- [x] User-approved exact or optional recursive scan roots with bounded exclusions.
 - [x] Project metadata, Git state, and incremental refresh.
 - [x] Import adapters with dry-run previews.
 
-## Phase 2: session model
+## Phase 2: session model and local recall
 
 - [x] Read-only Codex session discovery.
 - [x] Durable Codex session catalog and project relationships.
 - [x] Search and ranking with explainable evidence.
 - [x] Cheap incremental activity summaries.
+- [x] Bounded README, AGENTS, manifest, and docs full-text index.
+- [ ] Optional Git-tracked, symbol-ranked structural map inspired by Aider repo maps.
+- [x] Setup-required MCP onboarding on a fresh local state database.
+- [ ] Lazy stale-index refresh.
+- [x] Configurable generated-memory and approved-root raw-session recall profiles.
+- [ ] Incremental session/activity cursors with real time-window semantics.
 
 ## Phase 3: Codex-native control
 
@@ -35,7 +42,8 @@ and a polished TUI only after behavior is observable and safe.
 
 - [x] One prompt entry point with explicit routing confidence.
 - [x] Policy boundary for full-access workers.
-- [ ] MCP server and stable machine-readable protocol.
+- [x] MCP stdio transport and stable conductor-control protocol for Codex CLI.
+- [ ] Complete Codex Brain recall workflow parity through MCP.
 - [x] Crash-fenced planning, no-replay audit, and deterministic pre-dispatch failure.
 - [ ] Crash-safe job continuation or takeover after worker loss.
 
@@ -49,6 +57,15 @@ and a polished TUI only after behavior is observable and safe.
 - [ ] Cost views when reliable source data is available.
 - [x] Daily narrative and project-card views.
 - [x] Keyboard-first recovery of previous work from durable state.
+- [ ] Charm-inspired Ratatui themes, Markdown views, components, and restrained effects.
+
+## Phase 6: narrative and freshness
+
+- [ ] Standalone low-priority source refresh scheduler.
+- [ ] Optional user systemd/autostart adapters; never a runtime requirement.
+- [ ] Cached project descriptions regenerated only after relevant source changes.
+- [ ] Daily work narratives with explicit coverage and provenance.
+- [ ] Optional Codex-generated descriptions through the existing ChatGPT login.
 
 ## Optional enrichment track
 
@@ -59,5 +76,6 @@ and a polished TUI only after behavior is observable and safe.
 Missing, outdated, or broken optional integrations must degrade to diagnostics and
 must not affect Codex discovery, control, routing, database startup, or the TUI.
 
-Non-goals for the first public releases include cloud synchronization, silent
-recursive filesystem crawling, and storing API credentials in the state database.
+Non-goals for the first public releases include cloud synchronization, scanning any
+unapproved root, and storing API credentials in the state database. Recursive
+discovery is supported only for roots the user explicitly marks recursive.

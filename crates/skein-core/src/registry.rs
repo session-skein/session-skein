@@ -8,6 +8,7 @@ use std::time::UNIX_EPOCH;
 use rusqlite::Connection;
 use rusqlite::OpenFlags;
 use rusqlite::OptionalExtension;
+use rusqlite::TransactionBehavior;
 use rusqlite::params;
 use serde::Serialize;
 
@@ -17,7 +18,7 @@ use crate::Result;
 use crate::SkeinPaths;
 use crate::git;
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 10;
 
 const CREATE_CONDUCTOR_SCHEMA: &str = "CREATE TABLE conductor_decisions (
     id INTEGER PRIMARY KEY,
@@ -373,6 +374,67 @@ impl Registry {
             .ok_or_else(|| Error::Sqlite(rusqlite::Error::QueryReturnedNoRows))
     }
 
+    pub(crate) fn add_discovered_project(&self, path: &Path) -> Result<(Project, bool)> {
+        let canonical_path = canonical_project_path(path)?;
+        if let Some(project) = self.project_by_path(&canonical_path)? {
+            return Ok((project, false));
+        }
+        let project_name = canonical_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| Error::MissingProjectName(canonical_path.clone()))?;
+        let timestamp = unix_timestamp();
+        let inserted = self.connection.execute(
+            "INSERT OR IGNORE INTO projects (name, path, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?3)",
+            params![project_name, canonical_path.to_string_lossy(), timestamp],
+        )?;
+        let project = self
+            .project_by_path(&canonical_path)?
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        Ok((project, inserted == 1))
+    }
+
+    /// Remove an explicitly registered project only when no durable session or run refers to it.
+    pub fn remove_project_if_unused(&mut self, path: &Path) -> Result<Project> {
+        let canonical_path = canonical_project_path(path)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let query = format!("{PROJECT_SELECT} WHERE p.path = ?1");
+        let project = transaction
+            .query_row(&query, [canonical_path.to_string_lossy()], project_from_row)
+            .optional()?
+            .ok_or_else(|| Error::ProjectNotRegistered(canonical_path.clone()))?;
+        let session_count: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM sessions WHERE project_id = ?1",
+            [project.id],
+            |row| row.get(0),
+        )?;
+        let run_count: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM control_runs WHERE project_id = ?1",
+            [project.id],
+            |row| row.get(0),
+        )?;
+        if session_count > 0 || run_count > 0 {
+            return Err(Error::InvalidControlRequest(
+                "project cannot be removed while durable sessions or control runs refer to it"
+                    .to_owned(),
+            ));
+        }
+        let removed = transaction.execute("DELETE FROM projects WHERE id = ?1", [project.id])?;
+        if removed != 1 {
+            return Err(Error::ControlStateConflict(format!(
+                "project {} disappeared before removal",
+                project.id
+            )));
+        }
+        transaction.commit()?;
+        Ok(project)
+    }
+
     /// List all registered projects in stable name/path order.
     pub fn list_projects(&self) -> Result<Vec<Project>> {
         list_projects_on(&self.connection)
@@ -571,6 +633,21 @@ impl Registry {
 
         if current <= 6 {
             transaction.execute_batch(CREATE_CONDUCTOR_SCHEMA)?;
+            transaction.pragma_update(None, "user_version", 7)?;
+        }
+
+        if current <= 7 {
+            transaction.execute_batch(crate::scan::CREATE_SCAN_ROOT_SCHEMA)?;
+            transaction.pragma_update(None, "user_version", 8)?;
+        }
+
+        if current <= 8 {
+            transaction.execute_batch(crate::recall::CREATE_PROJECT_DOCUMENT_SCHEMA)?;
+            transaction.pragma_update(None, "user_version", 9)?;
+        }
+
+        if current <= 9 {
+            transaction.execute_batch(crate::context::CREATE_CONTEXT_DOCUMENT_SCHEMA)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         } else if current != SCHEMA_VERSION {
             return Err(Error::UnsupportedSchema {
@@ -705,7 +782,7 @@ mod tests {
     #[test]
     fn initializes_current_schema() -> Result<()> {
         let (_temp, registry) = isolated_registry()?;
-        assert_eq!(registry.schema_version()?, 7);
+        assert_eq!(registry.schema_version()?, SCHEMA_VERSION);
         Ok(())
     }
 
@@ -738,7 +815,7 @@ mod tests {
         drop(read_only);
 
         let registry = Registry::open(&paths)?;
-        assert_eq!(registry.schema_version()?, 7);
+        assert_eq!(registry.schema_version()?, SCHEMA_VERSION);
         assert!(registry.list_projects()?.is_empty());
         Ok(())
     }
@@ -781,7 +858,7 @@ mod tests {
         drop(connection);
 
         let registry = Registry::open(&paths)?;
-        assert_eq!(registry.schema_version()?, 7);
+        assert_eq!(registry.schema_version()?, SCHEMA_VERSION);
         assert_eq!(registry.list_projects()?.len(), 1);
         assert!(registry.list_sessions()?.is_empty());
         Ok(())
@@ -834,7 +911,7 @@ mod tests {
         drop(registry);
 
         let registry = Registry::open(&paths)?;
-        assert_eq!(registry.schema_version()?, 7);
+        assert_eq!(registry.schema_version()?, SCHEMA_VERSION);
         assert_eq!(registry.list_projects()?.len(), 1);
         assert_eq!(registry.list_sessions()?.len(), 1);
         assert!(registry.list_control_runs()?.is_empty());
@@ -909,7 +986,7 @@ mod tests {
         drop(connection);
 
         let registry = Registry::open(&paths)?;
-        assert_eq!(registry.schema_version()?, 7);
+        assert_eq!(registry.schema_version()?, SCHEMA_VERSION);
         assert_eq!(
             registry.control_run(1)?.expect("historical run").run_key,
             "historical-run"
@@ -967,7 +1044,7 @@ mod tests {
         drop(registry);
 
         let registry = Registry::open(&paths)?;
-        assert_eq!(registry.schema_version()?, 7);
+        assert_eq!(registry.schema_version()?, SCHEMA_VERSION);
         assert_eq!(registry.list_projects()?.len(), 1);
         let columns: String = registry.connection.query_row(
             "SELECT group_concat(name, ',') FROM pragma_table_info('control_actions')",
@@ -1013,7 +1090,7 @@ mod tests {
         drop(registry);
 
         let registry = Registry::open(&paths)?;
-        assert_eq!(registry.schema_version()?, 7);
+        assert_eq!(registry.schema_version()?, SCHEMA_VERSION);
         assert_eq!(registry.list_projects()?.len(), 1);
         assert_eq!(registry.list_control_runs()?.len(), 1);
         assert_eq!(registry.list_control_runs()?[0].id, plan.run_id);
@@ -1033,6 +1110,96 @@ mod tests {
     }
 
     #[test]
+    fn migrates_schema_version_seven_by_adding_empty_scan_roots() -> Result<()> {
+        let temp = tempfile::tempdir().map_err(|source| Error::Io {
+            path: PathBuf::from("temporary schema-seven migration"),
+            source,
+        })?;
+        let paths = SkeinPaths::new(temp.path().join("config"), temp.path().join("data"));
+        let registry = Registry::open(&paths)?;
+        registry.connection.execute_batch(
+            "DROP TABLE scan_root_projects;
+             DROP TABLE scan_roots;
+             PRAGMA user_version = 7;",
+        )?;
+        drop(registry);
+
+        let registry = Registry::open(&paths)?;
+        assert_eq!(registry.schema_version()?, SCHEMA_VERSION);
+        assert!(registry.list_scan_roots()?.is_empty());
+        let tables: i64 = registry.connection.query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name IN ('scan_roots', 'scan_root_projects')",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(tables, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn migrates_schema_version_eight_by_adding_empty_project_documents() -> Result<()> {
+        let temp = tempfile::tempdir().map_err(|source| Error::Io {
+            path: PathBuf::from("temporary schema-eight migration"),
+            source,
+        })?;
+        let paths = SkeinPaths::new(temp.path().join("config"), temp.path().join("data"));
+        let registry = Registry::open(&paths)?;
+        registry.connection.execute_batch(
+            "DROP TABLE project_documents_fts;
+             DROP TABLE project_documents;
+             PRAGMA user_version = 8;",
+        )?;
+        drop(registry);
+
+        let registry = Registry::open(&paths)?;
+        assert_eq!(registry.schema_version()?, SCHEMA_VERSION);
+        let tables: i64 = registry.connection.query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE name IN ('project_documents', 'project_documents_fts')",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(tables, 2);
+        assert!(
+            registry
+                .search_project_documents("synthetic", 10)?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn migrates_schema_version_nine_with_private_recall_disabled() -> Result<()> {
+        let temp = tempfile::tempdir().map_err(|source| Error::Io {
+            path: PathBuf::from("temporary schema-nine migration"),
+            source,
+        })?;
+        let paths = SkeinPaths::new(temp.path().join("config"), temp.path().join("data"));
+        let registry = Registry::open(&paths)?;
+        registry.connection.execute_batch(
+            "DROP TABLE context_documents_fts;
+             DROP TABLE context_documents;
+             DROP TABLE recall_settings;
+             PRAGMA user_version = 9;",
+        )?;
+        drop(registry);
+
+        let registry = Registry::open(&paths)?;
+        assert_eq!(registry.schema_version()?, SCHEMA_VERSION);
+        assert_eq!(
+            registry.get_recall_settings()?,
+            crate::RecallSettings::default()
+        );
+        assert!(
+            registry
+                .search_context_documents("synthetic", 10)?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn adds_and_updates_a_canonical_project() -> Result<()> {
         let (temp, registry) = isolated_registry()?;
         let project_dir = temp.path().join("example");
@@ -1048,6 +1215,21 @@ mod tests {
         assert_eq!(updated.id, first.id);
         assert_eq!(updated.name, "Example Project");
         assert_eq!(registry.list_projects()?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn removes_only_an_unused_registered_project() -> Result<()> {
+        let (temp, mut registry) = isolated_registry()?;
+        let project_dir = temp.path().join("removable");
+        fs::create_dir(&project_dir).map_err(|source| Error::Io {
+            path: project_dir.clone(),
+            source,
+        })?;
+        let added = registry.add_project(&project_dir, None)?;
+        let removed = registry.remove_project_if_unused(&project_dir)?;
+        assert_eq!(removed.id, added.id);
+        assert!(registry.list_projects()?.is_empty());
         Ok(())
     }
 

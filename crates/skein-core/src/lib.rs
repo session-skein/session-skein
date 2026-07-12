@@ -1,11 +1,14 @@
 //! Fast, local-first state primitives for Session Skein.
 
 mod conductor;
+mod context;
 mod control;
 mod git;
 mod insight;
 mod paths;
+mod recall;
 mod registry;
+mod scan;
 mod session;
 mod worker;
 
@@ -14,6 +17,14 @@ pub use conductor::ConductorEvidence;
 pub use conductor::ConductorPlanOutcome;
 pub use conductor::ExpectedConductorRoute;
 pub use conductor::NewConductorRun;
+pub use context::ContextDocumentRefreshOptions;
+pub use context::ContextDocumentRefreshReport;
+pub use context::ContextDocumentSearchResult;
+pub use context::ContextSourceKind;
+pub use context::ContextSourceRefreshReport;
+pub use context::ContextSourceRefreshStatus;
+pub use context::MAX_CONTEXT_FILES;
+pub use context::RecallSettings;
 pub use control::ControlAction;
 pub use control::ControlActionKind;
 pub use control::ControlActionState;
@@ -41,10 +52,21 @@ pub use insight::ProjectMatch;
 pub use insight::SessionMatch;
 pub use insight::SummaryCoverage;
 pub use paths::SkeinPaths;
+pub use recall::ProjectDocumentRefreshReport;
+pub use recall::ProjectDocumentRefreshStatus;
+pub use recall::ProjectDocumentSearchResult;
 pub use registry::Project;
 pub use registry::RefreshReport;
 pub use registry::RefreshStatus;
 pub use registry::Registry;
+pub use scan::DEFAULT_RECURSIVE_MAX_DEPTH;
+pub use scan::DiscoveryError;
+pub use scan::DiscoveryReport;
+pub use scan::DiscoverySkip;
+pub use scan::DiscoverySkipReason;
+pub use scan::MAX_SCAN_DEPTH;
+pub use scan::ScanRoot;
+pub use scan::ScanRootOptions;
 pub use session::ProjectLinkKind;
 pub use session::Session;
 pub use session::SessionImportReport;
@@ -95,6 +117,36 @@ pub enum Error {
     /// A path was not present in the explicit project registry.
     #[error("project is not registered: {0}")]
     ProjectNotRegistered(std::path::PathBuf),
+
+    /// A scan root path was not an existing directory when it was registered.
+    #[error("scan root is not an existing directory: {0}")]
+    InvalidScanRoot(std::path::PathBuf),
+
+    /// A path was not present in the scan-root registry.
+    #[error("scan root is not registered: {0}")]
+    ScanRootNotRegistered(std::path::PathBuf),
+
+    /// A recursive scan depth exceeded the supported safety bound.
+    #[error("scan depth {found} exceeds the supported maximum of {maximum}")]
+    InvalidScanDepth {
+        /// Requested depth.
+        found: u16,
+        /// Largest accepted depth.
+        maximum: u16,
+    },
+
+    /// A deep-recall refresh requested more files than the hard safety bound.
+    #[error("recall file limit {found} is outside the supported range 1..={maximum}")]
+    InvalidRecallFileLimit {
+        /// Requested maximum number of source files.
+        found: usize,
+        /// Largest accepted maximum.
+        maximum: usize,
+    },
+
+    /// A depth was supplied for a root which does not permit recursion.
+    #[error("scan depth {0} requires recursive discovery")]
+    ScanDepthRequiresRecursive(u16),
 
     /// An adapter observation violated the durable session contract.
     #[error("invalid session observation: {0}")]

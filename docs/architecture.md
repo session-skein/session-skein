@@ -61,18 +61,50 @@ exact-run interruption use the fenced worker API. Dispatch invokes the current
 `skein conduct` executable with a private stdin prompt, a stable request UUID, and a
 strictly bounded one-response JSON protocol. Invalid or lost child output is
 reconciled from durable content-free state and never causes prompt replay.
+One startup worker performs configured scan-root, Git, and bounded document refresh
+away from the render loop, then requests a fresh read-only catalog snapshot.
 
-## Git metadata adapter
+The MCP server is another presentation/controller adapter over the same boundaries.
+Codex starts `skein mcp` on demand over stdio; no listener, daemon, token, or extra
+authentication exists. Read tools open the registry read-only. Project registration
+and Git/session refresh use the existing bounded registry operations. Conduct runs
+the same fail-closed CLI path with private stdin and a stable request UUID; steer,
+interrupt, and reconciliation call the same fenced worker functions. MCP does not
+implement a parallel control state machine.
 
-The first source adapter observes only explicitly registered project roots. It stores
+Tool annotations distinguish read-only metadata calls from writes and destructive or
+open-world control. They are hints for the client, not authorization. Worker-control
+tools exist only when the server starts with the explicit `--allow-control`
+capability. `conduct` still requires an explicit boolean acknowledgement, a
+caller-owned request UUID, and records the normal
+immutable policy, route receipt, actions, worker claim, and audit events before Codex
+mutation.
+
+## Scan-root and Git metadata adapters
+
+Exact project registration and scan-root authorization are separate durable concepts.
+A scan root may examine only itself or explicitly recurse to a configured maximum
+depth. Discovery recognizes `.git` directories and worktree `.git` files, never
+follows directory symlinks, prunes known dependency/build/cache directories, and
+continues after entry-level I/O errors. The root-to-project provenance table prevents
+frequent activity refreshes from needing another filesystem walk.
+
+The Git metadata adapter observes registered projects. It stores
 branch, head object, latest commit timestamp and subject, and an optional tracked-file
 dirty result. A fingerprint of small Git administrative files lets the default path
 avoid spawning Git when repository metadata has not changed. Working-tree checks are
 opt-in and exclude untracked files and submodules.
 
 The adapter invokes read-only local Git commands. It does not fetch, contact remotes,
-change the index, or discover repositories. See [git-refresh.md](git-refresh.md) for
+change the Git index or discover repositories. See [git-refresh.md](git-refresh.md) for
 the observable contract.
+
+The project-document recall adapter prefers bounded `git ls-files` selection for
+tracked README, AGENTS, manifest, and top-level documentation files. A private FTS5
+row is replaced atomically only when its bounded fingerprint changes. The database
+may retain up to 512 KiB of identity text per registered project; public search
+projections expose only a 2 KiB snippet, title, project identity, and contributing
+relative paths.
 
 ## Codex adapter
 

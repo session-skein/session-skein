@@ -27,47 +27,88 @@ inspectable, and recoverable without treating one giant prompt as permanent memo
 cargo run --release --bin skein -- doctor
 cargo run --release --bin skein -- init
 cargo run --release --bin skein -- project add /path/to/project
-cargo run --release --bin skein -- project refresh /path/to/project --json
-cargo run --release --bin skein -- project refresh /path/to/project --working-tree --json
-cargo run --release --bin skein -- project show /path/to/project --json
-cargo run --release --bin skein -- project list --json
-cargo run --release --bin skein -- import codex preview --limit 50 --json
-cargo run --release --bin skein -- session sync codex --limit 50 --json
-cargo run --release --bin skein -- session list --json
-cargo run --release --bin skein -- session show THREAD_ID --json
-cargo run --release --bin skein -- session bind THREAD_ID /path/to/project --json
-cargo run --release --bin skein -- session unbind THREAD_ID --json
+cargo run --release --bin skein -- scan-root add /path/to/workspace --recursive
+cargo run --release --bin skein -- index
+cargo run --release --bin skein -- project refresh /path/to/project
+cargo run --release --bin skein -- project show /path/to/project
+cargo run --release --bin skein -- project list
+cargo run --release --bin skein -- import codex preview --limit 50
+cargo run --release --bin skein -- session sync codex --all-pages --limit 100
+cargo run --release --bin skein -- session list
+cargo run --release --bin skein -- session show THREAD_ID
+cargo run --release --bin skein -- session bind THREAD_ID /path/to/project
+cargo run --release --bin skein -- session unbind THREAD_ID
 printf '%s\n' 'Describe this repository.' | \
   cargo run --release --bin skein -- control codex /path/to/project \
     --full-access --jsonl
-cargo run --release --bin skein -- control list --json
-cargo run --release --bin skein -- control show RUN_ID --json
-cargo run --release --bin skein -- control mark-stale --force --json
+cargo run --release --bin skein -- control list
+cargo run --release --bin skein -- control show RUN_ID
+cargo run --release --bin skein -- control mark-stale --force
 printf '%s\n' 'Run the focused tests.' | \
   cargo run --release --bin skein -- worker start /path/to/project \
-    --full-access --json
-cargo run --release --bin skein -- worker list --active --json
-cargo run --release --bin skein -- worker status RUN_ID --json
+    --full-access
+cargo run --release --bin skein -- worker list --active
+cargo run --release --bin skein -- worker status RUN_ID
 cargo run --release --bin skein -- worker watch RUN_ID --jsonl
 printf '%s\n' 'Change direction without starting a new turn.' | \
   cargo run --release --bin skein -- worker steer RUN_ID
 cargo run --release --bin skein -- worker interrupt RUN_ID
-cargo run --release --bin skein -- worker read RUN_ID --json
-cargo run --release --bin skein -- worker reconcile RUN_ID --json
+cargo run --release --bin skein -- worker read RUN_ID
+cargo run --release --bin skein -- worker reconcile RUN_ID
 cargo run --release --bin skein -- worker stop RUN_ID
 printf '%s\n' 'continue Session Skein routing work' | \
-  cargo run --release --bin skein -- conduct --full-access --json
+  cargo run --release --bin skein -- conduct --full-access
 printf '%s\n' 'continue the renderer investigation' | \
-  cargo run --release --bin skein -- match --json
-cargo run --release --bin skein -- summary project /path/to/project --json
-cargo run --release --bin skein -- summary projects --json
-cargo run --release --bin skein -- summary day --json
+  cargo run --release --bin skein -- match
+cargo run --release --bin skein -- summary project /path/to/project
+cargo run --release --bin skein -- summary projects
+cargo run --release --bin skein -- summary day
 cargo run --release --bin skein -- tui
+cargo run --release --bin skein -- mcp
+
+# Add --format json anywhere when a script needs structured output:
+cargo run --release --bin skein -- project list --format json
 ```
 
 `doctor` is always read-only and does not migrate an older database. `init` creates
-or upgrades the private per-user SQLite database. Project discovery is explicit;
-Session Skein does not recursively crawl disks or network mounts.
+or upgrades the private per-user SQLite database. Project discovery is explicit.
+Register one exact project with `project add`, or approve a discovery root:
+
+```console
+skein scan-root add /path/to/workspace
+skein scan-root add /path/to/workspace --recursive --max-depth 16
+skein scan-root list
+skein index
+skein search project terms
+skein context status
+skein context memories enable
+skein context sessions enable
+skein context refresh
+```
+
+Recursion is opt-in. It never follows directory symlinks, recognizes normal Git
+repositories and worktree `.git` files, and prunes common dependency, build, cache,
+vendor, and virtual-environment directories. The default recursive depth is 16 and
+the maximum is 64. An unavailable network root is reported without removing its
+cached projects, and the stored root can still be removed while unmounted.
+
+Human-readable hierarchical output is the default. Use the global
+`--format json` option for automation; the older per-command `--json` switch remains
+available for compatibility. Streaming commands continue to use `--jsonl`.
+
+`index` also builds a private, bounded project-identity FTS index from Git-tracked
+README variants, `AGENTS.md`, common manifests, and top-level Markdown in `docs/`
+and `.codex/`. If Git file enumeration fails, it uses only this fixed bounded path
+set, which may include untracked files. It reads at most 40 files, 64 KiB per file,
+and 512 KiB per project; it never follows symlinks. `search` and the MCP recall tools return only bounded
+snippets and source paths, never complete indexed documents.
+
+Deep recall is disabled by default. Generated memory summaries can be enabled
+separately. Raw session recall additionally requires the session cwd to be beneath a
+persisted approved scan root; only user/assistant message text is admitted. Source
+files, imported documents, returned snippets, and total refresh work are all bounded.
+Disabling a source and refreshing atomically removes its private context documents.
+See [docs/context-recall.md](docs/context-recall.md).
 
 The default `project refresh` reads small Git administrative files and the latest
 commit, then stores a fingerprint. A second refresh skips Git entirely when that
@@ -126,6 +167,23 @@ registry, invokes `skein conduct` as a bounded child process, and follows redact
 worker events. A dispatch requires pressing F2 immediately before Enter; that
 authority is consumed once. Agent Deck, tmux, MCP, systemd, and API keys are not
 required. See [docs/tui.md](docs/tui.md).
+
+`mcp` is the on-demand stdio adapter for Codex CLI. It exposes the same private local
+registry and audited control paths without a daemon or another credential. Register
+the installed binary once, then start a new Codex session:
+
+```console
+codex mcp add session-skein -- skein mcp --allow-control
+codex mcp get session-skein --json
+```
+
+The project-recall names used by the former Codex Brain server remain available,
+including `search_projects`, `get_project`, `suggest_codex_command`, `refresh_index`,
+`refresh_activity`, and the scan-root tools. `add_scan_root` accepts an explicit
+`recursive` policy and `refresh_index` discovers repositories before refreshing Git
+metadata. Defaults-off, bounded generated-memory and raw user/assistant session recall
+are available explicitly. Native tools add session/run inspection and audited
+conduct, steer, interrupt, and reconciliation operations. See [docs/mcp.md](docs/mcp.md).
 
 Environment overrides:
 

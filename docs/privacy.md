@@ -8,8 +8,13 @@ personal or proprietary information.
 
 - Private generated state belongs in the platform data directory, never the repo.
 - On Unix, state directories are mode `0700` and the SQLite file is mode `0600`.
-- Credentials and bearer tokens must not be stored in SQLite or logs.
-- Raw transcripts remain source-owned unless a user explicitly imports them.
+- Default metadata and control paths do not intentionally store credentials or bearer
+  tokens. Explicit document/deep-recall sources are stored verbatim within their
+  bounds and can contain secrets if the admitted source text contains them.
+- Project-document recall is explicit through registered projects and `index`; it
+  stores bounded identity-file text privately and never follows symlinks.
+- Raw transcripts remain source-owned unless a user explicitly enables bounded
+  user/assistant recall beneath an approved root.
 - Exports are opt-in, inspectable, and redacted before publication.
 - Diagnostics must describe locations and health without dumping content.
 - Tests use synthetic names and temporary paths.
@@ -43,6 +48,13 @@ personal or proprietary information.
   responses, unrecognized source client IDs, item content, names, and previews are not
   additionally persisted. Skein's own opaque client IDs already exist in the audit
   ledger so acceptance can be correlated without text.
+- Project-document indexing stores selected identity-file text. Its fixed-path
+  fallback may admit an untracked identity file when Git enumeration fails.
+- Generated-memory and raw-session recall are separate defaults-off gates. Admitted
+  text is not comprehensively secret-redacted: it may include pasted credentials,
+  prompts, commands, diffs, or agent prose present inside a memory or user/assistant
+  message. Storage is bounded and owner-private; disabling a source and refreshing
+  deletes that source's indexed rows.
 
 Session Skein performs no telemetry and has no external network client. Its worker IPC
 is IPv4 loopback-only, its app-server transport is local, and it stores no Codex
@@ -73,3 +85,24 @@ environment variables, SQLite, and Session Skein logs. The child response is bou
 to 1 MiB, and live worker views expose only the existing redacted event schema. These
 rules prevent intentional persistence but do not promise secure erasure of operating
 system or allocator memory.
+
+MCP arguments and results cross the Codex-owned stdio connection in memory. Session
+Skein bounds each argument envelope to 128 KiB, individual text fields to 64 KiB,
+and each child output stream to 1 MiB. Project search
+does not echo or persist the query. `conduct` and `steer_run` pass prompt text only to
+the existing private stdin/IPC paths and return content-free IDs, evidence, and state.
+Tool errors are sanitized and bounded. The server exposes content-free session
+metadata and redaction-safe control records by default. `refresh_activity` never reads
+raw rollout transcripts. `refresh_index` may read enabled context sources, and
+`search_projects(include_deep_context=true)` may return their snippets into Codex's
+model context. Codex may send that context to OpenAI or another configured provider;
+Session Skein itself performs no such network request.
+
+The legacy `set_codex_memory_indexing` and `set_codex_session_indexing` tool names map
+to durable explicit gates. Both are disabled by default. Raw-session recall requires
+an approved scan root and admits only bounded user/assistant message text; disabling
+a source and refreshing deletes that source's private index rows atomically.
+
+Project-document search is a different, explicit source. It admits only selected
+identity files, caps each file at 64 KiB and each project at 512 KiB, and returns at
+most a 2 KiB FTS snippet rather than the stored document body.
