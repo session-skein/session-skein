@@ -181,7 +181,7 @@ impl Registry {
 
     /// Remove a root by its stored normalized path, even when it is now unavailable.
     pub fn remove_scan_root(&mut self, path: &Path) -> Result<ScanRoot> {
-        let normalized = normalize_absolute_path(path)?;
+        let normalized = canonicalize_existing_ancestor(path)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -209,7 +209,7 @@ impl Registry {
                 source,
             })?
         } else {
-            normalize_absolute_path(path)?
+            canonicalize_existing_ancestor(path)?
         };
         let root = self
             .scan_root_by_path(&normalized)?
@@ -431,6 +431,30 @@ fn normalize_absolute_path(path: &Path) -> Result<PathBuf> {
     Ok(normalized)
 }
 
+fn canonicalize_existing_ancestor(path: &Path) -> Result<PathBuf> {
+    let normalized = normalize_absolute_path(path)?;
+    if normalized.exists() {
+        return fs::canonicalize(&normalized).map_err(|source| Error::Io {
+            path: normalized,
+            source,
+        });
+    }
+    for ancestor in normalized.ancestors().skip(1) {
+        if !ancestor.exists() {
+            continue;
+        }
+        let canonical = fs::canonicalize(ancestor).map_err(|source| Error::Io {
+            path: ancestor.to_path_buf(),
+            source,
+        })?;
+        let suffix = normalized.strip_prefix(ancestor).map_err(|_| {
+            Error::ControlStateConflict("could not normalize unavailable scan root".to_owned())
+        })?;
+        return Ok(canonical.join(suffix));
+    }
+    Ok(normalized)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -565,6 +589,40 @@ mod tests {
         let removed = registry.remove_scan_root(&stored.path)?;
         assert_eq!(removed.id, stored.id);
         assert!(registry.list_scan_roots()?.is_empty());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unavailable_root_can_be_removed_through_its_original_symlinked_parent() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let (temp, mut registry) = isolated_registry()?;
+        let real_parent = temp.path().join("real-parent");
+        let alias_parent = temp.path().join("alias-parent");
+        let real_root = real_parent.join("workspace");
+        let alias_root = alias_parent.join("workspace");
+        fs::create_dir_all(&real_root).map_err(|source| Error::Io {
+            path: real_root.clone(),
+            source,
+        })?;
+        symlink(&real_parent, &alias_parent).map_err(|source| Error::Io {
+            path: alias_parent.clone(),
+            source,
+        })?;
+        let stored = registry.add_scan_root(&alias_root, ScanRootOptions::default())?;
+        let canonical_root = fs::canonicalize(&real_root).map_err(|source| Error::Io {
+            path: real_root.clone(),
+            source,
+        })?;
+        assert_eq!(stored.path, canonical_root);
+        fs::remove_dir(&real_root).map_err(|source| Error::Io {
+            path: real_root.clone(),
+            source,
+        })?;
+
+        let removed = registry.remove_scan_root(&alias_root)?;
+        assert_eq!(removed.id, stored.id);
         Ok(())
     }
 

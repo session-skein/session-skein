@@ -152,9 +152,10 @@ fn recursively_indexes_an_approved_root_and_removes_it_after_disconnect()
     assert_eq!(added["root"]["recursive"], true);
     assert_eq!(added["root"]["max_depth"], 4);
     assert_eq!(added["discovery"]["newly_registered"], 1);
+    let canonical_repository = std::fs::canonicalize(&repository)?;
     assert_eq!(
         added["discovery"]["discovered"][0]["path"],
-        repository.to_string_lossy().as_ref()
+        canonical_repository.to_string_lossy().as_ref()
     );
 
     let indexed = skein(&data, &config)
