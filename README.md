@@ -79,6 +79,18 @@ printf '%s\n' 'continue the renderer investigation' | \
   skein conduct --full-access --follow
 ```
 
+After explicitly enabling private Codex recall, find and resume an exact prior thread
+from natural-language terms. Generated rollout summaries can identify sessions even
+when their raw transcript cwd is outside approved repository roots:
+
+```console
+skein context sessions enable
+# Or enable generated memories (or both): skein context memories enable
+skein context refresh
+skein session search "deploy aura.ai.pro.br"
+# run the returned exact command: codex resume THREAD_ID
+```
+
 Human-readable output is the default. Add `--format json` for automation;
 streaming operations use `--jsonl`.
 
@@ -92,7 +104,7 @@ streaming operations use `--jsonl`.
 - Explainable matching, project cards, and factual daily activity summaries.
 - Foreground and reconnectable Codex workers with full-access policy receipts,
   redacted monitoring, steer, interrupt, and recovery reconciliation.
-- A fail-closed single-prompt conductor, standalone Ratatui TUI, and 24-tool MCP
+- A fail-closed single-prompt conductor, standalone Ratatui TUI, and 26-tool MCP
   server.
 - A distributable Codex skill and plugin manifest in this repository.
 

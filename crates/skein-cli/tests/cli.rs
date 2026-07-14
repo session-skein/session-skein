@@ -513,6 +513,7 @@ fn mcp_stdio_lists_legacy_tools_and_calls_read_and_write_paths() -> Result<(), B
     );
     for name in [
         "search_projects",
+        "search_sessions",
         "get_project",
         "suggest_codex_command",
         "add_scan_root",
@@ -969,6 +970,31 @@ fn codex_preview_rejects_an_out_of_range_limit_before_launch() -> Result<(), Box
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("1..=1000"));
     assert!(!temp.path().join("data").exists());
+    Ok(())
+}
+
+#[test]
+fn session_search_is_read_only_and_reports_disabled_private_gate() -> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let data = temp.path().join("data");
+    let config = temp.path().join("config");
+    assert!(skein(&data, &config).arg("init").output()?.status.success());
+    let database = data.join("skein.sqlite3");
+    let before = std::fs::metadata(&database)?.modified()?;
+    let output = skein(&data, &config)
+        .args(["session", "search", "deploy", "aura.ai.pro.br", "--json"])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let value: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(value["results"], json!([]));
+    assert_eq!(value["returned"], 0);
+    assert_eq!(value["privateSources"]["includeCodexSessions"], false);
+    assert_eq!(std::fs::metadata(&database)?.modified()?, before);
     Ok(())
 }
 

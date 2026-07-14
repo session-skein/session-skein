@@ -15,6 +15,13 @@
 
 ## Find prior work
 
+For a prior-session content question, prefer
+`search_sessions {"query":"distinctive terms","limit":10}`. It never enables or
+refreshes private recall. It may consult enabled raw-session projections and exact
+one-rollout memory summaries. Use its exact `threadId` / `resumeCommand`; if all
+private gates are disabled, explain the enable-and-refresh requirement instead of
+silently changing them.
+
 1. `search_projects {"query":"distinctive terms"}`.
 2. If unique, `get_project {"project_id_or_path":"..."}`.
 3. `list_sessions {"project":"..."}`.

@@ -36,6 +36,8 @@ do not blindly run both examples.
 skein search distinctive terms
 skein search --deep-context distinctive terms  # explicit private recall only
 skein session list --project /registered/project
+skein session search "deploy aura.ai.pro.br" --limit 10
+# Add --refresh only when a current private-source refresh is intended.
 skein worker list --active
 skein summary project /registered/project
 skein summary day

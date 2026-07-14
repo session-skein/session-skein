@@ -123,10 +123,12 @@ projections expose only a 2 KiB snippet, title, project identity, and contributi
 relative paths.
 
 The defaults-off raw-session context adapter enumerates the complete bounded file set
-on every authoritative refresh. Schema-11 byte-length checkpoints permit verified
-unchanged reuse and append-tail parsing only after the entire prior prefix matches its
-stored fingerprint. Rewrite, shrink, missing checkpoint, or identity drift falls back
-to the full bounded parser; deletion remains an atomic source reconciliation.
+on every authoritative refresh. Schema-12 size/mtime checkpoints make unchanged files
+metadata-only. Append-tail parsing remains permitted only after a streaming hash
+proves the entire prior prefix; rewrite, shrink, missing/inconsistent checkpoint, or
+cwd/thread identity drift falls back to a full streaming scan. Parsing reaches EOF
+while retaining only bounded early and recent user/assistant text. Deletion remains
+an atomic source reconciliation.
 
 ## Codex adapter
 

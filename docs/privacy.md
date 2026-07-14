@@ -62,12 +62,20 @@ personal or proprietary information.
   prompts, commands, diffs, or agent prose present inside a memory or user/assistant
   message. Storage is bounded and owner-private; disabling a source and refreshing
   deletes that source's indexed rows.
-- Raw-session incremental checkpoints add only bounded source byte length beside the
-  existing private whole-file fingerprint. They contain no transcript excerpt or
-  parsed message content, and the prior prefix is fully rehashed before tail reuse.
+- Raw-session checkpoints add source byte length/mtime, exact source-owned thread ID,
+  and source event timestamps beside the private whole-file fingerprint. They add no
+  transcript excerpt or parsed message content. Append-tail reuse fully rehashes the
+  prior prefix; full parsing streams to EOF while retaining bounded early/recent user
+  and assistant text and filtering injected startup context.
+- A bounded early metadata preflight rejects a session as soon as its source-owned cwd
+  is definitely outside approved roots or is a stale directory beneath a reachable
+  root, avoiding any scan of the remaining transcript.
 - Generated-memory project attribution uses conservative path/cwd evidence and the
   longest registered-project match. Conflicting references remain unmapped, and
   memory text never grants raw-session authorization.
+- Only one-rollout files under `memories/rollout_summaries/` may contribute a strictly
+  UUID-shaped `thread_id` to resumable search. Aggregate memory files cannot become
+  resumable sessions, and memory authorization never expands raw-transcript roots.
 
 Session Skein performs no telemetry and has no external network client. Its worker IPC
 is IPv4 loopback-only, its app-server transport is local, and it stores no Codex

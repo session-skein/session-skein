@@ -64,6 +64,7 @@ skein
 │   │                            [--max-threads 1..10000]]
 │   │              [--include-text] [--repair-source-index]
 │   │              [--since-days 0..3650]
+│   ├── search QUERY... [--limit 1..100] [--refresh]
 │   ├── list [--project PATH | --unmatched] [--source NAME] [--include-text]
 │   ├── show THREAD_ID [--source NAME] [--include-text]
 │   ├── bind THREAD_ID PROJECT [--source NAME] [--include-text]
@@ -187,7 +188,7 @@ checks still apply.
 ### `context refresh`
 
 Atomically rebuilds enabled sources. `--codex-home` overrides Codex discovery for
-this call; `--max-files` defaults to 1000.
+this call; `--max-files` defaults to the authoritative 10,000-file bound.
 
 ### `context search`
 
@@ -212,6 +213,15 @@ unless `--include-text`; JSONL repair is omitted unless `--repair-source-index`.
 Transactionally imports metadata. One page defaults to 50 threads. `--all-pages`
 follows opaque cursors within the page/thread caps. `--since-days` filters source
 updates. Text import and source-index repair are separate explicit flags.
+
+### `session search`
+
+Searches currently enabled private Codex-session projections and exact one-rollout
+generated-memory summaries. It returns bounded ranked hits with source provenance,
+exact thread IDs, source dates/path, optional cwd/project, match mode, and a ready
+`codex resume THREAD_ID` command. All normalized terms are required first;
+any-term fallback occurs only when strict search has no hits. Search-only opens state
+read-only. `--refresh` explicitly refreshes enabled recall sources first.
 
 ### `session list|show|bind|unbind`
 

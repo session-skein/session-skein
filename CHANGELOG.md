@@ -3,6 +3,18 @@
 All notable changes will be documented here. The project follows Semantic Versioning
 after its first published release.
 
+## Unreleased
+
+- Added schema-12 streaming private session recall for large JSONL catalogs: bounded
+  early/recent projections, injected-context filtering, exact thread/source times,
+  fast unchanged stat reuse, bounded outside-root metadata preflight, verified append
+  tails, safe full fallback, and a 10,000-file authoritative default.
+- Added AND-first resumable session search through `skein session search` and the
+  read-only MCP `search_sessions` tool, returning bounded ranked context plus exact
+  `codex resume THREAD_ID` commands while enforcing live private-source gates. Exact
+  one-rollout memory summaries can safely bridge sessions whose original cwd is
+  outside approved raw-transcript roots.
+
 ## [0.5.0-alpha.10] - 2026-07-12
 
 ### Added

@@ -43,7 +43,7 @@ const MAX_CHILD_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_LIST_LIMIT: usize = 500;
 const CHILD_TIMEOUT: Duration = Duration::from_secs(120);
 
-const READ_ONLY_INSTRUCTIONS: &str = "Session Skein is the local Codex project/session catalog. Use search_projects before guessing a path. Empty search results with setupRequired=true mean you must ask which root the user approves before calling add_scan_root. Recursive discovery is an explicit opt-in. Deep recall requires both an enabled private source and include_deep_context=true on each search; admitted text may contain prompts, diffs, commands, or credentials and returned snippets enter the model context. This server was started without Codex worker-control authority. Default metadata/control paths do not intentionally store content or credentials; opted-in recall stores bounded private source text.";
+const READ_ONLY_INSTRUCTIONS: &str = "Session Skein is the local Codex project/session catalog. Use search_projects before guessing a path; use search_sessions for an explicit prior-session content question that needs an exact resumable thread. Empty search results with setupRequired=true mean you must ask which root the user approves before calling add_scan_root. Recursive discovery is an explicit opt-in. Deep recall requires an enabled private source; admitted text may contain prompts, diffs, commands, or credentials and returned snippets enter the model context. This server was started without Codex worker-control authority. Default metadata/control paths do not intentionally store content or credentials; opted-in recall stores bounded private source text.";
 const CONTROL_INSTRUCTIONS: &str = "Session Skein is the local Codex project/session control plane. Use search_projects before guessing a path; weak or ambiguous matches are not dispatch authority. Deep recall requires both an enabled private source and include_deep_context=true on each search; admitted text may contain sensitive content and returned snippets enter the model context. This server was explicitly started with worker-control authority. Before conduct, steer_run, interrupt_run, or reconcile_run, confirm intent. conduct requires full_access_acknowledged=true and a caller UUID. Never retry a lost prompt under a new request_id.";
 
 #[derive(Clone)]
@@ -194,6 +194,16 @@ fn tool_catalog(allow_control: bool) -> Vec<Tool> {
                 "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 100}
             }),
             &[],
+            true,
+        ),
+        tool(
+            "search_sessions",
+            "Search currently enabled private Codex session projections and one-rollout memory summaries, returning bounded resumable hits with exact thread IDs. This explicitly consults opted-in private context.",
+            json!({
+                "query": {"type": "string", "minLength": 1, "maxLength": 65536},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10}
+            }),
+            &["query"],
             true,
         ),
         tool(
@@ -483,6 +493,7 @@ fn execute_local_tool(paths: &SkeinPaths, name: &str, arguments: Value) -> Resul
         "list_projects" => list_projects(paths),
         "list_scan_roots" => list_scan_roots(paths),
         "list_sessions" => list_sessions(paths, parse(arguments)?),
+        "search_sessions" => search_sessions(paths, parse(arguments)?),
         "list_runs" => list_runs(paths, parse(arguments)?),
         "get_run" => get_run(paths, parse(arguments)?),
         "observe_run" => observe_run(paths, parse(arguments)?),
@@ -515,6 +526,13 @@ struct SearchArgs {
     include_session_text: bool,
     #[serde(default)]
     include_deep_context: bool,
+}
+
+#[derive(Deserialize)]
+struct SessionSearchArgs {
+    query: String,
+    #[serde(default = "default_match_limit")]
+    limit: usize,
 }
 
 #[derive(Deserialize)]
@@ -681,6 +699,13 @@ fn search_projects(paths: &SkeinPaths, args: SearchArgs) -> Result<Value, String
     } else {
         Vec::new()
     };
+    let session_matches = if args.include_deep_context {
+        registry
+            .search_session_documents(&args.query, args.limit)
+            .map_err(error_string)?
+    } else {
+        Vec::new()
+    };
     let settings = registry.get_recall_settings().map_err(error_string)?;
     let freshness = registry
         .catalog_freshness(unix_timestamp(), skein_core::DEFAULT_STALE_AFTER_SECONDS)
@@ -701,6 +726,7 @@ fn search_projects(paths: &SkeinPaths, args: SearchArgs) -> Result<Value, String
         "setupHint": setup_required.then_some("Ask the user which directory may be indexed, call add_scan_root (recursive=true only when nested repositories should be discovered), then call refresh_index."),
         "documentMatches": document_matches,
         "contextMatches": context_matches,
+        "sessionMatches": session_matches,
         "recall": {
             "mode": if args.include_deep_context { "deep_private" } else { "quick_indexed" },
             "sourcesConsulted": sources_consulted,
@@ -718,6 +744,38 @@ fn search_projects(paths: &SkeinPaths, args: SearchArgs) -> Result<Value, String
             }))
         },
         "report": report
+    }))
+}
+
+fn search_sessions(paths: &SkeinPaths, args: SessionSearchArgs) -> Result<Value, String> {
+    validate_query(&args.query)?;
+    if !(1..=100).contains(&args.limit) {
+        return Err("limit must be in 1..=100".to_owned());
+    }
+    let registry = Registry::open_read_only(paths).map_err(error_string)?;
+    let settings = registry.get_recall_settings().map_err(error_string)?;
+    let results = registry
+        .search_session_documents(&args.query, args.limit)
+        .map_err(error_string)?;
+    let mut authorized_sources = Vec::new();
+    if settings.include_codex_memories {
+        authorized_sources.push("codex_memory");
+    }
+    if settings.include_codex_sessions {
+        authorized_sources.push("codex_session");
+    }
+    Ok(json!({
+        "ok": true,
+        "authorized": !authorized_sources.is_empty(),
+        "authorizedSources": authorized_sources,
+        "sourcesConsulted": authorized_sources,
+        "returned": results.len(),
+        "results": results,
+        "nextAction": if !authorized_sources.is_empty() {
+            "resume_with_exact_thread_id"
+        } else {
+            "enable_private_recall_then_refresh_index"
+        }
     }))
 }
 
@@ -1467,6 +1525,7 @@ mod tests {
         let tools = tool_catalog(true);
         for name in [
             "search_projects",
+            "search_sessions",
             "get_project",
             "suggest_codex_command",
             "refresh_index",
@@ -1489,6 +1548,18 @@ mod tests {
                 .and_then(|tool| tool.annotations.as_ref())
                 .and_then(|annotations| annotations.read_only_hint)
                 .unwrap_or(false)
+        );
+        let search_sessions = tools
+            .iter()
+            .find(|tool| tool.name == "search_sessions")
+            .expect("search_sessions tool missing");
+        assert_eq!(search_sessions.input_schema["required"], json!(["query"]));
+        assert_eq!(
+            search_sessions
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.read_only_hint),
+            Some(true)
         );
         assert_eq!(
             tools
@@ -1545,6 +1616,18 @@ mod tests {
         assert_eq!(value["rawTranscriptIndexing"], false);
         assert_eq!(value["generatedMemoryIndexing"], false);
         assert_eq!(value["deepRecallDefault"], false);
+        let search = search_sessions(
+            &paths,
+            SessionSearchArgs {
+                query: "deploy aura.ai.pro.br".to_owned(),
+                limit: 10,
+            },
+        )
+        .expect("disabled private session search");
+        assert_eq!(search["authorized"], false);
+        assert_eq!(search["authorizedSources"], json!([]));
+        assert_eq!(search["sourcesConsulted"], json!([]));
+        assert_eq!(search["results"], json!([]));
     }
 
     #[test]

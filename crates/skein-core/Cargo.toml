@@ -9,6 +9,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
+chrono.workspace = true
 directories.workspace = true
 rusqlite.workspace = true
 serde.workspace = true

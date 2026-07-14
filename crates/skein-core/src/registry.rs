@@ -18,7 +18,7 @@ use crate::Result;
 use crate::SkeinPaths;
 use crate::git;
 
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 
 const CREATE_CONDUCTOR_SCHEMA: &str = "CREATE TABLE conductor_decisions (
     id INTEGER PRIMARY KEY,
@@ -660,6 +660,10 @@ impl Registry {
                 "ALTER TABLE context_documents ADD COLUMN source_bytes INTEGER NOT NULL DEFAULT 0
                     CHECK(source_bytes >= 0 AND source_bytes <= 1048576);",
             )?;
+            migrate_context_documents_v12(&transaction)?;
+            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        } else if current == 11 {
+            migrate_context_documents_v12(&transaction)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         } else if current != SCHEMA_VERSION {
             return Err(Error::UnsupportedSchema {
@@ -682,6 +686,43 @@ impl Registry {
         }
         Ok(())
     }
+}
+
+fn migrate_context_documents_v12(transaction: &rusqlite::Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        "DROP TABLE context_documents_fts;
+         ALTER TABLE context_documents RENAME TO context_documents_v11;
+         CREATE TABLE context_documents (
+            id INTEGER PRIMARY KEY,
+            source_kind TEXT NOT NULL CHECK(source_kind IN ('codex_memory', 'codex_session')),
+            source_path TEXT NOT NULL,
+            project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+            context_path TEXT,
+            fingerprint TEXT NOT NULL,
+            refreshed_at INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            body TEXT NOT NULL,
+            imported_bytes INTEGER NOT NULL CHECK(imported_bytes >= 0 AND imported_bytes <= 524288),
+            source_bytes INTEGER NOT NULL DEFAULT 0 CHECK(source_bytes >= 0),
+            source_modified_at_ns INTEGER NOT NULL DEFAULT 0 CHECK(source_modified_at_ns >= 0),
+            source_thread_id TEXT,
+            source_created_at INTEGER,
+            source_updated_at INTEGER,
+            UNIQUE(source_kind, source_path)
+         );
+         INSERT INTO context_documents (
+            id, source_kind, source_path, project_id, context_path, fingerprint,
+            refreshed_at, title, body, imported_bytes, source_bytes
+         ) SELECT id, source_kind, source_path, project_id, context_path, fingerprint,
+                  refreshed_at, title, body, imported_bytes, source_bytes
+             FROM context_documents_v11;
+         DROP TABLE context_documents_v11;
+         CREATE INDEX context_documents_project ON context_documents(project_id, source_kind);
+         CREATE VIRTUAL TABLE context_documents_fts USING fts5(title, body);
+         INSERT INTO context_documents_fts(rowid, title, body)
+              SELECT id, title, body FROM context_documents;",
+    )?;
+    Ok(())
 }
 
 pub(crate) fn list_projects_on(connection: &Connection) -> Result<Vec<Project>> {
@@ -1278,6 +1319,88 @@ mod tests {
                 22,
                 0,
             )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn migrates_schema_version_eleven_preserving_private_rows_and_fts() -> Result<()> {
+        let temp = tempfile::tempdir().expect("temporary state");
+        let paths = SkeinPaths::new(temp.path().join("config"), temp.path().join("data"));
+        let registry = Registry::open(&paths)?;
+        registry.connection.execute_batch(
+            "INSERT INTO context_documents (
+                 source_kind, source_path, project_id, context_path, fingerprint,
+                 refreshed_at, title, body, imported_bytes, source_bytes
+             ) VALUES (
+                 'codex_session', 'sessions/preserved.jsonl', NULL, '/synthetic/project',
+                 'fnv1a64:fedcba9876543210', 1234567890, 'Preserved session',
+                 'private migration marker', 24, 987654
+             );
+             INSERT INTO context_documents_fts(rowid, title, body)
+                  VALUES (last_insert_rowid(), 'Preserved session', 'private migration marker');
+             ALTER TABLE context_documents DROP COLUMN source_modified_at_ns;
+             ALTER TABLE context_documents DROP COLUMN source_thread_id;
+             ALTER TABLE context_documents DROP COLUMN source_created_at;
+             ALTER TABLE context_documents DROP COLUMN source_updated_at;
+             PRAGMA user_version = 11;",
+        )?;
+        drop(registry);
+
+        let migrated = Registry::open(&paths)?;
+        assert_eq!(migrated.schema_version()?, SCHEMA_VERSION);
+        #[derive(Debug, PartialEq)]
+        struct MigratedContextRow {
+            source_path: String,
+            fingerprint: String,
+            body: String,
+            source_bytes: i64,
+            source_modified_at_ns: i64,
+            source_thread_id: Option<String>,
+            source_created_at: Option<i64>,
+            source_updated_at: Option<i64>,
+        }
+        let row = migrated.connection.query_row(
+            "SELECT source_path, fingerprint, body, source_bytes,
+                        source_modified_at_ns, source_thread_id,
+                        source_created_at, source_updated_at
+                   FROM context_documents WHERE source_path = 'sessions/preserved.jsonl'",
+            [],
+            |row| {
+                Ok(MigratedContextRow {
+                    source_path: row.get(0)?,
+                    fingerprint: row.get(1)?,
+                    body: row.get(2)?,
+                    source_bytes: row.get(3)?,
+                    source_modified_at_ns: row.get(4)?,
+                    source_thread_id: row.get(5)?,
+                    source_created_at: row.get(6)?,
+                    source_updated_at: row.get(7)?,
+                })
+            },
+        )?;
+        assert_eq!(
+            row,
+            MigratedContextRow {
+                source_path: "sessions/preserved.jsonl".to_owned(),
+                fingerprint: "fnv1a64:fedcba9876543210".to_owned(),
+                body: "private migration marker".to_owned(),
+                source_bytes: 987_654,
+                source_modified_at_ns: 0,
+                source_thread_id: None,
+                source_created_at: None,
+                source_updated_at: None,
+            }
+        );
+        migrated.set_recall_settings(crate::RecallSettings {
+            include_codex_memories: false,
+            include_codex_sessions: true,
+        })?;
+        assert_eq!(
+            migrated
+                .search_context_documents("migration marker", 10)?
+                .len(),
+            1
         );
         Ok(())
     }
