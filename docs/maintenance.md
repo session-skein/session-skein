@@ -9,7 +9,7 @@ For an unchanged binary-first installation from alpha.9 onward:
 ```console
 skein update --check
 skein update
-skein update 0.5.0-alpha.10 --force
+skein update 0.5.0-alpha.11 --force
 ```
 
 The check is non-mutating. The running binary's compiled package version is the
