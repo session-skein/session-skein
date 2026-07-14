@@ -3,7 +3,9 @@
 All notable changes will be documented here. The project follows Semantic Versioning
 after its first published release.
 
-## Unreleased
+## [0.5.0-alpha.11] - 2026-07-14
+
+### Added
 
 - Added schema-12 streaming private session recall for large JSONL catalogs: bounded
   early/recent projections, injected-context filtering, exact thread/source times,
