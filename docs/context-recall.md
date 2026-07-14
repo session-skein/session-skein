@@ -9,6 +9,7 @@ skein context memories enable
 skein context sessions enable
 skein context refresh
 skein context search webhook reconciliation
+skein session search "deploy aura.ai.pro.br"
 skein search webhook reconciliation
 skein search --deep-context webhook reconciliation
 ```
@@ -28,11 +29,13 @@ Admitted user/assistant or generated-memory text is not comprehensively redacted
 may itself contain pasted secrets, commands, diffs, prompts, or agent prose. Treat the
 private index as sensitive local data.
 
-Each enabled source independently considers 1,000 files by default and accepts an
-explicit maximum up to 10,000. Source files over 1 MiB are skipped; imported text is
-capped at 512 KiB per document; titles at 256 bytes; returned FTS snippets at 2 KiB;
-search at 100 results. Symlinked files and directories are never followed. Stored
-provenance is relative to the selected Codex home.
+Each enabled source independently considers 10,000 files by default and at most.
+Generated-memory files over 1 MiB are skipped. Session JSONL is streamed to EOF
+regardless of file size: individual records are capped at 1 MiB and the retained
+early-plus-recent projection remains capped at 512 KiB per session. Titles are capped
+at 256 bytes, returned FTS snippets at 2 KiB, and search at 100 results. Symlinked
+files and directories are never followed. Stored provenance is relative to the
+selected Codex home.
 
 Candidate files are selected newest-first by modification time, with stable path
 ordering for timestamp ties, before the per-source file budget is consumed. Generated
@@ -50,19 +53,37 @@ rows non-searchable; no refresh is required for revocation. Re-enabling may make
 those owner-private rows searchable again before refresh, with their existing
 freshness timestamps. Refresh when current source coverage is required.
 
-Raw-session JSONL reconciliation is incrementally parsed after the first full build.
-For each admitted file, Skein stores only bounded byte length beside the existing
-private whole-file fingerprint. An unchanged repeat fully rereads and hashes the file
-to prove equality, but reuses the parsed private document without JSONL processing.
-If a file grew and its entire prior prefix matches at a newline boundary, only the
-appended records are parsed. The complete bounded candidate set is still enumerated,
-so deletion is reconciled atomically.
+Raw-session JSONL reconciliation is incremental after the first full build. Schema 12
+stores size/mtime checkpoint metadata plus exact `session_meta` thread identity and
+source event timestamps. A matching checkpoint makes an unchanged repeat metadata-
+only. If a file grew and a streaming hash proves its entire prior prefix at a newline
+boundary, only appended records are parsed. The complete candidate set is still
+enumerated, so deletion is reconciled atomically.
 
-A missing legacy checkpoint, shrink, rewritten prefix, changed or unauthorized cwd,
-or non-newline append falls back to a full bounded parse. Truncated or unavailable
+A missing or inconsistent checkpoint, shrink, rewritten prefix, changed thread/cwd,
+unauthorized cwd, or non-newline append falls back to a full streaming parse. Injected
+AGENTS/environment startup payloads are excluded from titles and search text.
+Truncated or unavailable
 discovery remains deferred. Reports expose `mode` (`full`, `incremental`, `unchanged`,
 `fallback_full`, `disabled`, or `deferred`) plus byte, record, reuse, fallback, and
 deletion counts. Checkpoints contain no transcript excerpts or parsed message text.
+For sessions with no admitted checkpoint, Skein reads only a bounded early metadata
+preflight first. An early `session_meta` cwd that is definitely outside every approved
+root—or is a stale/deleted directory beneath a reachable approved root—stops that file
+immediately; its transcript body is neither parsed nor retained.
+
+`session search` is the resumable private-search path. It consults enabled raw-session
+projections plus generated files under `memories/rollout_summaries/` that carry one
+strictly validated `thread_id`; aggregate memory files never gain a resumable identity.
+This lets a summary identify a session whose original cwd is outside approved raw-
+transcript roots without broadening those roots. It requires every normalized
+distinctive term first, ignores conversational filler, and treats longer terms as
+prefixes so “deploy” can match “deployed”. It uses an any-term fallback only when
+strict search has no hits. Duplicate sources for one thread collapse to one hit.
+Results include source provenance, exact thread ID, relative source path, source dates,
+optional cwd/project, bounded title/snippet, rank/match mode, and
+`codex resume THREAD_ID`. Search alone is read-only; `--refresh` explicitly refreshes
+enabled sources first.
 
 Interactive `context refresh` reports its scan and completion stages on stderr.
 Progress is suppressed for JSON and non-TTY use. `skein freshness` reads the latest

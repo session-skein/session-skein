@@ -62,7 +62,7 @@ domain model. The binary crate composes them.
 | [`git.rs`](../crates/skein-core/src/git.rs) | Bounded Git fingerprint and metadata observation | Project cards, activity, routing |
 | [`freshness.rs`](../crates/skein-core/src/freshness.rs) | Read-only age and coverage projection over existing observations | CLI freshness and MCP activity status |
 | [`recall.rs`](../crates/skein-core/src/recall.rs) | Bounded project identity documents and FTS | Search and project matching |
-| [`context.rs`](../crates/skein-core/src/context.rs) | Defaults-off snippets, verified JSONL tail reuse, and FTS | Deep-context search and global index reports |
+| [`context.rs`](../crates/skein-core/src/context.rs) | Defaults-off streaming JSONL, exact session identity, verified tail reuse, and AND-first FTS | Resumable session/deep-context search and global index reports |
 | [`session.rs`](../crates/skein-core/src/session.rs) | Source-neutral thread metadata and project binding | Recovery, routing, summaries |
 | [`insight.rs`](../crates/skein-core/src/insight.rs) | Ranked scoring evidence, stable route selectors, project cards, day summaries | `match`, `summary`, conductor plan |
 | [`control.rs`](../crates/skein-core/src/control.rs) | Policies, runs, turns, actions, events, reconciliation | Foreground and worker control |
@@ -121,7 +121,7 @@ sequenceDiagram
 - `main.rs` provides stable human, JSON, and JSONL command contracts.
 - `tui.rs` renders snapshots and invokes bounded child commands away from the render
   loop.
-- `mcp.rs` exposes 24 tools with annotations, setup-required responses, and an
+- `mcp.rs` exposes 26 tools with annotations, setup-required responses, and an
   optional control capability.
 - `output.rs` keeps human-readable output separate from machine-readable structures.
 

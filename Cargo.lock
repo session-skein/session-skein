@@ -1300,6 +1300,7 @@ dependencies = [
 name = "skein-core"
 version = "0.5.0-alpha.10"
 dependencies = [
+ "chrono",
  "directories",
  "rusqlite",
  "serde",

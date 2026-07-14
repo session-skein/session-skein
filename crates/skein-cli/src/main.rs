@@ -388,6 +388,24 @@ enum SessionCommand {
     Bind(SessionBindArgs),
     /// Leave one durable session explicitly unassigned.
     Unbind(SessionIdentityArgs),
+    /// Search explicitly enabled private Codex session content for resumable threads.
+    Search(SessionSearchArgs),
+}
+
+#[derive(Debug, Args)]
+struct SessionSearchArgs {
+    /// Natural-language terms to find in bounded user/assistant projections.
+    #[arg(required = true, num_args = 1..)]
+    query: Vec<String>,
+    /// Maximum ranked session hits.
+    #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u32).range(1..=100))]
+    limit: u32,
+    /// Refresh enabled private context sources before searching.
+    #[arg(long)]
+    refresh: bool,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -622,7 +640,7 @@ enum ContextCommand {
         #[arg(long)]
         codex_home: Option<PathBuf>,
         /// Maximum source files considered across enabled sources.
-        #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(u32).range(1..=10_000))]
+        #[arg(long, default_value_t = 10_000, value_parser = clap::value_parser!(u32).range(1..=10_000))]
         max_files: u32,
         #[arg(long)]
         json: bool,
@@ -970,6 +988,34 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let registry = Registry::open(&paths)?;
                 let session = registry.unbind_session(&args.source, &args.source_thread_id)?;
                 print_value(&session_view(session, args.include_text), args.json)?;
+            }
+            SessionCommand::Search(args) => {
+                let refresh = if args.refresh {
+                    let progress = progress::Progress::cli(args.json);
+                    progress.stage("refreshing enabled private context sources");
+                    let mut registry = Registry::open(&paths)?;
+                    let report = registry.refresh_context_documents(
+                        &codex_home(None)?,
+                        skein_core::ContextDocumentRefreshOptions::default(),
+                    )?;
+                    progress.stage("private context refresh complete");
+                    Some(report)
+                } else {
+                    None
+                };
+                let registry = Registry::open_read_only(&paths)?;
+                let query = args.query.join(" ");
+                let results =
+                    registry.search_session_documents(&query, usize::try_from(args.limit)?)?;
+                print_value(
+                    &serde_json::json!({
+                        "results": results,
+                        "returned": results.len(),
+                        "refresh": refresh,
+                        "privateSources": registry.get_recall_settings()?,
+                    }),
+                    args.json,
+                )?;
             }
         },
         Command::Control { command } => match command {

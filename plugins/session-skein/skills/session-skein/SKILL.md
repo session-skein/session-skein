@@ -37,12 +37,18 @@ its database, matching, or worker logic in the skill.
 
 ## Recover before starting duplicate work
 
-1. Search projects using the user's distinctive terms.
-2. Inspect the selected project, linked sessions, and active/recovery runs.
-3. Prefer an exact existing session or run when it represents the requested work.
-4. Surface ambiguity and evidence. Ask for direction instead of choosing a weak
+1. For prior-session content questions, call `search_sessions` using distinctive
+   terms. It returns exact thread IDs and `codex resume` commands only from explicitly
+   enabled raw-session projections or exact one-rollout memory summaries. Use
+   `session search` as CLI fallback; add `--refresh` only when the user asked to
+   refresh private recall.
+2. Search projects when the question is about repository identity rather than raw
+   session content.
+3. Inspect the selected project, linked sessions, and active/recovery runs.
+4. Prefer an exact existing session or run when it represents the requested work.
+5. Surface ambiguity and evidence. Ask for direction instead of choosing a weak
    route.
-5. Reconcile a recovery-required run before starting replacement work. Never replay a
+6. Reconcile a recovery-required run before starting replacement work. Never replay a
    prompt whose dispatch outcome is uncertain.
 
 ## Preserve context consent

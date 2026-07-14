@@ -1,8 +1,13 @@
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::VecDeque;
 use std::fs;
 use std::fs::File;
+use std::io::BufRead;
+use std::io::BufReader;
 use std::io::Read;
+use std::io::Seek;
+use std::io::SeekFrom;
 use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
@@ -40,7 +45,11 @@ CREATE TABLE IF NOT EXISTS context_documents (
     title TEXT NOT NULL,
     body TEXT NOT NULL,
     imported_bytes INTEGER NOT NULL CHECK(imported_bytes >= 0 AND imported_bytes <= 524288),
-    source_bytes INTEGER NOT NULL DEFAULT 0 CHECK(source_bytes >= 0 AND source_bytes <= 1048576),
+    source_bytes INTEGER NOT NULL DEFAULT 0 CHECK(source_bytes >= 0),
+    source_modified_at_ns INTEGER NOT NULL DEFAULT 0 CHECK(source_modified_at_ns >= 0),
+    source_thread_id TEXT,
+    source_created_at INTEGER,
+    source_updated_at INTEGER,
     UNIQUE(source_kind, source_path)
 );
 CREATE INDEX IF NOT EXISTS context_documents_project ON context_documents(project_id, source_kind);
@@ -48,9 +57,11 @@ CREATE VIRTUAL TABLE IF NOT EXISTS context_documents_fts USING fts5(title, body)
 
 /// Hard upper bound for one deep-recall refresh.
 pub const MAX_CONTEXT_FILES: usize = 10_000;
-const DEFAULT_CONTEXT_FILES: usize = 1_000;
+const DEFAULT_CONTEXT_FILES: usize = MAX_CONTEXT_FILES;
 const MAX_SOURCE_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_DOCUMENT_TEXT_BYTES: usize = 512 * 1024;
+const SESSION_EARLY_TEXT_BYTES: usize = MAX_DOCUMENT_TEXT_BYTES / 2;
+const MAX_SESSION_RECORD_BYTES: usize = 1024 * 1024;
 const MAX_CONTEXT_SNIPPET_BYTES: usize = 2 * 1024;
 const MAX_CONTEXT_TITLE_BYTES: usize = 256;
 const MAX_CONTEXT_SEARCH_RESULTS: usize = 100;
@@ -152,7 +163,7 @@ pub struct ContextSourceRefreshReport {
     pub documents: usize,
     /// Prepared text bytes after message-only extraction and bounds.
     pub imported_bytes: usize,
-    /// Files skipped because their source size exceeded 1 MiB.
+    /// Non-session files skipped because their source size exceeded 1 MiB.
     pub skipped_oversized: usize,
     /// Files with no valid document structure or admitted text.
     pub skipped_malformed_or_empty: usize,
@@ -218,6 +229,36 @@ pub struct ContextDocumentSearchResult {
     pub rank: f64,
 }
 
+/// Match strategy used by the dedicated private session search.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionSearchMatchMode {
+    /// Every normalized query term matched the same indexed session.
+    AllTerms,
+    /// No all-term matches existed, so at least one normalized term matched.
+    AnyTermFallback,
+}
+
+/// Bounded, resumable projection of one opted-in Codex session search hit.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionContentSearchResult {
+    pub document_id: i64,
+    pub source_kind: ContextSourceKind,
+    pub thread_id: String,
+    pub source_path: PathBuf,
+    pub created_at: Option<i64>,
+    pub updated_at: Option<i64>,
+    pub project_id: Option<i64>,
+    pub project_path: Option<PathBuf>,
+    pub cwd: Option<PathBuf>,
+    pub title: String,
+    pub snippet: String,
+    pub rank: f64,
+    pub match_mode: SessionSearchMatchMode,
+    pub resume_command: String,
+}
+
 #[derive(Debug)]
 struct ContextDocument {
     source_kind: ContextSourceKind,
@@ -228,7 +269,11 @@ struct ContextDocument {
     title: String,
     body: String,
     imported_bytes: usize,
-    source_bytes: usize,
+    source_bytes: u64,
+    source_modified_at_ns: i64,
+    source_thread_id: Option<String>,
+    source_created_at: Option<i64>,
+    source_updated_at: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -240,7 +285,11 @@ struct ExistingContextDocument {
     title: String,
     body: String,
     imported_bytes: usize,
-    source_bytes: usize,
+    source_bytes: u64,
+    source_modified_at_ns: i64,
+    source_thread_id: Option<String>,
+    source_created_at: Option<i64>,
+    source_updated_at: Option<i64>,
 }
 
 #[derive(Default)]
@@ -475,6 +524,128 @@ impl Registry {
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Error::from)
     }
+
+    /// Search currently authorized resumable Codex session projections.
+    ///
+    /// The strict all-term query runs first. The controlled any-term query is used
+    /// only when strict search returned no resumable session hits.
+    pub fn search_session_documents(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SessionContentSearchResult>> {
+        let settings = self.get_recall_settings()?;
+        if !settings.include_codex_sessions && !settings.include_codex_memories {
+            return Ok(Vec::new());
+        }
+        let Some(terms) = session_query_terms(query) else {
+            return Ok(Vec::new());
+        };
+        let tokens = terms
+            .iter()
+            .map(|value| session_fts_token(value))
+            .collect::<Vec<_>>();
+        let limit = limit.clamp(1, MAX_CONTEXT_SEARCH_RESULTS);
+        let strict = tokens.join(" AND ");
+        let hits = session_search_query(
+            &self.connection,
+            &strict,
+            limit,
+            SessionSearchMatchMode::AllTerms,
+            settings,
+            &terms,
+        )?;
+        if !hits.is_empty() || tokens.len() == 1 {
+            return Ok(hits);
+        }
+        session_search_query(
+            &self.connection,
+            &tokens.join(" OR "),
+            limit,
+            SessionSearchMatchMode::AnyTermFallback,
+            settings,
+            &terms,
+        )
+    }
+}
+
+fn session_search_query(
+    connection: &rusqlite::Connection,
+    fts_query: &str,
+    limit: usize,
+    match_mode: SessionSearchMatchMode,
+    settings: RecallSettings,
+    snippet_terms: &[String],
+) -> Result<Vec<SessionContentSearchResult>> {
+    let mut statement = connection.prepare(
+        "SELECT d.id, d.source_kind, d.source_thread_id, d.source_path, d.source_created_at,
+                d.source_updated_at, d.project_id, p.path,
+                CASE WHEN d.source_kind = 'codex_session' THEN d.context_path END, d.title,
+                bm25(context_documents_fts)
+           FROM context_documents_fts
+           JOIN context_documents d ON d.id = context_documents_fts.rowid
+           LEFT JOIN projects p ON p.id = d.project_id
+          WHERE context_documents_fts MATCH ?1
+            AND ((d.source_kind = 'codex_memory' AND ?2)
+              OR (d.source_kind = 'codex_session' AND ?3))
+            AND d.source_thread_id IS NOT NULL
+          ORDER BY round(bm25(context_documents_fts), 3),
+                   COALESCE(d.source_updated_at, d.source_created_at, 0) DESC,
+                   CASE d.source_kind WHEN 'codex_memory' THEN 0 ELSE 1 END,
+                   d.source_thread_id
+          LIMIT ?4",
+    )?;
+    let candidates = statement
+        .query_map(
+            params![
+                fts_query,
+                settings.include_codex_memories,
+                settings.include_codex_sessions,
+                i64::try_from(limit.saturating_mul(4)).unwrap_or(i64::MAX)
+            ],
+            |row| {
+                let source: String = row.get(1)?;
+                let source_kind = ContextSourceKind::parse(&source).ok_or_else(|| {
+                    rusqlite::Error::InvalidColumnType(
+                        1,
+                        "source_kind".to_owned(),
+                        rusqlite::types::Type::Text,
+                    )
+                })?;
+                let thread_id: String = row.get(2)?;
+                Ok(SessionContentSearchResult {
+                    document_id: row.get(0)?,
+                    source_kind,
+                    resume_command: format!("codex resume {thread_id}"),
+                    thread_id,
+                    source_path: PathBuf::from(row.get::<_, String>(3)?),
+                    created_at: row.get(4)?,
+                    updated_at: row.get(5)?,
+                    project_id: row.get(6)?,
+                    project_path: row.get::<_, Option<String>>(7)?.map(PathBuf::from),
+                    cwd: row.get::<_, Option<String>>(8)?.map(PathBuf::from),
+                    title: row.get(9)?,
+                    snippet: String::new(),
+                    rank: row.get(10)?,
+                    match_mode,
+                })
+            },
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Error::from)?;
+    let mut seen = BTreeSet::new();
+    let mut hits = candidates
+        .into_iter()
+        .filter(|hit| seen.insert(hit.thread_id.clone()))
+        .take(limit)
+        .collect::<Vec<_>>();
+    let mut body_statement =
+        connection.prepare("SELECT body FROM context_documents WHERE id = ?1")?;
+    for hit in &mut hits {
+        let body: String = body_statement.query_row([hit.document_id], |row| row.get(0))?;
+        hit.snippet = session_search_snippet(&body, snippet_terms);
+    }
+    Ok(hits)
 }
 
 fn recall_settings_on(connection: &rusqlite::Connection) -> Result<RecallSettings> {
@@ -559,7 +730,8 @@ fn existing_context_documents(
 ) -> Result<BTreeMap<PathBuf, ExistingContextDocument>> {
     let mut statement = connection.prepare(
         "SELECT source_path, project_id, context_path, fingerprint, title, body,
-                imported_bytes, source_bytes
+                imported_bytes, source_bytes, source_modified_at_ns,
+                source_thread_id, source_created_at, source_updated_at
            FROM context_documents WHERE source_kind = ?1 ORDER BY source_path",
     )?;
     let documents = statement
@@ -575,7 +747,11 @@ fn existing_context_documents(
                     title: row.get(4)?,
                     body: row.get(5)?,
                     imported_bytes: usize::try_from(row.get::<_, i64>(6)?).unwrap_or(0),
-                    source_bytes: usize::try_from(row.get::<_, i64>(7)?).unwrap_or(0),
+                    source_bytes: u64::try_from(row.get::<_, i64>(7)?).unwrap_or(0),
+                    source_modified_at_ns: row.get(8)?,
+                    source_thread_id: row.get(9)?,
+                    source_created_at: row.get(10)?,
+                    source_updated_at: row.get(11)?,
                 },
             ))
         })?
@@ -612,7 +788,8 @@ fn replace_context_source(
     documents: &[ContextDocument],
 ) -> Result<ContextSourceRefreshStatus> {
     let mut statement = transaction.prepare(
-        "SELECT source_path, fingerprint, project_id, context_path, source_bytes
+        "SELECT source_path, fingerprint, project_id, context_path, source_bytes,
+                source_modified_at_ns, source_thread_id, source_created_at, source_updated_at
            FROM context_documents WHERE source_kind = ?1 ORDER BY source_path",
     )?;
     let existing = statement
@@ -623,6 +800,10 @@ fn replace_context_source(
                 row.get::<_, Option<i64>>(2)?,
                 row.get::<_, Option<String>>(3)?,
                 row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<i64>>(7)?,
+                row.get::<_, Option<i64>>(8)?,
             ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -639,6 +820,10 @@ fn replace_context_source(
                     .as_ref()
                     .map(|path| path.to_string_lossy().into_owned()),
                 i64::try_from(document.source_bytes).unwrap_or(i64::MAX),
+                document.source_modified_at_ns,
+                document.source_thread_id.clone(),
+                document.source_created_at,
+                document.source_updated_at,
             )
         })
         .collect::<Vec<_>>();
@@ -663,8 +848,9 @@ fn replace_context_source(
         transaction.execute(
             "INSERT INTO context_documents (
                 source_kind, source_path, project_id, context_path, fingerprint,
-                refreshed_at, title, body, imported_bytes, source_bytes
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                refreshed_at, title, body, imported_bytes, source_bytes,
+                source_modified_at_ns, source_thread_id, source_created_at, source_updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 document.source_kind.as_str(),
                 document.source_path.to_string_lossy(),
@@ -679,6 +865,10 @@ fn replace_context_source(
                 document.body,
                 i64::try_from(document.imported_bytes).unwrap_or(i64::MAX),
                 i64::try_from(document.source_bytes).unwrap_or(i64::MAX),
+                document.source_modified_at_ns,
+                document.source_thread_id,
+                document.source_created_at,
+                document.source_updated_at,
             ],
         )?;
         let id = transaction.last_insert_rowid();
@@ -728,6 +918,8 @@ fn collect_memory_documents(
         let imported_bytes = body.len();
         let title = first_heading(&body).unwrap_or_else(|| source_title(&source_path));
         let (project_id, context_path) = memory_project_context(&body, projects);
+        let (source_thread_id, source_updated_at) =
+            rollout_summary_session_metadata(&source_path, &body);
         documents.push(ContextDocument {
             source_kind: ContextSourceKind::CodexMemory,
             source_path,
@@ -737,7 +929,11 @@ fn collect_memory_documents(
             title,
             body,
             imported_bytes,
-            source_bytes: bytes.len(),
+            source_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            source_modified_at_ns: source_modified_at_ns(&path)?,
+            source_thread_id,
+            source_created_at: None,
+            source_updated_at,
         });
     }
     documents.sort_by(|left, right| left.source_path.cmp(&right.source_path));
@@ -763,20 +959,23 @@ fn collect_session_documents(
     let mut documents = Vec::new();
     for path in collected.paths {
         let source_path = relative_source_path(codex_home, &path)?;
-        let bytes = match read_bounded_source(&path)? {
-            BoundedFile::Bytes(bytes) => bytes,
-            BoundedFile::Oversized => {
-                accounting.skipped_oversized += 1;
-                continue;
-            }
-        };
-        accounting.bytes_read = accounting.bytes_read.saturating_add(bytes.len());
+        let metadata = fs::symlink_metadata(&path).map_err(|source| Error::Io {
+            path: path.clone(),
+            source,
+        })?;
+        if !metadata.file_type().is_file() {
+            accounting.skipped_malformed_or_empty += 1;
+            continue;
+        }
+        let source_bytes = metadata.len();
+        let modified_at_ns = metadata_modified_at_ns(&metadata);
         let checkpoint = existing.get(&source_path);
+        let mut fallback_scan = None;
         if let Some(checkpoint) = checkpoint
             && checkpoint.source_bytes > 0
-            && checkpoint.source_bytes == bytes.len()
-            && checkpoint.fingerprint
-                == content_fingerprint(ContextSourceKind::CodexSession, &path, &bytes)
+            && checkpoint.source_bytes == source_bytes
+            && checkpoint.source_modified_at_ns > 0
+            && checkpoint.source_modified_at_ns == modified_at_ns
             && checkpoint_context_authorized(checkpoint, approved_roots)
         {
             accounting.files_reused += 1;
@@ -785,36 +984,58 @@ fn collect_session_documents(
         }
         if let Some(checkpoint) = checkpoint
             && checkpoint.source_bytes > 0
-            && bytes.len() > checkpoint.source_bytes
-            && bytes
-                .get(checkpoint.source_bytes.saturating_sub(1))
-                .is_some_and(|byte| *byte == b'\n')
-            && checkpoint.fingerprint
-                == content_fingerprint(
-                    ContextSourceKind::CodexSession,
-                    &path,
-                    &bytes[..checkpoint.source_bytes],
-                )
+            && source_bytes > checkpoint.source_bytes
             && checkpoint_context_authorized(checkpoint, approved_roots)
         {
-            let parsed = parse_session_document(&bytes[checkpoint.source_bytes..]);
-            accounting.records_considered += parsed.records_considered;
-            accounting.malformed_lines += parsed.malformed_lines;
-            let tail_cwd_matches = parsed.cwd.as_ref().is_none_or(|cwd| {
-                checkpoint
-                    .context_path
-                    .as_ref()
-                    .is_some_and(|existing| same_canonical_directory(cwd, existing))
-            });
-            if tail_cwd_matches {
-                let mut document = context_document_from_checkpoint(checkpoint);
-                append_preformatted_context(&mut document.body, &parsed.body);
-                document.imported_bytes = document.body.len();
-                document.source_bytes = bytes.len();
-                document.fingerprint =
-                    content_fingerprint(ContextSourceKind::CodexSession, &path, &bytes);
-                accounting.files_incremental += 1;
-                documents.push(document);
+            let scanned = scan_session_file(&path, Some(checkpoint))?;
+            accounting.bytes_read = accounting.bytes_read.saturating_add(scanned.bytes_read);
+            if scanned.prefix_verified {
+                let parsed = scanned.parsed;
+                accounting.records_considered += parsed.records_considered;
+                accounting.malformed_lines += parsed.malformed_lines;
+                let tail_cwd_matches = parsed.cwd.as_ref().is_none_or(|cwd| {
+                    checkpoint
+                        .context_path
+                        .as_ref()
+                        .is_some_and(|existing| same_canonical_directory(cwd, existing))
+                });
+                let tail_thread_matches = parsed.thread_id.as_ref().is_none_or(|thread_id| {
+                    checkpoint.source_thread_id.as_ref() == Some(thread_id)
+                });
+                if tail_cwd_matches && tail_thread_matches {
+                    let mut document = context_document_from_checkpoint(checkpoint);
+                    merge_session_projection(&mut document.body, &parsed.body);
+                    document.imported_bytes = document.body.len();
+                    document.source_bytes = source_bytes;
+                    document.source_modified_at_ns = modified_at_ns;
+                    document.fingerprint = scanned.fingerprint;
+                    document.source_created_at =
+                        earliest_timestamp(document.source_created_at, parsed.created_at);
+                    document.source_updated_at =
+                        latest_timestamp(document.source_updated_at, parsed.updated_at);
+                    accounting.files_incremental += 1;
+                    documents.push(document);
+                    continue;
+                }
+            } else {
+                fallback_scan = Some(scanned);
+            }
+        }
+        if checkpoint.is_none() {
+            let preflight = preflight_session_metadata(&path)?;
+            if preflight
+                .cwd
+                .as_ref()
+                .is_some_and(|cwd| session_cwd_preflight_rejects(cwd, approved_roots))
+            {
+                accounting.bytes_read = accounting.bytes_read.saturating_add(preflight.bytes_read);
+                accounting.records_considered = accounting
+                    .records_considered
+                    .saturating_add(preflight.records_considered);
+                accounting.malformed_lines = accounting
+                    .malformed_lines
+                    .saturating_add(preflight.malformed_lines);
+                accounting.skipped_outside_roots += 1;
                 continue;
             }
         }
@@ -822,7 +1043,14 @@ fn collect_session_documents(
             accounting.fallback_files += 1;
         }
         accounting.files_full += 1;
-        let parsed = parse_session_document(&bytes);
+        let scanned = if let Some(scanned) = fallback_scan {
+            scanned
+        } else {
+            let scanned = scan_session_file(&path, None)?;
+            accounting.bytes_read = accounting.bytes_read.saturating_add(scanned.bytes_read);
+            scanned
+        };
+        let parsed = scanned.parsed;
         accounting.records_considered += parsed.records_considered;
         accounting.malformed_lines += parsed.malformed_lines;
         let Some(recorded_cwd) = parsed.cwd else {
@@ -889,11 +1117,15 @@ fn collect_session_documents(
             source_path,
             project_id,
             context_path: Some(cwd),
-            fingerprint: content_fingerprint(ContextSourceKind::CodexSession, &path, &bytes),
+            fingerprint: scanned.fingerprint,
             title,
             body: parsed.body,
             imported_bytes,
-            source_bytes: bytes.len(),
+            source_bytes,
+            source_modified_at_ns: modified_at_ns,
+            source_thread_id: parsed.thread_id,
+            source_created_at: parsed.created_at,
+            source_updated_at: parsed.updated_at,
         });
     }
     documents.sort_by(|left, right| left.source_path.cmp(&right.source_path));
@@ -910,32 +1142,67 @@ fn collect_session_documents(
 
 struct ParsedSession {
     cwd: Option<PathBuf>,
+    thread_id: Option<String>,
+    created_at: Option<i64>,
+    updated_at: Option<i64>,
     body: String,
     first_user_text: Option<String>,
     malformed_lines: usize,
     records_considered: usize,
 }
 
-fn parse_session_document(bytes: &[u8]) -> ParsedSession {
-    let mut cwd = None;
-    let mut body = String::new();
-    let mut first_user_text = None;
-    let mut malformed_lines = 0;
-    let mut records_considered = 0;
-    for line in bytes.split(|byte| *byte == b'\n') {
+struct ScannedSession {
+    parsed: ParsedSession,
+    fingerprint: String,
+    bytes_read: usize,
+    prefix_verified: bool,
+}
+
+struct SessionMetadataPreflight {
+    cwd: Option<PathBuf>,
+    bytes_read: usize,
+    malformed_lines: usize,
+    records_considered: usize,
+}
+
+#[derive(Default)]
+struct SessionProjection {
+    cwd: Option<PathBuf>,
+    thread_id: Option<String>,
+    created_at: Option<i64>,
+    updated_at: Option<i64>,
+    early: String,
+    recent: VecDeque<String>,
+    recent_bytes: usize,
+    overflowed_early: bool,
+    first_user_text: Option<String>,
+    malformed_lines: usize,
+    records_considered: usize,
+}
+
+impl SessionProjection {
+    fn ingest(&mut self, line: &[u8], oversized: bool) {
         if line.iter().all(u8::is_ascii_whitespace) {
-            continue;
+            return;
         }
-        records_considered += 1;
+        self.records_considered += 1;
+        if oversized {
+            self.malformed_lines += 1;
+            return;
+        }
         let value = match serde_json::from_slice::<serde_json::Value>(line) {
             Ok(value) => value,
             Err(_) => {
-                malformed_lines += 1;
-                continue;
+                self.malformed_lines += 1;
+                return;
             }
         };
+        if let Some(timestamp) = source_timestamp(&value) {
+            self.created_at = earliest_timestamp(self.created_at, Some(timestamp));
+            self.updated_at = latest_timestamp(self.updated_at, Some(timestamp));
+        }
         let Some(payload) = value.get("payload").and_then(serde_json::Value::as_object) else {
-            continue;
+            return;
         };
         if value.get("type").and_then(serde_json::Value::as_str) == Some("session_meta") {
             if let Some(path) = payload
@@ -943,23 +1210,29 @@ fn parse_session_document(bytes: &[u8]) -> ParsedSession {
                 .and_then(serde_json::Value::as_str)
                 .and_then(safe_absolute_path)
             {
-                cwd = Some(path);
+                self.cwd = Some(path);
             }
-            continue;
+            self.thread_id = payload
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty() && value.len() <= 256)
+                .map(str::to_owned)
+                .or_else(|| self.thread_id.take());
+            return;
         }
         if value.get("type").and_then(serde_json::Value::as_str) != Some("response_item")
             || payload.get("type").and_then(serde_json::Value::as_str) != Some("message")
         {
-            continue;
+            return;
         }
         let Some(role) = payload.get("role").and_then(serde_json::Value::as_str) else {
-            continue;
+            return;
         };
         if !matches!(role, "user" | "assistant") {
-            continue;
+            return;
         }
         let Some(content) = payload.get("content").and_then(serde_json::Value::as_array) else {
-            continue;
+            return;
         };
         for item in content {
             let Some(kind) = item.get("type").and_then(serde_json::Value::as_str) else {
@@ -972,28 +1245,304 @@ fn parse_session_document(bytes: &[u8]) -> ParsedSession {
                 continue;
             };
             let text = text.trim();
-            if text.is_empty() {
+            if text.is_empty() || is_injected_context(text) {
                 continue;
             }
-            if role == "user" && first_user_text.is_none() {
-                first_user_text = Some(text.to_owned());
+            if role == "user" && self.first_user_text.is_none() {
+                self.first_user_text = Some(compact_title(text, MAX_CONTEXT_TITLE_BYTES));
             }
-            append_context_message(&mut body, role, text);
-            if body.len() >= MAX_DOCUMENT_TEXT_BYTES {
+            self.push_message(role, text);
+        }
+    }
+
+    fn push_message(&mut self, role: &str, text: &str) {
+        let mut text = text.to_owned();
+        truncate_context_utf8(&mut text, MAX_SESSION_RECORD_BYTES / 2);
+        let message = format!("{role}: {text}");
+        if self.early.len() < SESSION_EARLY_TEXT_BYTES {
+            append_bounded_projection(&mut self.early, &message, SESSION_EARLY_TEXT_BYTES);
+            if self.early.len() >= SESSION_EARLY_TEXT_BYTES {
+                self.overflowed_early = true;
+            }
+        } else {
+            self.overflowed_early = true;
+        }
+        self.recent_bytes = self.recent_bytes.saturating_add(message.len() + 2);
+        self.recent.push_back(message);
+        while self.recent_bytes > MAX_DOCUMENT_TEXT_BYTES - SESSION_EARLY_TEXT_BYTES {
+            let Some(removed) = self.recent.pop_front() else {
                 break;
+            };
+            self.recent_bytes = self.recent_bytes.saturating_sub(removed.len() + 2);
+        }
+    }
+
+    fn finish(self) -> ParsedSession {
+        let mut body = self.early;
+        if self.overflowed_early {
+            for message in self.recent {
+                append_bounded_projection(&mut body, &message, MAX_DOCUMENT_TEXT_BYTES);
             }
         }
-        if body.len() >= MAX_DOCUMENT_TEXT_BYTES {
+        ParsedSession {
+            cwd: self.cwd,
+            thread_id: self.thread_id,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            body,
+            first_user_text: self.first_user_text,
+            malformed_lines: self.malformed_lines,
+            records_considered: self.records_considered,
+        }
+    }
+}
+
+fn scan_session_file(
+    path: &Path,
+    checkpoint: Option<&ExistingContextDocument>,
+) -> Result<ScannedSession> {
+    let mut file = File::open(path).map_err(|source| Error::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut fingerprint = ContextFingerprint::new();
+    fingerprint.write(ContextSourceKind::CodexSession.as_str().as_bytes());
+    fingerprint.write(path.file_name().unwrap_or_default().as_encoded_bytes());
+    let mut bytes_read = 0usize;
+    let mut prefix_verified = checkpoint.is_none();
+    if let Some(checkpoint) = checkpoint {
+        let mut remaining = checkpoint.source_bytes;
+        let mut buffer = [0u8; 64 * 1024];
+        let mut last = None;
+        while remaining > 0 {
+            let wanted =
+                usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
+            let read = file
+                .read(&mut buffer[..wanted])
+                .map_err(|source| Error::Io {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+            if read == 0 {
+                break;
+            }
+            fingerprint.write(&buffer[..read]);
+            last = buffer.get(read - 1).copied();
+            bytes_read = bytes_read.saturating_add(read);
+            remaining -= read as u64;
+        }
+        prefix_verified =
+            remaining == 0 && last == Some(b'\n') && fingerprint.finish() == checkpoint.fingerprint;
+        if !prefix_verified {
+            file.seek(SeekFrom::Start(0)).map_err(|source| Error::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+            fingerprint = ContextFingerprint::new();
+            fingerprint.write(ContextSourceKind::CodexSession.as_str().as_bytes());
+            fingerprint.write(path.file_name().unwrap_or_default().as_encoded_bytes());
+            bytes_read = 0;
+        }
+    }
+    let mut reader = BufReader::new(file);
+    let mut projection = SessionProjection::default();
+    while let Some((line, oversized, read)) =
+        read_bounded_jsonl_record(&mut reader, &mut fingerprint, path)?
+    {
+        bytes_read = bytes_read.saturating_add(read);
+        projection.ingest(&line, oversized);
+    }
+    Ok(ScannedSession {
+        parsed: projection.finish(),
+        fingerprint: fingerprint.finish(),
+        bytes_read,
+        prefix_verified,
+    })
+}
+
+fn preflight_session_metadata(path: &Path) -> Result<SessionMetadataPreflight> {
+    const MAX_PREFLIGHT_RECORDS: usize = 16;
+    const MAX_PREFLIGHT_BYTES: usize = 2 * MAX_SESSION_RECORD_BYTES;
+
+    let file = File::open(path).map_err(|source| Error::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut reader = BufReader::new(file);
+    let mut fingerprint = ContextFingerprint::new();
+    let mut projection = SessionProjection::default();
+    let mut bytes_read = 0usize;
+    while projection.records_considered < MAX_PREFLIGHT_RECORDS && bytes_read < MAX_PREFLIGHT_BYTES
+    {
+        let Some((line, oversized, read)) =
+            read_bounded_jsonl_record(&mut reader, &mut fingerprint, path)?
+        else {
+            break;
+        };
+        bytes_read = bytes_read.saturating_add(read);
+        projection.ingest(&line, oversized);
+        if projection.cwd.is_some() {
             break;
         }
     }
-    ParsedSession {
-        cwd,
-        body,
-        first_user_text,
-        malformed_lines,
-        records_considered,
+    Ok(SessionMetadataPreflight {
+        cwd: projection.cwd,
+        bytes_read,
+        malformed_lines: projection.malformed_lines,
+        records_considered: projection.records_considered,
+    })
+}
+
+fn session_cwd_preflight_rejects(recorded_cwd: &Path, approved_roots: &[PathBuf]) -> bool {
+    let Ok(normalized_cwd) = crate::scan::canonicalize_existing_ancestor(recorded_cwd) else {
+        return false;
+    };
+    let matching_roots = approved_roots.iter().filter(|root| {
+        crate::scan::canonicalize_existing_ancestor(root)
+            .ok()
+            .is_some_and(|root| normalized_cwd.starts_with(root))
+    });
+    let mut matched = false;
+    for root in matching_roots {
+        matched = true;
+        if root.is_dir()
+            && canonical_existing_directory(root).is_some()
+            && canonical_existing_directory(recorded_cwd).is_none()
+        {
+            return true;
+        }
     }
+    !matched
+}
+
+fn read_bounded_jsonl_record<R: BufRead>(
+    reader: &mut R,
+    fingerprint: &mut ContextFingerprint,
+    path: &Path,
+) -> Result<Option<(Vec<u8>, bool, usize)>> {
+    let mut captured = Vec::new();
+    let mut oversized = false;
+    let mut total = 0usize;
+    loop {
+        let available = reader.fill_buf().map_err(|source| Error::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if available.is_empty() {
+            return if total == 0 {
+                Ok(None)
+            } else {
+                Ok(Some((captured, oversized, total)))
+            };
+        }
+        let consumed = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |index| index + 1);
+        let chunk = &available[..consumed];
+        fingerprint.write(chunk);
+        total = total.saturating_add(chunk.len());
+        let content = chunk.strip_suffix(b"\n").unwrap_or(chunk);
+        if captured.len() < MAX_SESSION_RECORD_BYTES {
+            let remaining = MAX_SESSION_RECORD_BYTES - captured.len();
+            captured.extend_from_slice(&content[..content.len().min(remaining)]);
+        }
+        if total > MAX_SESSION_RECORD_BYTES {
+            oversized = true;
+        }
+        let ended = chunk.last() == Some(&b'\n');
+        reader.consume(consumed);
+        if ended {
+            return Ok(Some((captured, oversized, total)));
+        }
+    }
+}
+
+fn source_timestamp(value: &serde_json::Value) -> Option<i64> {
+    let value = value
+        .get("timestamp")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            value
+                .get("payload")
+                .and_then(|payload| payload.get("timestamp"))
+                .and_then(serde_json::Value::as_str)
+        })?;
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|timestamp| timestamp.timestamp())
+}
+
+fn earliest_timestamp(left: Option<i64>, right: Option<i64>) -> Option<i64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (left, right) => left.or(right),
+    }
+}
+
+fn latest_timestamp(left: Option<i64>, right: Option<i64>) -> Option<i64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (left, right) => left.or(right),
+    }
+}
+
+fn is_injected_context(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    trimmed.starts_with("# AGENTS.md instructions for ")
+        || trimmed.starts_with("<environment_context>")
+        || trimmed.starts_with("<permissions instructions>")
+        || trimmed.starts_with("<skills_instructions>")
+        || trimmed.starts_with("<INSTRUCTIONS>")
+        || trimmed.starts_with("## Memory\n")
+}
+
+fn append_bounded_projection(body: &mut String, message: &str, maximum: usize) {
+    if body.len() >= maximum {
+        return;
+    }
+    if !body.is_empty() {
+        body.push_str("\n\n");
+    }
+    let remaining = maximum.saturating_sub(body.len());
+    let mut admitted = message.to_owned();
+    truncate_context_utf8(&mut admitted, remaining);
+    body.push_str(&admitted);
+}
+
+fn merge_session_projection(body: &mut String, tail: &str) {
+    if tail.trim().is_empty() {
+        return;
+    }
+    let mut early = body.clone();
+    truncate_context_utf8(&mut early, SESSION_EARLY_TEXT_BYTES);
+    let recent_budget = MAX_DOCUMENT_TEXT_BYTES - SESSION_EARLY_TEXT_BYTES;
+    let combined = format!("{body}\n\n{tail}");
+    let mut boundary = combined.len().saturating_sub(recent_budget);
+    while boundary < combined.len() && !combined.is_char_boundary(boundary) {
+        boundary += 1;
+    }
+    let recent = &combined[boundary..];
+    *body = early;
+    append_bounded_projection(body, recent, MAX_DOCUMENT_TEXT_BYTES);
+}
+
+fn metadata_modified_at_ns(metadata: &fs::Metadata) -> i64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|value| i64::try_from(value.as_nanos()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+fn source_modified_at_ns(path: &Path) -> Result<i64> {
+    fs::symlink_metadata(path)
+        .map(|metadata| metadata_modified_at_ns(&metadata))
+        .map_err(|source| Error::Io {
+            path: path.to_path_buf(),
+            source,
+        })
 }
 
 fn context_document_from_checkpoint(checkpoint: &ExistingContextDocument) -> ContextDocument {
@@ -1007,6 +1556,10 @@ fn context_document_from_checkpoint(checkpoint: &ExistingContextDocument) -> Con
         body: checkpoint.body.clone(),
         imported_bytes: checkpoint.imported_bytes,
         source_bytes: checkpoint.source_bytes,
+        source_modified_at_ns: checkpoint.source_modified_at_ns,
+        source_thread_id: checkpoint.source_thread_id.clone(),
+        source_created_at: checkpoint.source_created_at,
+        source_updated_at: checkpoint.source_updated_at,
     }
 }
 
@@ -1026,36 +1579,6 @@ fn checkpoint_context_authorized(
 
 fn same_canonical_directory(left: &Path, right: &Path) -> bool {
     canonical_existing_directory(left) == canonical_existing_directory(right)
-}
-
-fn append_preformatted_context(body: &mut String, tail: &str) {
-    if tail.trim().is_empty() || body.len() >= MAX_DOCUMENT_TEXT_BYTES {
-        return;
-    }
-    if !body.is_empty() {
-        body.push_str("\n\n");
-    }
-    let remaining = MAX_DOCUMENT_TEXT_BYTES.saturating_sub(body.len());
-    let mut tail = tail.to_owned();
-    truncate_context_utf8(&mut tail, remaining);
-    body.push_str(&tail);
-}
-
-fn append_context_message(body: &mut String, role: &str, text: &str) {
-    if body.len() >= MAX_DOCUMENT_TEXT_BYTES {
-        return;
-    }
-    let separator = if body.is_empty() { "" } else { "\n\n" };
-    let prefix = format!("{separator}{role}: ");
-    let remaining = MAX_DOCUMENT_TEXT_BYTES.saturating_sub(body.len());
-    if prefix.len() >= remaining {
-        return;
-    }
-    body.push_str(&prefix);
-    let remaining = MAX_DOCUMENT_TEXT_BYTES.saturating_sub(body.len());
-    let mut admitted = text.to_owned();
-    truncate_context_utf8(&mut admitted, remaining);
-    body.push_str(&admitted);
 }
 
 fn collect_source_files(
@@ -1303,7 +1826,47 @@ fn content_fingerprint(kind: ContextSourceKind, path: &Path, bytes: &[u8]) -> St
     fingerprint.finish()
 }
 
+fn rollout_summary_session_metadata(
+    source_path: &Path,
+    body: &str,
+) -> (Option<String>, Option<i64>) {
+    let rollout_summaries = Path::new("memories/rollout_summaries");
+    if !source_path.starts_with(rollout_summaries)
+        || source_path.extension().and_then(|value| value.to_str()) != Some("md")
+    {
+        return (None, None);
+    }
+    let mut thread_id = None;
+    let mut updated_at = None;
+    for line in body.lines().take(16) {
+        let line = line.trim();
+        if line.is_empty() {
+            break;
+        }
+        if let Some(value) = line.strip_prefix("thread_id:").map(str::trim) {
+            thread_id = valid_codex_thread_id(value).then(|| value.to_owned());
+        } else if let Some(value) = line.strip_prefix("updated_at:").map(str::trim) {
+            updated_at = chrono::DateTime::parse_from_rfc3339(value)
+                .ok()
+                .map(|timestamp| timestamp.timestamp());
+        }
+    }
+    (thread_id, updated_at)
+}
+
+fn valid_codex_thread_id(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            _ => byte.is_ascii_hexdigit(),
+        })
+}
+
 fn context_fts_query(query: &str) -> Option<String> {
+    context_fts_tokens(query).map(|tokens| tokens.join(" OR "))
+}
+
+fn context_fts_tokens(query: &str) -> Option<Vec<String>> {
     let tokens = query
         .split_whitespace()
         .map(|value| {
@@ -1318,7 +1881,106 @@ fn context_fts_query(query: &str) -> Option<String> {
         .take(32)
         .map(|value| format!("\"{}\"", value.replace('"', "\"\"")))
         .collect::<Vec<_>>();
-    (!tokens.is_empty()).then(|| tokens.join(" OR "))
+    (!tokens.is_empty()).then_some(tokens)
+}
+
+fn session_query_terms(query: &str) -> Option<Vec<String>> {
+    let tokens = query
+        .split(|character: char| !(character.is_alphanumeric() || character == '_'))
+        .filter(|value| !value.is_empty())
+        .filter(|value| !session_query_stopword(value))
+        .take(32)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    (!tokens.is_empty()).then_some(tokens)
+}
+
+fn session_fts_token(value: &str) -> String {
+    let prefix = if value.chars().count() >= 4 { "*" } else { "" };
+    format!("\"{}\"{prefix}", value.replace('"', "\"\""))
+}
+
+fn session_search_snippet(body: &str, terms: &[String]) -> String {
+    let searchable = body.to_ascii_lowercase();
+    let anchor = terms
+        .iter()
+        .map(|term| term.to_ascii_lowercase())
+        .filter_map(|term| {
+            searchable
+                .find(&term)
+                .map(|position| (term.len(), position))
+        })
+        .max_by_key(|(length, _)| *length)
+        .map(|(_, position)| position)
+        .unwrap_or(0);
+    let mut start = anchor.saturating_sub(MAX_CONTEXT_SNIPPET_BYTES / 4);
+    while start > 0 && !body.is_char_boundary(start) {
+        start -= 1;
+    }
+    let mut end = start
+        .saturating_add(MAX_CONTEXT_SNIPPET_BYTES)
+        .min(body.len());
+    while end > start && !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut snippet = String::with_capacity(end - start + 6);
+    if start > 0 {
+        snippet.push_str("...");
+    }
+    snippet.push_str(&body[start..end]);
+    if end < body.len() {
+        snippet.push_str("...");
+    }
+    truncate_context_utf8(&mut snippet, MAX_CONTEXT_SNIPPET_BYTES);
+    snippet
+}
+
+fn session_query_stopword(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "a" | "an"
+            | "the"
+            | "i"
+            | "me"
+            | "my"
+            | "we"
+            | "our"
+            | "which"
+            | "what"
+            | "where"
+            | "when"
+            | "who"
+            | "why"
+            | "how"
+            | "was"
+            | "were"
+            | "is"
+            | "are"
+            | "am"
+            | "be"
+            | "been"
+            | "being"
+            | "do"
+            | "did"
+            | "does"
+            | "have"
+            | "had"
+            | "has"
+            | "to"
+            | "for"
+            | "of"
+            | "in"
+            | "on"
+            | "at"
+            | "with"
+            | "from"
+            | "that"
+            | "this"
+            | "it"
+            | "session"
+            | "working"
+            | "recently"
+    )
 }
 
 fn truncate_context_utf8(value: &mut String, maximum: usize) {
@@ -1542,6 +2204,56 @@ mod tests {
     }
 
     #[test]
+    fn rollout_memory_summaries_bridge_to_exact_resumable_sessions() -> Result<()> {
+        let (_temp, mut registry, codex_home) = registry()?;
+        let thread_id = "019f0000-1111-7000-8000-000000000001";
+        write(
+            &codex_home.join("memories/rollout_summaries/aura.md"),
+            format!(
+                "thread_id: {thread_id}\nupdated_at: 2026-07-10T15:38:29+00:00\nrollout_path: /outside/approved/roots/{thread_id}.jsonl\ncwd: /home/example\n\n# Aura deployment\nDeployed aura.ai.pro.br through Cloudflare Tunnel."
+            )
+            .as_bytes(),
+        )?;
+        write(
+            &codex_home.join("memories/MEMORY.md"),
+            format!(
+                "thread_id: {thread_id}\nupdated_at: 2026-07-11T00:00:00Z\n\nThis aggregate mentions aura.ai.pro.br."
+            )
+            .as_bytes(),
+        )?;
+        registry.set_recall_settings(RecallSettings {
+            include_codex_memories: true,
+            include_codex_sessions: false,
+        })?;
+        registry
+            .refresh_context_documents(&codex_home, ContextDocumentRefreshOptions::default())?;
+
+        let hits = registry.search_session_documents(
+            "which session I was working recently to deploy aura.ai.pro.br?",
+            10,
+        )?;
+        assert_eq!(hits.len(), 1);
+        let hit = &hits[0];
+        assert_eq!(hit.source_kind, ContextSourceKind::CodexMemory);
+        assert_eq!(hit.thread_id, thread_id);
+        assert_eq!(hit.cwd, None);
+        assert_eq!(hit.updated_at, Some(1_783_697_909));
+        assert_eq!(hit.resume_command, format!("codex resume {thread_id}"));
+        assert_eq!(
+            hit.source_path,
+            PathBuf::from("memories/rollout_summaries/aura.md")
+        );
+
+        registry.set_recall_settings(RecallSettings::default())?;
+        assert!(
+            registry
+                .search_session_documents("aura.ai.pro.br", 10)?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn sessions_require_an_approved_root_and_extract_only_message_text() -> Result<()> {
         let (temp, mut registry, codex_home) = registry()?;
         let approved = temp.path().join("approved");
@@ -1621,6 +2333,231 @@ mod tests {
         ] {
             assert!(registry.search_context_documents(marker, 10)?.is_empty());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn outside_root_session_preflight_stops_before_large_body() -> Result<()> {
+        let (temp, mut registry, codex_home) = registry()?;
+        let approved = temp.path().join("approved");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&approved).map_err(|source| Error::Io {
+            path: approved.clone(),
+            source,
+        })?;
+        fs::create_dir_all(&outside).map_err(|source| Error::Io {
+            path: outside.clone(),
+            source,
+        })?;
+        registry.add_scan_root(&approved, ScanRootOptions::default())?;
+        registry.set_recall_settings(RecallSettings {
+            include_codex_memories: false,
+            include_codex_sessions: true,
+        })?;
+        for (name, cwd, thread) in [
+            (
+                "outside-large",
+                outside.clone(),
+                "019f0000-0000-7000-8000-000000000001",
+            ),
+            (
+                "stale-large",
+                approved.join("deleted-project"),
+                "019f0000-0000-7000-8000-000000000002",
+            ),
+        ] {
+            let path = codex_home.join(format!("sessions/{name}.jsonl"));
+            fs::create_dir_all(path.parent().unwrap_or(&codex_home)).map_err(|source| {
+                Error::Io {
+                    path: path.parent().unwrap_or(&codex_home).to_path_buf(),
+                    source,
+                }
+            })?;
+            let mut session = File::create(&path).map_err(|source| Error::Io {
+                path: path.clone(),
+                source,
+            })?;
+            writeln!(
+                session,
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":{thread:?},\"cwd\":{cwd:?}}}}}",
+                cwd = cwd.to_string_lossy()
+            )
+            .map_err(|source| Error::Io {
+                path: path.clone(),
+                source,
+            })?;
+            session
+                .write_all(&vec![b'x'; 8 * 1024 * 1024])
+                .and_then(|()| session.write_all(b"\n"))
+                .map_err(|source| Error::Io {
+                    path: path.clone(),
+                    source,
+                })?;
+        }
+
+        let report = registry
+            .refresh_context_documents(&codex_home, ContextDocumentRefreshOptions::default())?;
+        assert_eq!(report.sessions.documents, 0);
+        assert_eq!(report.sessions.skipped_outside_roots, 2);
+        assert_eq!(report.sessions.records_considered, 2);
+        assert!(report.sessions.bytes_read < 8 * 1024);
+        Ok(())
+    }
+
+    #[test]
+    fn large_sessions_stream_head_and_recent_text_into_resumable_ranked_search() -> Result<()> {
+        let (temp, mut registry, codex_home) = registry()?;
+        let approved = temp.path().join("approved");
+        let project = approved.join("aura-project");
+        fs::create_dir_all(&project).map_err(|source| Error::Io {
+            path: project.clone(),
+            source,
+        })?;
+        let registered = registry.add_project(&project, Some("Synthetic Aura"))?;
+        registry.add_scan_root(&approved, ScanRootOptions::default())?;
+        registry.set_recall_settings(RecallSettings {
+            include_codex_memories: false,
+            include_codex_sessions: true,
+        })?;
+
+        let session_path = codex_home.join("sessions/2026/large.jsonl");
+        if let Some(parent) = session_path.parent() {
+            fs::create_dir_all(parent).map_err(|source| Error::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        let mut session = File::create(&session_path).map_err(|source| Error::Io {
+            path: session_path.clone(),
+            source,
+        })?;
+        writeln!(
+            session,
+            "{{\"timestamp\":\"2026-07-01T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"019f-synthetic-aura-thread\",\"cwd\":{cwd:?}}}}}",
+            cwd = project.to_string_lossy()
+        )
+        .map_err(|source| Error::Io { path: session_path.clone(), source })?;
+        session
+            .write_all(&vec![b'x'; MAX_SESSION_RECORD_BYTES + 1])
+            .and_then(|()| session.write_all(b"\n"))
+            .map_err(|source| Error::Io {
+                path: session_path.clone(),
+                source,
+            })?;
+        writeln!(session, "{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"# AGENTS.md instructions for /synthetic\\n<environment_context>injectedstartupunique</environment_context>\"}}]}}}}")
+            .map_err(|source| Error::Io { path: session_path.clone(), source })?;
+        writeln!(session, "{{\"timestamp\":\"2026-07-01T10:01:00Z\",\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"head-retained-marker investigate deployment routing\"}}]}}}}")
+            .map_err(|source| Error::Io { path: session_path.clone(), source })?;
+        let filler = "bounded-filler ".repeat(80);
+        for index in 0..1_200 {
+            writeln!(session, "{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":{text:?}}}]}}}}", text = format!("{index} {filler}"))
+                .map_err(|source| Error::Io { path: session_path.clone(), source })?;
+        }
+        writeln!(session, "{{\"timestamp\":\"2026-07-01T12:34:56Z\",\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":\"late-retained-marker deployed aura.ai.pro.br successfully\"}}]}}}}")
+            .map_err(|source| Error::Io { path: session_path.clone(), source })?;
+        drop(session);
+        assert!(
+            fs::metadata(&session_path)
+                .map_err(|source| Error::Io {
+                    path: session_path.clone(),
+                    source
+                })?
+                .len()
+                > 1024 * 1024
+        );
+
+        let report = registry
+            .refresh_context_documents(&codex_home, ContextDocumentRefreshOptions::default())?;
+        assert_eq!(report.sessions.files_full, 1);
+        assert_eq!(report.sessions.skipped_oversized, 0);
+        assert_eq!(report.sessions.malformed_lines, 1);
+        for query in ["head-retained-marker", "late-retained-marker"] {
+            assert_eq!(registry.search_context_documents(query, 10)?.len(), 1);
+        }
+        assert!(
+            registry
+                .search_context_documents("injectedstartupunique", 10)?
+                .is_empty()
+        );
+
+        let hits = registry.search_session_documents(
+            "which session I was working recently to deploy aura.ai.pro.br?",
+            10,
+        )?;
+        assert_eq!(hits.len(), 1);
+        let hit = &hits[0];
+        assert_eq!(hit.thread_id, "019f-synthetic-aura-thread");
+        assert_eq!(hit.created_at, Some(1_782_900_000));
+        assert_eq!(hit.updated_at, Some(1_782_909_296));
+        assert_eq!(hit.source_kind, ContextSourceKind::CodexSession);
+        assert_eq!(hit.project_id, Some(registered.id));
+        assert_eq!(hit.cwd.as_deref(), Some(registered.path.as_path()));
+        assert_eq!(hit.source_path, PathBuf::from("sessions/2026/large.jsonl"));
+        assert!(hit.title.contains("head-retained-marker"));
+        assert!(!hit.title.contains("AGENTS.md"));
+        assert_eq!(hit.match_mode, SessionSearchMatchMode::AllTerms);
+        assert_eq!(
+            hit.resume_command,
+            "codex resume 019f-synthetic-aura-thread"
+        );
+        assert!(hit.snippet.len() <= MAX_CONTEXT_SNIPPET_BYTES);
+
+        let unchanged = registry
+            .refresh_context_documents(&codex_home, ContextDocumentRefreshOptions::default())?;
+        assert_eq!(unchanged.sessions.mode, ContextRefreshMode::Unchanged);
+        assert_eq!(unchanged.sessions.bytes_read, 0);
+        assert_eq!(unchanged.sessions.records_considered, 0);
+
+        registry.set_recall_settings(RecallSettings::default())?;
+        assert!(
+            registry
+                .search_session_documents("aura.ai.pro.br", 10)?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn session_search_uses_any_term_only_when_all_terms_have_no_hits() -> Result<()> {
+        let (temp, mut registry, codex_home) = registry()?;
+        let approved = temp.path().join("approved");
+        let project = approved.join("project");
+        fs::create_dir_all(&project).map_err(|source| Error::Io {
+            path: project.clone(),
+            source,
+        })?;
+        registry.add_project(&project, None)?;
+        registry.add_scan_root(&approved, ScanRootOptions::default())?;
+        registry.set_recall_settings(RecallSettings {
+            include_codex_memories: false,
+            include_codex_sessions: true,
+        })?;
+        for (name, thread, text) in [
+            ("strict", "strict-thread", "alpha-marker beta-marker"),
+            ("partial", "partial-thread", "alpha-marker only"),
+        ] {
+            let value = format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":{thread:?},\"cwd\":{cwd:?}}}}}\n{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":{text:?}}}]}}}}\n",
+                cwd = project.to_string_lossy(),
+            );
+            write(
+                &codex_home.join(format!("sessions/{name}.jsonl")),
+                value.as_bytes(),
+            )?;
+        }
+        registry
+            .refresh_context_documents(&codex_home, ContextDocumentRefreshOptions::default())?;
+        let strict = registry.search_session_documents("alpha-marker beta-marker", 10)?;
+        assert_eq!(strict.len(), 1);
+        assert_eq!(strict[0].thread_id, "strict-thread");
+        assert_eq!(strict[0].match_mode, SessionSearchMatchMode::AllTerms);
+        let fallback = registry.search_session_documents("alpha-marker missing-marker", 10)?;
+        assert_eq!(fallback.len(), 2);
+        assert!(
+            fallback
+                .iter()
+                .all(|hit| hit.match_mode == SessionSearchMatchMode::AnyTermFallback)
+        );
         Ok(())
     }
 

@@ -226,7 +226,7 @@ fn mcp_reference_covers_the_runtime_catalog() {
     let source = read(repo_root().join("crates/skein-cli/src/mcp.rs"));
     let reference = read(repo_root().join("docs/mcp-reference.md"));
     let tools = mcp_tool_names(&source);
-    assert_eq!(tools.len(), 25, "update the documented MCP catalog count");
+    assert_eq!(tools.len(), 26, "update the documented MCP catalog count");
     for tool in tools {
         assert!(
             reference.contains(&format!("`{tool}`")),

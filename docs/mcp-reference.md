@@ -17,6 +17,7 @@ The server returns structured JSON inside MCP content. A fresh database may retu
 | `list_projects` | read | none | all registered projects |
 | `list_scan_roots` | read | none | all approved roots |
 | `list_sessions` | read | none | limit 100; optional project |
+| `search_sessions` | read/private | `query` | limit 10; enabled session/rollout-summary sources |
 | `list_runs` | read | none | limit 100; optional project/active |
 | `get_run` | read | `run_id` | redaction-safe detail |
 | `observe_run` | read/wait | `run_id` | cursor 0; limit 50; timeout 0 |
@@ -58,6 +59,8 @@ consulted sources, private gates, conservative freshness, limits, possible trunc
 and an explicit escalation input. Quick mode does not query private context rows.
 Deep results and `sourcesConsulted` are filtered by the live memory/session gates, so
 disabling either source revokes its retained rows immediately without a refresh.
+When a resumable private source is enabled, `sessionMatches` adds the same exact-thread
+projection as `search_sessions`; quick mode always returns it empty.
 
 ### `get_project`
 
@@ -81,6 +84,17 @@ policy and maximum depth.
 
 Optional `project` selects an exact registered project identity; `limit` is 1–500 and
 defaults to 100. Output is content-free session metadata.
+
+### `search_sessions`
+
+This is the explicit private-recall tool for questions such as “which session was I
+using to deploy aura.ai.pro.br?”. It consults currently enabled Codex-session rows and
+exact one-rollout generated-memory summaries, then deduplicates by thread ID. It
+returns bounded ranked hits with source provenance, exact thread ID, source-relative
+path, source dates, optional cwd/project, title/snippet, strict/fallback match mode,
+and `codex resume THREAD_ID`. It never refreshes or enables a source. The response
+lists `authorizedSources`; when both gates are off it returns no hits and the exact
+enable-then-refresh next action.
 
 ### `list_runs`
 

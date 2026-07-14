@@ -28,6 +28,8 @@ pub use context::ContextSourceRefreshReport;
 pub use context::ContextSourceRefreshStatus;
 pub use context::MAX_CONTEXT_FILES;
 pub use context::RecallSettings;
+pub use context::SessionContentSearchResult;
+pub use context::SessionSearchMatchMode;
 pub use control::ControlAction;
 pub use control::ControlActionKind;
 pub use control::ControlActionState;
